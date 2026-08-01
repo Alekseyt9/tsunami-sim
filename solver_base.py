@@ -302,9 +302,16 @@ class DelugeSolver:
                                   "water_field_nodes", "water_mesh_excluded_surface_particles",
                                   "water_mesh_voxel_millimeters", "water_mesh_lod_changes",
                                   "water_splash_bricks", "water_splash_mesh_vertices",
-                                  "shallow_water_cells", "shallow_water_wet_cells"):
+                                  "water_stitch_surface_samples", "shallow_water_cells",
+                                  "shallow_water_wet_cells", "shallow_emitted_particles"):
                 if optional_stat in stats:
                     row[optional_stat] = int(stats[optional_stat])
+            for optional_stat in (
+                "fluid_volume_m3", "fluid_momentum_z_kg_m_s", "shallow_water_volume_m3",
+                "shallow_water_momentum_z", "shallow_emitted_volume_m3",
+            ):
+                if optional_stat in stats:
+                    row[optional_stat] = float(stats[optional_stat])
             benchmark_rows.append(row)
             with metrics_path.open("a", encoding="utf-8") as metrics_file:
                 metrics_file.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -365,10 +372,32 @@ class DelugeSolver:
                                   "time_level_0_particles", "time_level_1_particles", "time_level_2_particles",
                                   "surface_water_particles", "water_mesh_vertices", "water_mesh_triangles",
                                   "water_field_nodes", "water_mesh_lod_changes", "water_splash_bricks",
-                                  "water_splash_mesh_vertices", "shallow_water_cells",
-                                  "shallow_water_wet_cells"):
+                                  "water_splash_mesh_vertices", "water_stitch_surface_samples",
+                                  "shallow_water_cells", "shallow_water_wet_cells",
+                                  "shallow_emitted_particles"):
                 if optional_stat in benchmark_rows[0]:
                     summary[f"peak_{optional_stat}"] = max(row.get(optional_stat, 0) for row in benchmark_rows)
+            if all(
+                key in benchmark_rows[0] and key in benchmark_rows[-1]
+                for key in ("fluid_volume_m3", "shallow_water_volume_m3")
+            ):
+                initial_water_volume = (
+                    benchmark_rows[0]["fluid_volume_m3"]
+                    + benchmark_rows[0]["shallow_water_volume_m3"]
+                )
+                final_water_volume = (
+                    benchmark_rows[-1]["fluid_volume_m3"]
+                    + benchmark_rows[-1]["shallow_water_volume_m3"]
+                )
+                summary["initial_combined_water_volume_m3"] = initial_water_volume
+                summary["final_combined_water_volume_m3"] = final_water_volume
+                summary["combined_water_volume_drift_fraction"] = (
+                    final_water_volume / initial_water_volume - 1.0
+                    if initial_water_volume > 0.0 else 0.0
+                )
+                summary["shallow_emitted_volume_m3"] = benchmark_rows[-1].get(
+                    "shallow_emitted_volume_m3", 0.0
+                )
             (self.output / "benchmark_summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
         if render_times:
             print(f"Complete. Average output-frame wall time: {sum(render_times)/len(render_times):.2f}s")

@@ -64,7 +64,13 @@
       "velocity_relaxation_rate": 1.5,
       "bed_drag": 0.006,
       "dry_depth": 0.02,
-      "render_far_surface": false
+      "render_far_surface": false,
+      "stitch_surface": true,
+      "surface_sample_spacing": 0.65,
+      "minimum_stitch_height": 4.0,
+      "maximum_stitch_height_delta": 6.0,
+      "emit_sph": true,
+      "emitter_spacing": 1.0
     },
     "activation_force_per_mass": 0.8,
     "minimum_contact_particles": 8,

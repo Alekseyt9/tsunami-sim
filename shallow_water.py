@@ -131,19 +131,125 @@ def couple_sph_interface(
 @wp.kernel
 def apply_exchange_impulse(
     shallow: wp.array2d(dtype=wp.vec3),
+    exchange_volume: wp.array2d(dtype=float),
     exchange_x: wp.array2d(dtype=float),
     exchange_z: wp.array2d(dtype=float),
+    cell_area: float,
     density_times_area: float,
 ):
     ix, iz = wp.tid()
     state = shallow[ix, iz]
     shallow[ix, iz] = wp.vec3(
-        state[0],
+        wp.max(0.0, state[0] + exchange_volume[ix, iz] / cell_area),
         state[1] + exchange_x[ix, iz] / density_times_area,
         state[2] + exchange_z[ix, iz] / density_times_area,
     )
+    exchange_volume[ix, iz] = 0.0
     exchange_x[ix, iz] = 0.0
     exchange_z[ix, iz] = 0.0
+
+
+@wp.kernel
+def emit_sph_interface_particles(
+    grid: wp.uint64,
+    x: wp.array(dtype=wp.vec3),
+    rest_x: wp.array(dtype=wp.vec3),
+    v: wp.array(dtype=wp.vec3),
+    radius: wp.array(dtype=float),
+    mass: wp.array(dtype=float),
+    volume: wp.array(dtype=float),
+    kind: wp.array(dtype=wp.int32),
+    material: wp.array(dtype=wp.int32),
+    building_id: wp.array(dtype=wp.int32),
+    structural_class: wp.array(dtype=wp.int32),
+    fixed: wp.array(dtype=wp.int32),
+    damage: wp.array(dtype=float),
+    rho_reference: wp.array(dtype=float),
+    rho: wp.array(dtype=float),
+    acceleration: wp.array(dtype=wp.vec3),
+    solid_force: wp.array(dtype=wp.vec3),
+    base_fixed: wp.array(dtype=wp.int32),
+    fragment_id: wp.array(dtype=wp.int32),
+    normal_axis: wp.array(dtype=wp.int32),
+    time_level: wp.array(dtype=wp.int32),
+    time_active: wp.array(dtype=wp.int32),
+    surface_mask: wp.array(dtype=wp.int32),
+    surface_normal: wp.array(dtype=wp.vec3),
+    foam_strength: wp.array(dtype=float),
+    shallow: wp.array2d(dtype=wp.vec3),
+    exchange_volume: wp.array2d(dtype=float),
+    exchange_x: wp.array2d(dtype=float),
+    exchange_z: wp.array2d(dtype=float),
+    count: wp.array(dtype=wp.int32),
+    old_count: int,
+    capacity: int,
+    emitter_nx: int,
+    emitter_ny: int,
+    lower_x: float,
+    lower_z: float,
+    interface_z: float,
+    cell_size: float,
+    shallow_nx: int,
+    shallow_nz: int,
+    particle_spacing: float,
+    rest_density: float,
+):
+    emitter_x, emitter_y = wp.tid()
+    if emitter_x >= emitter_nx or emitter_y >= emitter_ny:
+        return
+    px = lower_x + (float(emitter_x) + 0.5) * particle_spacing
+    py = (float(emitter_y) + 0.5) * particle_spacing
+    pz = interface_z + 0.55 * particle_spacing
+    sx = wp.clamp(int(wp.floor((px - lower_x) / cell_size)), 0, shallow_nx - 1)
+    sz = wp.clamp(int(wp.floor((interface_z - lower_z) / cell_size)), 0, shallow_nz - 1)
+    state = shallow[sx, sz]
+    if state[0] <= py + 0.5 * particle_spacing:
+        return
+    position = wp.vec3(px, py, pz)
+    occupied = int(0)
+    query = wp.hash_grid_query(grid, position, particle_spacing * 0.62)
+    for neighbour in query:
+        if neighbour < old_count and kind[neighbour] == 0:
+            if wp.length_sq(x[neighbour] - position) < particle_spacing * particle_spacing * 0.38:
+                occupied = 1
+                break
+    if occupied != 0:
+        return
+    target = wp.atomic_add(count, 0, 1)
+    if target >= capacity:
+        return
+    particle_volume = particle_spacing * particle_spacing * particle_spacing
+    particle_mass = particle_volume * rest_density
+    velocity_x = state[1] / wp.max(state[0], 1.0e-5)
+    velocity_z = state[2] / wp.max(state[0], 1.0e-5)
+    velocity = wp.vec3(velocity_x, 0.0, velocity_z)
+    x[target] = position
+    rest_x[target] = position
+    v[target] = velocity
+    radius[target] = 0.5 * particle_spacing
+    mass[target] = particle_mass
+    volume[target] = particle_volume
+    kind[target] = 0
+    material[target] = 0
+    building_id[target] = -1
+    structural_class[target] = 0
+    fixed[target] = 0
+    damage[target] = 0.0
+    rho_reference[target] = 0.0
+    rho[target] = rest_density
+    acceleration[target] = wp.vec3(0.0)
+    solid_force[target] = wp.vec3(0.0)
+    base_fixed[target] = 0
+    fragment_id[target] = -1
+    normal_axis[target] = -1
+    time_level[target] = 0
+    time_active[target] = 1
+    surface_mask[target] = 0
+    surface_normal[target] = wp.vec3(0.0)
+    foam_strength[target] = 0.0
+    wp.atomic_add(exchange_volume, sx, sz, -particle_volume)
+    wp.atomic_add(exchange_x, sx, sz, -particle_mass * velocity_x)
+    wp.atomic_add(exchange_z, sx, sz, -particle_mass * velocity_z)
 
 
 class ShallowWaterFarField:
@@ -188,6 +294,15 @@ class ShallowWaterFarField:
         self.updated = wp.zeros((self.nx, self.nz), dtype=wp.vec3, device=device)
         self.exchange_x = wp.zeros((self.nx, self.nz), dtype=float, device=device)
         self.exchange_z = wp.zeros((self.nx, self.nz), dtype=float, device=device)
+        self.exchange_volume = wp.zeros((self.nx, self.nz), dtype=float, device=device)
+        self.emitted_particles_total = 0
+        self.emitted_volume_total = 0.0
+        if checkpoint is not None and checkpoint.exists():
+            with np.load(checkpoint, allow_pickle=False) as saved:
+                if "shallow_emitted_particles_total" in saved:
+                    self.emitted_particles_total = int(saved["shallow_emitted_particles_total"])
+                if "shallow_emitted_volume_total" in saved:
+                    self.emitted_volume_total = float(saved["shallow_emitted_volume_total"])
 
     def couple(self, arrays: dict, count: int, dt: float):
         if not self.enabled:
@@ -211,11 +326,7 @@ class ShallowWaterFarField:
             return
         step_dt = self.accumulated_dt
         self.accumulated_dt = 0.0
-        wp.launch(
-            apply_exchange_impulse, dim=(self.nx, self.nz),
-            inputs=[self.state, self.exchange_x, self.exchange_z,
-                    rest_density * self.cell_size * self.cell_size], device=self.device,
-        )
+        self.commit_exchange(rest_density)
         maximum_dt = float(self.cfg.get("maximum_step", 0.02))
         substeps = max(1, int(math.ceil(step_dt / maximum_dt)))
         local_dt = step_dt / substeps
@@ -227,6 +338,23 @@ class ShallowWaterFarField:
                         float(self.cfg.get("dry_depth", 0.02))], device=self.device,
             )
             self.state, self.updated = self.updated, self.state
+
+    def commit_exchange(self, rest_density: float):
+        """Apply pending SPH exchange without advancing the shallow grid.
+
+        Emission happens at an output boundary. Committing it immediately keeps
+        the 2D and 3D representations conservative in that same rendered frame
+        and prevents checkpoints from storing a newly emitted particle while
+        still retaining its source volume in the shallow field.
+        """
+        if not self.enabled:
+            return
+        wp.launch(
+            apply_exchange_impulse, dim=(self.nx, self.nz),
+            inputs=[self.state, self.exchange_volume, self.exchange_x, self.exchange_z,
+                    self.cell_size * self.cell_size,
+                    rest_density * self.cell_size * self.cell_size], device=self.device,
+        )
 
     def surface_mesh(self):
         """Return the visible rear-field free surface up to the SPH overlap."""
@@ -254,6 +382,85 @@ class ShallowWaterFarField:
                 triangles.extend((a, b, a + 1, b, b + 1, a + 1))
         return vertices, np.asarray(triangles, dtype=np.int32)
 
+    def stitched_surface_samples(self, sph_surface_positions: np.ndarray):
+        """Create a shallow/SPH transition sheet for the common scalar field.
+
+        These are reconstruction samples, not additional physical particles.
+        Their height follows the 2D field in the rear and smoothly approaches
+        a robust SPH free-surface height inside the overlap. Marching Cubes can
+        therefore build one surface instead of two independently rasterized
+        planes with a visible step between them.
+        """
+        if not self.enabled or not bool(self.cfg.get("stitch_surface", True)):
+            return np.empty((0, 3), dtype=np.float32), np.empty(0, dtype=np.float32)
+        spacing = float(self.cfg.get("surface_sample_spacing", 1.3))
+        coupling_width = float(self.cfg.get("coupling_width", 4.0))
+        upper_z = self.interface_z + coupling_width
+        xs = np.arange(
+            self.lower_x + 0.5 * spacing,
+            self.lower_x + self.nx * self.cell_size,
+            spacing,
+            dtype=np.float32,
+        )
+        zs = np.arange(
+            self.lower_z + 0.5 * spacing,
+            upper_z + 0.25 * spacing,
+            spacing,
+            dtype=np.float32,
+        )
+        state = self.state.numpy()
+        heights = state[:, :, 0]
+        ix = np.clip(((xs - self.lower_x) / self.cell_size).astype(np.int32), 0, self.nx - 1)
+        interface_iz = int(np.clip((self.interface_z - self.lower_z) / self.cell_size, 0, self.nz - 1))
+        target = heights[ix, interface_iz].astype(np.float32, copy=True)
+
+        sph = np.asarray(sph_surface_positions, dtype=np.float32)
+        if len(sph):
+            band = (
+                (sph[:, 2] >= self.interface_z)
+                & (sph[:, 2] <= self.interface_z + 2.0 * coupling_width)
+                & (sph[:, 1] > float(self.cfg.get("minimum_stitch_height", 4.0)))
+            )
+            band_points = sph[band]
+            if len(band_points):
+                bins = np.clip(
+                    ((band_points[:, 0] - self.lower_x) / spacing).astype(np.int32),
+                    0,
+                    len(xs) - 1,
+                )
+                known = []
+                for bin_index in np.unique(bins):
+                    values = band_points[bins == bin_index, 1]
+                    if len(values) >= 2:
+                        target[bin_index] = float(np.quantile(values, 0.95))
+                        known.append(int(bin_index))
+                if known:
+                    known = np.asarray(known, dtype=np.int32)
+                    target = np.interp(
+                        np.arange(len(xs), dtype=np.float32), known.astype(np.float32), target[known]
+                    ).astype(np.float32)
+        base_at_interface = heights[ix, interface_iz]
+        maximum_delta = float(self.cfg.get("maximum_stitch_height_delta", 6.0))
+        target = np.clip(target, base_at_interface - maximum_delta, base_at_interface + maximum_delta)
+
+        samples = np.empty((len(xs) * len(zs), 3), dtype=np.float32)
+        cursor = 0
+        transition_start = self.interface_z - coupling_width
+        transition_span = max(2.0 * coupling_width, 1.0e-5)
+        for z in zs:
+            iz = int(np.clip((z - self.lower_z) / self.cell_size, 0, self.nz - 1))
+            shallow_height = heights[ix, iz]
+            blend = float(np.clip((z - transition_start) / transition_span, 0.0, 1.0))
+            blend = blend * blend * (3.0 - 2.0 * blend)
+            row_height = shallow_height * (1.0 - blend) + target * blend
+            count = len(xs)
+            samples[cursor:cursor + count, 0] = xs
+            samples[cursor:cursor + count, 1] = row_height
+            samples[cursor:cursor + count, 2] = z
+            cursor += count
+        radius = np.full(len(samples), spacing * 0.5, dtype=np.float32)
+        return samples, radius
+
     def diagnostics(self):
         host = self.state.numpy()
         area = self.cell_size * self.cell_size
@@ -262,4 +469,6 @@ class ShallowWaterFarField:
             "shallow_water_wet_cells": int(np.count_nonzero(host[:, :, 0] > 0.02)),
             "shallow_water_volume_m3": float(np.sum(host[:, :, 0], dtype=np.float64) * area),
             "shallow_water_momentum_z": float(np.sum(host[:, :, 2], dtype=np.float64) * area),
+            "shallow_emitted_particles": self.emitted_particles_total,
+            "shallow_emitted_volume_m3": self.emitted_volume_total,
         }

@@ -53,7 +53,7 @@ from hybrid_model import (  # noqa: E402
 )
 from hybrid_renderer import HybridRenderer  # noqa: E402
 from rigid_clusters import fit_rigid_cluster  # noqa: E402
-from shallow_water import ShallowWaterFarField  # noqa: E402
+from shallow_water import ShallowWaterFarField, emit_sph_interface_particles  # noqa: E402
 from surface_kernels import (  # noqa: E402
     blend_sparse_fields,
     classify_water_surface,
@@ -301,6 +301,7 @@ class HybridDelugeSolver(DelugeSolver):
         self.water_splash_active_keys = set()
         self.water_splash_brick_count = 0
         self.water_splash_mesh_vertices = 0
+        self.water_stitch_sample_count = 0
         if checkpoint is not None and checkpoint.exists():
             with np.load(checkpoint, allow_pickle=False) as saved:
                 if "water_mesh_domain_lower" in saved:
@@ -367,6 +368,11 @@ class HybridDelugeSolver(DelugeSolver):
         )
         excluded = np.any((positions < robust_minimum) | (positions > robust_maximum), axis=1)
         self.water_mesh_excluded_surface_count = int(np.count_nonzero(excluded))
+        stitch_positions, stitch_radii = self.shallow_water.stitched_surface_samples(positions)
+        self.water_stitch_sample_count = len(stitch_positions)
+        if len(stitch_positions):
+            robust_minimum = np.minimum(robust_minimum, stitch_positions.min(axis=0))
+            robust_maximum = np.maximum(robust_maximum, stitch_positions.max(axis=0))
 
         robust_minimum, robust_maximum = hysteretic_bounds(
             self.water_mesh_domain_lower,
@@ -420,6 +426,16 @@ class HybridDelugeSolver(DelugeSolver):
                     self.arrays["kind"][:self.count], self.arrays["water_surface_mask"][:self.count],
                     field, wp.vec3(*lower), voxel, nx, ny, nz], device=self.device,
         )
+        if len(stitch_positions):
+            stitch_x = wp.array(stitch_positions, dtype=wp.vec3, device=self.device)
+            stitch_radius = wp.array(stitch_radii, dtype=float, device=self.device)
+            stitch_kind = wp.zeros(len(stitch_positions), dtype=wp.int32, device=self.device)
+            stitch_mask = wp.ones(len(stitch_positions), dtype=wp.int32, device=self.device)
+            wp.launch(
+                splat_sparse_surface_field, dim=len(stitch_positions),
+                inputs=[stitch_x, stitch_radius, stitch_kind, stitch_mask, field,
+                        wp.vec3(*lower), voxel, nx, ny, nz], device=self.device,
+            )
         smoothing_iterations = max(0, int(self.water_mesh_cfg.get("field_smoothing_iterations", 1)))
         if smoothing_iterations:
             temporary = wp.zeros(shape, dtype=float, device=self.device)
@@ -455,7 +471,6 @@ class HybridDelugeSolver(DelugeSolver):
         vertices, indices = self._append_splash_brick_meshes(
             vertices, indices, positions, surface_radii, excluded
         )
-        vertices, indices = self._append_shallow_surface_mesh(vertices, indices)
         self.water_sparse_field = field
         self.water_mesh_field_lower = lower.copy()
         self.water_mesh_vertices = vertices
@@ -594,6 +609,8 @@ class HybridDelugeSolver(DelugeSolver):
             water_mesh_lod_change_count=np.int32(self.water_mesh_lod_change_count),
             shallow_water_state=self.shallow_water.state.numpy(),
             shallow_water_accumulated_dt=np.float32(self.shallow_water.accumulated_dt),
+            shallow_emitted_particles_total=np.int64(self.shallow_water.emitted_particles_total),
+            shallow_emitted_volume_total=np.float64(self.shallow_water.emitted_volume_total),
         )
         print(f"  V3 checkpoint: {v3_path.name} ({v3_path.stat().st_size / 1024**2:.1f} MiB)")
 
@@ -741,6 +758,13 @@ class HybridDelugeSolver(DelugeSolver):
         view = a["x"][:self.count]
         self.grid.build(view, self.max_support)
         wp.launch(clear_vec3, dim=self.count, inputs=[a["solid_force"][:self.count]], device=self.device)
+        shallow_policy = self.v3_cfg.get("shallow_water", {})
+        particle_z_min = (
+            float(shallow_policy.get("sph_z_min", self.cfg["reservoir_z_min"]))
+            if bool(shallow_policy.get("enabled", False))
+            and bool(shallow_policy.get("replace_far_sph", False))
+            else float(self.cfg["reservoir_z_min"])
+        )
         if self.multirate_enabled:
             classify_every = max(4, int(self.multirate_cfg.get("classify_every_substeps", 256)))
             if self.multirate_tick % classify_every == 0 and self.multirate_tick % 4 == 0:
@@ -879,7 +903,7 @@ class HybridDelugeSolver(DelugeSolver):
                 integrate_multirate, dim=self.count,
                 inputs=[view, a["v"][:self.count], a["acceleration"][:self.count], a["kind"][:self.count],
                         a["fixed"][:self.count], self.time_level[:self.count], self.time_active[:self.count],
-                        dt, float(self.cfg["domain_width"]) * 0.5, float(self.cfg["reservoir_z_min"]),
+                        dt, float(self.cfg["domain_width"]) * 0.5, particle_z_min,
                         float(self.cfg["domain_z_max"]), float(self.cfg["domain_y_max"]),
                         float(self.cfg.get("fluid_bed_drag", 0.12))], device=self.device,
             )
@@ -889,7 +913,7 @@ class HybridDelugeSolver(DelugeSolver):
                 integrate, dim=self.count,
                 inputs=[view, a["v"][:self.count], a["acceleration"][:self.count], a["kind"][:self.count],
                         a["fixed"][:self.count], dt, float(self.cfg["domain_width"]) * 0.5,
-                        float(self.cfg["reservoir_z_min"]), float(self.cfg["domain_z_max"]),
+                        particle_z_min, float(self.cfg["domain_z_max"]),
                         float(self.cfg["domain_y_max"]), float(self.cfg.get("fluid_bed_drag", 0.12))],
                 device=self.device,
             )
@@ -981,8 +1005,18 @@ class HybridDelugeSolver(DelugeSolver):
             )
 
     def stats(self):
+        self._emit_shallow_interface_particles()
         self.update_rigid_clusters()
         result = super().stats()
+        kind_host = self.arrays["kind"][:self.count].numpy()
+        fluid_mask = kind_host == 0
+        volume_host = self.arrays["volume"][:self.count].numpy()
+        result["fluid_volume_m3"] = float(np.sum(volume_host[fluid_mask], dtype=np.float64))
+        mass_host = self.arrays["mass"][:self.count].numpy()
+        velocity_host = self.arrays["v"][:self.count].numpy()
+        result["fluid_momentum_z_kg_m_s"] = float(
+            np.sum(mass_host[fluid_mask] * velocity_host[fluid_mask, 2], dtype=np.float64)
+        )
         active_count = int(np.count_nonzero(self.building_active.numpy())) if self.building_count else 0
         if active_count != self.last_active_count:
             print(f"  V3 building activation: {self.last_active_count} -> {active_count}")
@@ -1022,9 +1056,10 @@ class HybridDelugeSolver(DelugeSolver):
         result["rigid_reactivated_fragments"] = reactivated_total
         if self.multirate_enabled:
             levels = self.time_level[:self.count].numpy()
-            fluid = self.arrays["kind"][:self.count].numpy() == 0
             for level in range(3):
-                result[f"time_level_{level}_particles"] = int(np.count_nonzero(fluid & (levels == level)))
+                result[f"time_level_{level}_particles"] = int(
+                    np.count_nonzero(fluid_mask & (levels == level))
+                )
         self.update_water_surface()
         if self.surface_enabled:
             surface_mask = self.arrays["water_surface_mask"][:self.count].numpy()
@@ -1037,8 +1072,56 @@ class HybridDelugeSolver(DelugeSolver):
             result["water_mesh_lod_changes"] = self.water_mesh_lod_change_count
             result["water_splash_bricks"] = self.water_splash_brick_count
             result["water_splash_mesh_vertices"] = self.water_splash_mesh_vertices
+            result["water_stitch_surface_samples"] = self.water_stitch_sample_count
             result.update(self.shallow_water.diagnostics())
         return result
+
+    def _emit_shallow_interface_particles(self):
+        policy = self.v3_cfg.get("shallow_water", {})
+        if not (
+            bool(policy.get("enabled", False))
+            and bool(policy.get("replace_far_sph", False))
+            and bool(policy.get("emit_sph", True))
+        ):
+            return
+        spacing = float(policy.get("emitter_spacing", self.cfg.get("coarse_spacing", 1.0)))
+        emitter_nx = max(1, int(np.floor(float(self.cfg["domain_width"]) / spacing)))
+        emitter_ny = max(
+            1,
+            int(np.ceil((float(self.cfg["water_depth"]) + float(self.cfg["wave_height"])) / spacing)),
+        )
+        old_count = self.count
+        self.grid.build(self.arrays["x"][:old_count], self.max_support)
+        counter = wp.array(np.asarray([old_count], dtype=np.int32), dtype=wp.int32, device=self.device)
+        wp.launch(
+            emit_sph_interface_particles, dim=(emitter_nx, emitter_ny),
+            inputs=[self.grid.id, self.arrays["x"], self.arrays["rest_x"], self.arrays["v"],
+                    self.arrays["radius"], self.arrays["mass"], self.arrays["volume"],
+                    self.arrays["kind"], self.arrays["material"], self.arrays["building_id"],
+                    self.arrays["structural_class"], self.arrays["fixed"], self.arrays["damage"],
+                    self.arrays["rho_reference"], self.arrays["rho"], self.arrays["acceleration"],
+                    self.arrays["solid_force"], self.base_fixed, self.fragment_id, self.normal_axis,
+                    self.time_level, self.time_active, self.arrays["water_surface_mask"],
+                    self.arrays["water_surface_normal"], self.arrays["water_foam_strength"],
+                    self.shallow_water.state, self.shallow_water.exchange_volume,
+                    self.shallow_water.exchange_x, self.shallow_water.exchange_z,
+                    counter, old_count, self.capacity, emitter_nx, emitter_ny,
+                    self.shallow_water.lower_x, self.shallow_water.lower_z,
+                    self.shallow_water.interface_z, self.shallow_water.cell_size,
+                    self.shallow_water.nx, self.shallow_water.nz, spacing,
+                    float(self.cfg["rest_density"])], device=self.device,
+        )
+        wp.synchronize_device(self.device)
+        self.count = min(int(counter.numpy()[0]), self.capacity)
+        emitted = self.count - old_count
+        if emitted > 0:
+            self.shallow_water.emitted_particles_total += emitted
+            self.shallow_water.emitted_volume_total += emitted * spacing ** 3
+            self.shallow_water.commit_exchange(float(self.cfg["rest_density"]))
+            print(
+                f"  V3 shallow -> SPH emission: +{emitted:,} particles "
+                f"({self.shallow_water.emitted_particles_total:,} total)"
+            )
 
 
 def main():

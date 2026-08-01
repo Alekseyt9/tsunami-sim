@@ -74,18 +74,20 @@ Reopen the file in VLC or mpv after another simulated second is completed to see
 
 ## Current RTX 5070 results
 
-The clean 100-frame V3.6 QA run used four cameras in one H.264 video:
+The corrected 100-frame V3.7 QA run used four cameras in one H.264 video:
 
 - 100 output frames, 4.1667 simulated seconds;
-- 459.4 seconds total wall time;
-- 4.57 seconds average per output frame;
-- 170,131 initial particles and 566,895 peak particles after adaptive refinement;
-- 255,829 peak fluid particles;
+- 479.0 seconds total wall time;
+- 4.77 seconds average per output frame;
+- 170,131 initial particles and 583,937 peak particles after adaptive refinement;
+- 276,254 peak fluid particles;
 - 1,659.6 MiB peak reported VRAM use;
-- 788 released cohesive fragments and one active rigid cluster;
-- 37,652 late water-mesh vertices and 74,870 triangles;
+- 753 released cohesive fragments and two active rigid clusters;
+- 38,934-41,788 late water-mesh vertices after frame 85;
 - a constant 0.65 m water voxel from frame 0 through frame 99;
-- zero water-mesh LOD changes and no late collapse to spherical spray.
+- zero water-mesh LOD changes and no late collapse to spherical spray;
+- 9,708 m3 transferred conservatively from the 2D field to SPH;
+- 0.813% combined 2D+3D water-volume drift over 4.1667 simulated seconds.
 
 The V3.4 wide-scene validation used a 420 m domain and 45 buildings:
 
@@ -93,7 +95,7 @@ The V3.4 wide-scene validation used a 420 m domain and 45 buildings:
 - 19,320 shallow-water cells;
 - about 1.64 GiB reported VRAM use.
 
-The shallow-water regression measured 0.249% volume drift after one simulated second and a zero float32 residual for the SPH↔2D exchange impulse.
+The shallow-water regression measured 0.249% volume drift after one simulated second. Both the SPH↔2D exchange impulse and the shallow-to-SPH emission volume/momentum tests have zero float32 residual.
 
 ## Water representation
 
@@ -101,7 +103,9 @@ The local impact region is simulated with 3D SPH particles. Only classified free
 
 Sparse distant droplets do not expand the global reconstruction box. Bounds expand immediately but shrink gradually; improved voxel LOD requires eight stable frames. Dense splash sheets outside the main water body receive up to six local 12 m mesh bricks with a 0.4 m voxel, while isolated droplets stay inexpensive anisotropic spray samples.
 
-The shallow-water far field remains part of the physics and momentum coupling, but is not drawn as a second independent surface. This avoids two overlapping water planes at different heights in side views.
+The shallow-water far field and the local SPH surface are now reconstructed as one mesh. Graphical samples from the 2D field are smoothly blended to the robust SPH free-surface height in the overlap, then splatted into the same scalar field before Marching Cubes. There is no second water plane at another height.
+
+Empty interface sites can emit SPH particles from the shallow field. Every emitted particle removes the same volume and horizontal momentum from its source 2D cell in the same rendered frame, including checkpoint boundaries.
 
 ## Structural model
 
@@ -117,6 +121,12 @@ Run the complete CUDA regression batch:
 
 ```bat
 validate_v3_gpu.bat
+```
+
+Validate a completed 100-frame production directory:
+
+```bat
+.venv\Scripts\python.exe validate_production_output.py outputs\your_run --expected-frames 100
 ```
 
 It covers:
@@ -135,6 +145,7 @@ It covers:
 - `deluge_v3.py` — V3 orchestration, checkpoints, surface reconstruction, and simulation loop integration.
 - `solver_base.py` — shared particle solver and output loop in the standalone repository.
 - `shallow_water.py` — GPU shallow-water solver and conservative SPH interface coupling.
+- `validate_production_output.py` — MP4, water-balance, late-mesh, and metric validation.
 - `hybrid_kernels.py` — structural LOD, fracture, multirate, rigid-body, contact, and facade CUDA kernels.
 - `hybrid_model.py` — cohesive fragments, refinement axes, and facade generation.
 - `hybrid_renderer.py` — facade and reconstructed-water rendering.
@@ -144,4 +155,4 @@ It covers:
 
 ## Status
 
-V3.3d mesh stability, V3.4 shallow-water far field, V3.5 debris contacts, and the 100-frame portion of V3.6 are implemented and validated. The previous 8-second continuation was intentionally stopped after detecting the duplicated far-water rendering plane; the renderer configuration now keeps only the unified local surface visible. A new full 8-second production run should be started from a checkpoint produced with the corrected configuration.
+V3.3d mesh stability, V3.4 shallow-water far field, V3.5 debris contacts, V3.6 progressive output, and the 100-frame V3.7 stitched/conservative water run are implemented and validated. The duplicated far-water plane is removed, shallow and SPH samples feed one reconstructed surface, and a playable MP4 is exposed every completed simulated second. The next production milestone is the full eight-second run followed by conservative SPH-to-shallow merging for return flow.
