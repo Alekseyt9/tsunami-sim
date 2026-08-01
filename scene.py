@@ -101,6 +101,12 @@ class ParticleScene:
         fine = float(cfg["fine_spacing"])
         surface_band = float(cfg.get("fine_surface_band", 2.0))
         rng = np.random.default_rng(4192)
+        shallow_cfg = cfg.get("v3", {}).get("shallow_water", {})
+        if bool(shallow_cfg.get("enabled", False)) and bool(shallow_cfg.get("replace_far_sph", False)):
+            # V3 keeps expensive particles only in the near-field window. The
+            # removed smooth rear reservoir is evolved by its 2D conservative
+            # shallow-water field and overlaps this boundary for coupling.
+            z_min = max(z_min, float(shallow_cfg.get("sph_z_min", z_min)))
 
         # Production-stable path: a uniform discretization avoids the density
         # inconsistency of a naive coarse/fine interface. The adaptive solver is

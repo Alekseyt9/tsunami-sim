@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import numpy as np
 import warp as wp
 
+
+ROOT = Path(__file__).resolve().parents[1]
+V2 = ROOT / "v2_particle_solver"
+if str(V2) not in sys.path:
+    sys.path.insert(0, str(V2))
 
 from surface_kernels import smooth_sparse_field_axis, splat_sparse_surface_field  # noqa: E402
 

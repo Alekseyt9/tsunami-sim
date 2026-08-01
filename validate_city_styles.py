@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 
 import numpy as np
 
 
 HERE = Path(__file__).resolve().parent
+V2 = HERE.parent / "v2_particle_solver"
+if str(V2) not in sys.path:
+    sys.path.insert(0, str(V2))
 
 from scene import ParticleScene, building_profile  # noqa: E402
 from hybrid_model import build_facade_skin  # noqa: E402

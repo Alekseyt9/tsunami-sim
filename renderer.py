@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -97,7 +98,7 @@ class ParticleRenderer:
         image = Image.fromarray(rgb, "RGB")
         draw = ImageDraw.Draw(image, "RGBA")
         draw.rectangle((20, 18, 420, 88), fill=(4, 14, 18, 190), outline=(80, 214, 228, 95), width=1)
-        draw.text((36, 30), "DELUGE V3 / CUDA PARTICLE SOLVER", fill=(220, 241, 244, 255))
+        draw.text((36, 30), "DELUGE V2 / CUDA PARTICLE SOLVER", fill=(220, 241, 244, 255))
         draw.text((36, 54), f"FRAME {frame:05d}   T+{time_s:07.3f}s   {count:,} PARTICLES", fill=(102, 206, 217, 255))
         draw.rectangle((self.width - 330, 18, self.width - 20, 112), fill=(4, 14, 18, 190), outline=(255, 255, 255, 45), width=1)
         draw.text((self.width - 312, 30), f"WATER  {stats['fluid']:,}", fill=(92, 198, 215, 255))
@@ -110,7 +111,7 @@ class ParticleRenderer:
 
 
 class StreamingVideoWriter:
-    """Stream RGB frames to recoverable video, optionally as live fMP4 fragments."""
+    """Encode RGB frames with a recoverable one-second progressive preview."""
 
     def __init__(self, output_file: Path, width: int, height: int, fps: int, codec: str = "h264_nvenc",
                  progressive_fragment_seconds: float = 0.0):
@@ -118,14 +119,30 @@ class StreamingVideoWriter:
         self.progressive_fragment_seconds = max(0.0, float(progressive_fragment_seconds))
         self.progressive = self.progressive_fragment_seconds > 0.0
         self.fragment_frames = max(1, int(round(fps * self.progressive_fragment_seconds))) if self.progressive else 0
-        # Progressive mode writes directly to the requested MP4.  Its empty
-        # moov plus completed moof/mdat fragments can be opened while FFmpeg
-        # is still receiving later frames.  Legacy mode retains recoverable MKV.
-        self.temp_file = output_file if self.progressive else output_file.with_suffix(".stream.mkv")
         self.log_path = output_file.with_suffix(".ffmpeg.log")
         self.log_file = self.log_path.open("w", encoding="utf-8")
         self.ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
         self.frames_written = 0
+        self.width = int(width)
+        self.height = int(height)
+        self.fps = int(fps)
+        self.codec = codec
+        self.segment_frames: list[bytes] = []
+        self.segment_files: list[Path] = []
+        self.segment_dir = output_file.with_suffix(".segments")
+        if self.progressive:
+            # A completed second is encoded as an independent MP4, then all
+            # completed seconds are stream-copied to the public file through
+            # an atomic replace. Windows therefore reports a real non-zero
+            # playable MP4 after every simulated second, even if the solver is
+            # interrupted before close(). Segment files remain recoverable.
+            self.segment_dir.mkdir(parents=True, exist_ok=True)
+            for stale in self.segment_dir.glob("segment_*.mp4"):
+                stale.unlink()
+            self.process = None
+            return
+
+        self.temp_file = output_file.with_suffix(".stream.mkv")
         command = [
             self.ffmpeg, "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}",
             "-r", str(fps), "-i", "-", "-an", "-c:v", codec,
@@ -135,35 +152,66 @@ class StreamingVideoWriter:
         else:
             command += ["-preset", "medium", "-crf", "17"]
         command += ["-pix_fmt", "yuv420p"]
-        if self.progressive:
-            fragment_us = max(1, int(round(self.progressive_fragment_seconds * 1_000_000.0)))
-            if codec == "h264_nvenc":
-                command += ["-zerolatency", "1", "-delay", "0", "-rc-lookahead", "0"]
-            else:
-                command += ["-tune", "zerolatency"]
-            command += [
-                "-g", str(self.fragment_frames),
-                "-bf", "0",
-                "-force_key_frames", f"expr:gte(t,n_forced*{self.progressive_fragment_seconds:.9f})",
-                "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
-                "-frag_duration", str(fragment_us),
-                "-flush_packets", "1",
-            ]
         command += [str(self.temp_file)]
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=self.log_file)
 
     def write(self, rgb: np.ndarray):
+        frame_bytes = np.ascontiguousarray(rgb).tobytes()
+        if self.progressive:
+            self.segment_frames.append(frame_bytes)
+            self.frames_written += 1
+            if len(self.segment_frames) >= self.fragment_frames:
+                self._flush_progressive_segment()
+            return
         if self.process.stdin is None:
             raise RuntimeError("FFmpeg input pipe is closed")
-        self.process.stdin.write(np.ascontiguousarray(rgb).tobytes())
+        self.process.stdin.write(frame_bytes)
         self.frames_written += 1
-        # A keyframe at the start of the next interval closes the preceding
-        # fragment.  Flush the Python pipe around both sides of that boundary
-        # so the playable file appears as soon as one simulated second exists.
-        if self.progressive and self.frames_written % self.fragment_frames in (0, 1):
-            self.process.stdin.flush()
+
+    def _flush_progressive_segment(self):
+        if not self.segment_frames:
+            return
+        segment = self.segment_dir / f"segment_{len(self.segment_files):05d}.mp4"
+        command = [
+            self.ffmpeg, "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-s", f"{self.width}x{self.height}", "-r", str(self.fps), "-i", "-",
+            "-an", "-c:v", self.codec,
+        ]
+        if self.codec == "h264_nvenc":
+            command += ["-preset", "p5", "-tune", "hq", "-rc", "vbr", "-cq", "18", "-b:v", "0"]
+        else:
+            command += ["-preset", "medium", "-crf", "17"]
+        command += ["-pix_fmt", "yuv420p", "-movflags", "+faststart", str(segment)]
+        result = subprocess.run(
+            command, input=b"".join(self.segment_frames), stdout=subprocess.DEVNULL, stderr=self.log_file
+        )
+        self.log_file.flush()
+        if result.returncode != 0:
+            raise RuntimeError(f"Progressive segment encoding failed; see {self.log_path}")
+        self.segment_frames.clear()
+        self.segment_files.append(segment)
+        manifest = self.segment_dir / "concat.txt"
+        manifest.write_text(
+            "".join(f"file '{path.name}'\n" for path in self.segment_files), encoding="utf-8"
+        )
+        preview = self.output_file.with_suffix(".previewing.mp4")
+        result = subprocess.run(
+            [self.ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(manifest),
+             "-c", "copy", "-movflags", "+faststart", str(preview)],
+            stdout=subprocess.DEVNULL, stderr=self.log_file,
+        )
+        self.log_file.flush()
+        if result.returncode != 0:
+            raise RuntimeError(f"Progressive preview assembly failed; see {self.log_path}")
+        os.replace(preview, self.output_file)
 
     def close(self):
+        if self.progressive:
+            self._flush_progressive_segment()
+            self.log_file.close()
+            if self.segment_files:
+                shutil.rmtree(self.segment_dir, ignore_errors=True)
+            return
         if self.process.stdin is not None:
             self.process.stdin.close()
         code = self.process.wait()
@@ -171,15 +219,12 @@ class StreamingVideoWriter:
         if code != 0:
             raise RuntimeError(f"Streaming FFmpeg failed with exit code {code}; see {self.log_path}")
         remux_source = self.temp_file
-        remux_target = self.output_file.with_suffix(".finalizing.mp4") if self.progressive else self.output_file
+        remux_target = self.output_file
         subprocess.run(
             [self.ffmpeg, "-y", "-i", str(remux_source), "-c", "copy", "-movflags", "+faststart", str(remux_target)],
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        if self.progressive:
-            os.replace(remux_target, self.output_file)
-        else:
-            self.temp_file.unlink(missing_ok=True)
+        self.temp_file.unlink(missing_ok=True)
 
 
 def encode_video(frames_dir: Path, output_file: Path, fps: int):

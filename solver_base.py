@@ -1,11 +1,13 @@
-"""Shared offline CUDA particle solver used by DELUGE V3.
+"""Shared standalone CUDA particle solver used by DELUGE V3.
 
 The solver deliberately prioritizes physical state and reproducible offline
-frames over real-time playback. See README.md for usage and numerical checks.
+frames over real-time playback. See README.md.
 """
 
 from __future__ import annotations
 
+import argparse
+from datetime import datetime
 import json
 import math
 from pathlib import Path
@@ -230,7 +232,7 @@ class DelugeSolver:
         quad_order = list(render_cfg.get("quad_order", view_renderers.keys()))
         stream_writers = {}
         if output_mode == "video":
-            output_basename = str(self.cfg.get("output_basename", "deluge_v3"))
+            output_basename = str(self.cfg.get("output_basename", "deluge_v2"))
             if quad_layout:
                 segment = f"_segment_{self.start_frame:05d}" if self.start_frame != 0 else ""
                 stream_writers["quad"] = StreamingVideoWriter(
@@ -294,10 +296,13 @@ class DelugeSolver:
                 "gpu_memory_used_mib": gpu_used_mib,
             }
             for optional_stat in ("active_buildings", "released_fragments", "rigid_clusters", "rigid_particles",
+                                  "rigid_reactivated_fragments",
                                   "time_level_0_particles", "time_level_1_particles", "time_level_2_particles",
                                   "surface_water_particles", "water_mesh_vertices", "water_mesh_triangles",
                                   "water_field_nodes", "water_mesh_excluded_surface_particles",
-                                  "water_mesh_voxel_millimeters"):
+                                  "water_mesh_voxel_millimeters", "water_mesh_lod_changes",
+                                  "water_splash_bricks", "water_splash_mesh_vertices",
+                                  "shallow_water_cells", "shallow_water_wet_cells"):
                 if optional_stat in stats:
                     row[optional_stat] = int(stats[optional_stat])
             benchmark_rows.append(row)
@@ -317,7 +322,7 @@ class DelugeSolver:
             encoding_elapsed = time.perf_counter() - encoding_started
         elif not smoke and not no_video:
             encoding_started = time.perf_counter()
-            output_basename = str(self.cfg.get("output_basename", "deluge_v3"))
+            output_basename = str(self.cfg.get("output_basename", "deluge_v2"))
             encode_targets = [("", self.frames_dir)] if quad_layout else [
                 (f"_{view_name}" if multiple_views or view_name != "main" else "",
                  self.frames_dir / view_name if multiple_views else self.frames_dir)
@@ -356,11 +361,40 @@ class DelugeSolver:
                 "peak_gpu_memory_used_mib": max(row["gpu_memory_used_mib"] for row in benchmark_rows),
             }
             for optional_stat in ("active_buildings", "released_fragments", "rigid_clusters", "rigid_particles",
+                                  "rigid_reactivated_fragments",
                                   "time_level_0_particles", "time_level_1_particles", "time_level_2_particles",
                                   "surface_water_particles", "water_mesh_vertices", "water_mesh_triangles",
-                                  "water_field_nodes"):
+                                  "water_field_nodes", "water_mesh_lod_changes", "water_splash_bricks",
+                                  "water_splash_mesh_vertices", "shallow_water_cells",
+                                  "shallow_water_wet_cells"):
                 if optional_stat in benchmark_rows[0]:
                     summary[f"peak_{optional_stat}"] = max(row.get(optional_stat, 0) for row in benchmark_rows)
             (self.output / "benchmark_summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
         if render_times:
             print(f"Complete. Average output-frame wall time: {sum(render_times)/len(render_times):.2f}s")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="DELUGE V2 offline CUDA particle simulation")
+    parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config_preview.json"))
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--resume", type=Path)
+    parser.add_argument("--smoke", action="store_true", help="Compile and test all CUDA stages using two frames")
+    parser.add_argument("--no-video", action="store_true")
+    args = parser.parse_args()
+
+    cfg = json.loads(args.config.read_text(encoding="utf-8"))
+    output = args.output or Path(__file__).with_name("outputs") / datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "config_used.json").write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+    wp.init()
+    device = wp.get_device(cfg.get("device", "cuda:0"))
+    if not device.is_cuda:
+        raise RuntimeError("V2 requires an NVIDIA CUDA device")
+    print(f"DELUGE V2 on {device.name}; CUDA compute {device.arch}; free memory is managed by Warp mempool")
+    solver = DelugeSolver(cfg, output, args.resume)
+    solver.run(smoke=args.smoke, no_video=args.no_video)
+
+
+if __name__ == "__main__":
+    main()

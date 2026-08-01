@@ -1,4 +1,4 @@
-"""Adaptive structural and multirate GPU kernels for DELUGE V3.
+"""Small V3 GPU kernels layered on top of the stable V2 solver.
 
 V3 keeps inactive buildings as immovable SPH boundaries, but skips their
 expensive bond traversal until enough facade particles receive water load.
@@ -164,6 +164,10 @@ def compute_clustered_solid_forces(
         else:
             # Contact remains active after a joint breaks, so chunks collide
             # as rubble instead of passing through one another.
+            # Rigid/rigid pairs are handled once by accumulate_rigid_contacts,
+            # which applies equal/opposite forces, Coulomb friction and torque.
+            if body_rigid and neighbour_rigid:
+                continue
             contact = radius[i] + radius[j]
             if dist < contact:
                 penetration = contact - dist
@@ -249,6 +253,100 @@ def accumulate_rigid_body_loads(
     for axis in range(3):
         wp.atomic_add(body_force, fid, axis, force[axis])
         wp.atomic_add(body_torque, fid, axis, torque[axis])
+
+
+@wp.func
+def contact_friction(material: int) -> float:
+    if material == 2:  # glass
+        return 0.32
+    if material == 3:  # reinforcement steel
+        return 0.48
+    return 0.64  # concrete / masonry
+
+
+@wp.func
+def contact_stiffness(material: int) -> float:
+    if material == 2:
+        return 2.2e6
+    if material == 3:
+        return 6.0e6
+    return 4.0e6
+
+
+@wp.kernel
+def accumulate_rigid_contacts(
+    grid: wp.uint64,
+    x: wp.array(dtype=wp.vec3),
+    v: wp.array(dtype=wp.vec3),
+    radius: wp.array(dtype=float),
+    kind: wp.array(dtype=wp.int32),
+    material: wp.array(dtype=wp.int32),
+    fragment_id: wp.array(dtype=wp.int32),
+    rigid_state: wp.array(dtype=wp.int32),
+    body_center: wp.array(dtype=wp.vec3),
+    body_mass: wp.array(dtype=float),
+    body_force: wp.array2d(dtype=float),
+    body_torque: wp.array2d(dtype=float),
+    contact_acceleration_peak: wp.array(dtype=float),
+    query_radius: float,
+    normal_damping: float,
+    tangential_damping: float,
+):
+    """Pairwise rubble contact using rigid surface samples as the broadphase."""
+    tid = wp.tid()
+    i = wp.hash_grid_point_id(grid, tid)
+    fid = fragment_id[i]
+    if kind[i] == 0 or fid < 0 or rigid_state[fid] == 0:
+        return
+    xi = x[i]
+    query = wp.hash_grid_query(grid, xi, query_radius)
+    for j in query:
+        other = fragment_id[j]
+        if j <= i or kind[j] == 0 or other < 0 or other == fid or rigid_state[other] == 0:
+            continue
+        delta = x[j] - xi
+        distance = wp.length(delta)
+        contact_distance = radius[i] + radius[j]
+        if distance <= 1.0e-6 or distance >= contact_distance:
+            continue
+        normal = delta / distance
+        relative = v[j] - v[i]
+        normal_speed = wp.dot(relative, normal)
+        stiffness = wp.min(contact_stiffness(material[i]), contact_stiffness(material[j]))
+        normal_magnitude = stiffness * (contact_distance - distance)
+        normal_magnitude += normal_damping * wp.max(-normal_speed, 0.0)
+        normal_magnitude = wp.max(normal_magnitude, 0.0)
+        tangent_velocity = relative - normal * normal_speed
+        tangent_speed = wp.length(tangent_velocity)
+        friction_force = wp.vec3(0.0)
+        if tangent_speed > 1.0e-5:
+            friction = wp.min(contact_friction(material[i]), contact_friction(material[j]))
+            friction_magnitude = wp.min(friction * normal_magnitude, tangential_damping * tangent_speed)
+            friction_force = tangent_velocity * (friction_magnitude / tangent_speed)
+        force_on_i = -normal * normal_magnitude + friction_force
+        force_on_j = -force_on_i
+        torque_i = wp.cross(xi - body_center[fid], force_on_i)
+        torque_j = wp.cross(x[j] - body_center[other], force_on_j)
+        for axis in range(3):
+            wp.atomic_add(body_force, fid, axis, force_on_i[axis])
+            wp.atomic_add(body_force, other, axis, force_on_j[axis])
+            wp.atomic_add(body_torque, fid, axis, torque_i[axis])
+            wp.atomic_add(body_torque, other, axis, torque_j[axis])
+        wp.atomic_max(contact_acceleration_peak, fid, normal_magnitude / wp.max(body_mass[fid], 1.0))
+        wp.atomic_max(contact_acceleration_peak, other, normal_magnitude / wp.max(body_mass[other], 1.0))
+
+
+@wp.kernel
+def reactivate_rigid_after_impact(
+    rigid_state: wp.array(dtype=wp.int32),
+    contact_acceleration_peak: wp.array(dtype=float),
+    reactivated_count: wp.array(dtype=wp.int32),
+    acceleration_threshold: float,
+):
+    body = wp.tid()
+    if rigid_state[body] != 0 and contact_acceleration_peak[body] >= acceleration_threshold:
+        rigid_state[body] = 0
+        wp.atomic_add(reactivated_count, 0, 1)
 
 
 @wp.kernel
