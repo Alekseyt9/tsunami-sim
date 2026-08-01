@@ -1,0 +1,4 @@
+warp-lang==1.15.0
+numpy>=2.2
+pillow>=11.0
+imageio-ffmpeg>=0.6
