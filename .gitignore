@@ -5,4 +5,6 @@ outputs/
 *.log
 *.stream.mkv
 *.finalizing.mp4
+*.previewing.mp4
+*.segments/
 .pytest_cache/

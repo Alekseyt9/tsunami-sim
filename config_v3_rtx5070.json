@@ -53,6 +53,19 @@
   "building_palettes": [4, 0, 5, 2, 3, 1, 4, 0, 2, 5, 3, 1, 4, 0, 2],
   "v3": {
     "initially_active_buildings": [],
+    "shallow_water": {
+      "enabled": true,
+      "replace_far_sph": true,
+      "sph_z_min": -22.0,
+      "cell_size": 2.0,
+      "update_interval": 0.008,
+      "maximum_step": 0.02,
+      "coupling_width": 4.0,
+      "velocity_relaxation_rate": 1.5,
+      "bed_drag": 0.006,
+      "dry_depth": 0.02,
+      "render_far_surface": false
+    },
     "activation_force_per_mass": 0.8,
     "minimum_contact_particles": 8,
     "solid_refinement": {
@@ -92,7 +105,10 @@
       "angular_damping": 0.03,
       "maximum_angular_speed": 18.0,
       "boundary_stiffness": 4000000.0,
-      "boundary_damping": 18000.0
+      "boundary_damping": 18000.0,
+      "contact_normal_damping": 3200.0,
+      "contact_tangential_damping": 1800.0,
+      "reactivate_acceleration": 120.0
     },
     "multirate": {
       "enabled": true,
@@ -116,9 +132,20 @@
       "margin_cells": 3.0,
       "bbox_lower_quantile": [0.0, 0.0, 0.0],
       "bbox_upper_quantile": [1.0, 0.995, 0.9975],
+      "domain_shrink_alpha": 0.12,
+      "lod_recovery_frames": 8,
+      "temporal_field_previous_weight": 0.12,
       "iso_threshold": 5.0,
       "field_smoothing_iterations": 1,
-      "rebuild_every_frames": 1
+      "rebuild_every_frames": 1,
+      "splash_bricks_enabled": true,
+      "splash_brick_size": 12.0,
+      "splash_enter_particles": 48,
+      "splash_keep_particles": 24,
+      "maximum_splash_bricks": 6,
+      "splash_voxel_size": 0.4,
+      "splash_margin_cells": 2,
+      "splash_iso_threshold": 1.35
     },
     "facade_skin": {
       "enabled": true,

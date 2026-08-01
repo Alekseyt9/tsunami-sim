@@ -4,11 +4,16 @@ from __future__ import annotations
 
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import time
 
 import numpy as np
 
+
+V2 = Path(__file__).resolve().parents[1] / "v2_particle_solver"
+if str(V2) not in sys.path:
+    sys.path.insert(0, str(V2))
 
 from renderer import StreamingVideoWriter  # noqa: E402
 
@@ -45,6 +50,8 @@ def main() -> None:
                 live_duration = probe_duration(output)
                 if live_duration >= 0.99:
                     break
+            if not output.exists() or output.stat().st_size <= 0:
+                raise AssertionError("public MP4 is still absent or zero-sized after one completed second")
             for frame in range(fps + 1, 50):
                 writer.write(np.full((180, 320, 3), frame, dtype=np.uint8))
         finally:
@@ -63,7 +70,7 @@ def main() -> None:
         if final_frames != 50:
             raise AssertionError(f"final MP4 has {final_frames} frames instead of 50")
         print(
-            f"PASS: open NVENC MP4 exposed {live_duration:.3f}s; "
+            f"PASS: non-zero open NVENC MP4 exposed {live_duration:.3f}s; "
             f"finalized file has {final_frames} frames"
         )
 

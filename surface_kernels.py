@@ -216,6 +216,20 @@ def smooth_sparse_field_axis(
     target[ix, iy, iz] = total / wp.max(weight_sum, 1.0)
 
 
+@wp.kernel
+def blend_sparse_fields(
+    current: wp.array3d(dtype=float),
+    previous: wp.array3d(dtype=float),
+    previous_weight: float,
+):
+    """Temporally filter equal-domain scalar fields before meshing."""
+    ix, iy, iz = wp.tid()
+    current[ix, iy, iz] = (
+        current[ix, iy, iz] * (1.0 - previous_weight)
+        + previous[ix, iy, iz] * previous_weight
+    )
+
+
 @wp.func
 def mesh_edge(a: wp.vec3, b: wp.vec3, px: float, py: float) -> float:
     return (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0])

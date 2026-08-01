@@ -1,116 +1,147 @@
-# DELUGE V3 — hybrid structural LOD
+# DELUGE V3 — GPU Tsunami and City Destruction Simulator
 
-Репозиторий содержит самостоятельную V3: CUDA-ядра воды, разрушения, адаптивный
-структурный solver, реконструкцию поверхности и видеорендер входят в комплект.
+DELUGE V3 is an offline CUDA simulation of a large tsunami hitting a destructible modern city. It combines adaptive 3D SPH water, a GPU shallow-water far field, structural fracture, rigid debris, a reconstructed water surface, and four synchronized camera views.
 
-## Уже реализовано
+![DELUGE V3 four-camera simulation](assets/deluge_v3_quad.jpg)
 
-- все здания начинают как дешёвые неподвижные SPH-препятствия;
-- GPU считает число действительно нагруженных водой частиц каждого здания;
-- после восьми согласованных контактов активируется полный deformable bond graph
-  целого здания, а фундамент остаётся закреплённым;
-- конструкция заранее разбита на архитектурные фрагменты порядка 3×3×3 м;
-- разрушаются соединения между фрагментами, но внутренние связи фрагмента
-  сохраняются — вместо «пыли» получаются плиты, секции стен и крупные обломки;
-- редкие краевые группы автоматически присоединяются к соседнему фрагменту,
-  поэтому одиночная частица не может стать самостоятельным обломком;
-- создаётся `facade_skin.npz` с 16 623 стеновыми, оконными, этажными и кровельными панелями;
-- 6 915 горизонтальных панелей отображают все физические перекрытия и крыши;
-- 66 492 угла панелей привязаны к ближайшим частицам каркаса, поэтому фасад
-  деформируется и отрывается вместе с крупными обломками;
-- каждая панель принадлежит одному связному структурному фрагменту, и все её
-  углы привязываются только к частицам этого фрагмента;
-- если остаточная деформация всё же растягивает сторону треугольника более чем
-  в 1,8 раза, панель считается разорванной и не превращается в гигантский полигон;
-- V3 GPU-рендер рисует треугольники стен и окон вместо круглых solid-splats;
-- одно состояние симуляции последовательно рендерится четырьмя камерами:
-  исходной диагональной, спереди, сбоку и сверху;
-- четыре RGB-кадра объединяются 2×2 и сразу кодируются NVENC в один
-  `deluge_v3.mp4` разрешением 1920×1080 без PNG;
-- возле гидродинамического удара или растущей трещины твёрдая частица локально
-  делится в плоскости стены/плиты 1→4 с шага 0,65 до 0,325 м;
-- тонкая ось стены определяется по связности исходной решётки, поэтому
-  уточнение не добавляет ложную толщину и не создаёт объёмное облако;
-- дальние здания изначально строятся на coarse-уровне 1,3 м: это уменьшило
-  начальное число строительных частиц до 62 891;
-- прогноз положения фронта волны заранее выбирает ближайший ряд зданий и
-  планарно уточняет его 1,3→0,65 м до гидродинамического контакта;
-- после контакта сохраняется локальное crack-уточнение 0,65→0,325 м.
-- строительные частицы явно классифицируются как плиты, стены, балки,
-  колонны, ядра жёсткости и стекло; в coarse-сцене их 62 891;
-- плиты, стены и стекло уточняются в своей плоскости 1→4, балки и колонны —
-  вдоль продольной оси 1→2, а объёмные ядра жёсткости — 1→8;
-- стекло допускает дополнительный локальный уровень до 0,1625 м;
-- при каждом делении сохраняются масса, объём, линейный импульс и центр масс;
-- порог деформации связи масштабируется как √(h_ref/h), поэтому повышение LOD
-  не уменьшает искусственно энергию разрушения на единицу площади трещины;
-- `validate_refinement.py` проверяет все шесть правил деления непосредственно
-  на CUDA и контролирует законы сохранения;
-- отделившийся фрагмент после двух спокойных проверок переводится в rigid-cluster LOD;
-- при конверсии двойная точность используется для центра масс, тензора инерции,
-  линейного и углового импульса, после чего движение выполняется на CUDA;
-- частицы rigid-кластера остаются на поверхности обломка: вода обтекает их и
-  передаёт суммарную силу и момент, но внутренние пружины больше не считаются;
-- столкновения с дном и границами создают силу и вращающий момент в фактических
-  точках контакта, а не независимо зажимают каждую частицу;
-- rigid-состояние, ориентация, скорости, инерция и локальная геометрия входят
-  в V3 checkpoint;
-- `validate_rigid_clusters.py` проверяет GPU-динамику и сохранение формы, а
-  `validate_rigid_transition.py` — полную конверсию фрагмента внутри solver;
-- V3.2 делит воду на три временных уровня: каждый подшаг, через 2 и через 4;
-- перед включением multirate все частицы обязательно проходят полную калибровку
-  плотности; это исключает нулевой знаменатель давления на первом fast-шаге;
-- импульс slow-частицы согласуется в точке синхронизации и применяется за весь
-  её интервал без дорогостоящих атомиков между каждой парой соседей;
-- городской тест после 128 подшагов дал отличие импульса 0,0774%, энергии
-  0,3267% и RMS координат 0,000494 м относительно единого малого шага;
-- среднее время 10-кадрового теста уменьшилось с 2,22 до 1,85 с/кадр;
-- V3.3 выделяет на GPU только свободную поверхность воды: в текущей сцене
-  42 480 проб вместо рендера всех 264 040 водяных частиц;
-- нормали поверхности восстанавливаются по соседям, splat имеет умеренно
-  анизотропную форму, а расширенная bilateral-реконструкция убирает полосы;
-- пена создаётся по локальному вихрю и вертикальному перевороту, поэтому
-  спокойная вода за фронтом не покрывается белыми частицами;
-- `validate_multirate.py`, `validate_multirate_city.py` и
-  `validate_surface_reconstruction.py` входят в общий GPU regression batch.
+The project targets an NVIDIA RTX 5070 with 12 GB of VRAM. It prioritizes physical state, reproducibility, and high-quality offline output over real-time playback.
 
-## Следующие этапы
+## Main features
 
-Подробный порядок, критерии готовности и ожидаемый эффект находятся в
-`ROADMAP.md`. Ближайший крупный этап — shallow-water дальнего поля и локальные
-трёхмерные SPH-окна; связная сетка воды V3.3b уже реализована.
+- CUDA simulation through NVIDIA Warp.
+- Adaptive water particles at 1.0, 0.5, 0.325, and 0.1625 m scales.
+- A conservative 2D shallow-water far field coupled to the local 3D SPH region.
+- GPU free-surface classification, anisotropic surface samples, foam, and Marching Cubes reconstruction.
+- Temporally stable mesh bounds and voxel LOD with local high-resolution splash bricks.
+- Fifteen physically different building silhouettes: rectangular, podium, setback, tapered, and offset towers.
+- Six coordinated facade palettes for concrete, stone, brick, glass, and roofs.
+- Explicit slabs, walls, beams, columns, cores, glazing, floor spans, and roofs.
+- Dormant structural LOD: untouched buildings remain inexpensive fixed water boundaries.
+- Local structural refinement near predicted impact and growing cracks.
+- Cohesive architectural fragments that prevent buildings from dissolving into particle dust.
+- Rigid-cluster conversion for detached, settled debris.
+- Frictional rigid-debris contacts with equal-and-opposite forces and torques.
+- Rigid-to-deformable reactivation after a new strong collision.
+- Original, front, side, and top cameras combined into one 1920×1080 video.
+- Direct NVENC output without intermediate PNG sequences.
+- A playable MP4 is atomically updated after every completed simulated second.
+- Checkpoint and resume support for both particle and V3 hybrid state.
 
-Для установки зависимостей и production-запуска на Windows используйте
-`start_v3_rtx5070.bat`; скрипт создаст локальную `.venv` при первом запуске.
+## Requirements
 
-Для короткой проверки длительность можно переопределить без изменения JSON:
-`python deluge_v3.py --config config_v3_rtx5070.json --duration 0.25`.
+- Windows 10 or 11
+- NVIDIA GPU with CUDA support
+- A current NVIDIA driver
+- Python 3.11 or newer
+- FFmpeg/ffprobe available on `PATH` for validation and video inspection
 
-Все CUDA-регрессии запускаются командным файлом `validate_v3_gpu.bat`.
+The launcher creates `.venv` automatically and installs the Python packages from `requirements.txt`.
 
-Во время production-прогона `deluge_v3.mp4` теперь является прогрессивным fragmented MP4:
-после каждых 24 готовых кадров в него сбрасывается завершённый секундный фрагмент. Файл можно
-открывать в VLC/mpv до окончания симуляции и переоткрывать после появления следующей секунды.
-После штатного завершения он без повторного кодирования преобразуется в обычный fast-start MP4.
+## Run
 
-## V3.3b — связная сетка и верхний слой воды
+Double-click:
 
-- плотность всех водяных частиц собирается на GPU в компактном активном 3D-объёме;
-- поле сглаживается трёхмерным разделяемым фильтром, затем Warp Marching Cubes строит связную сетку;
-- верхняя свободная поверхность уточняется анизотропными SPH-пробами поверх сетки, поэтому не видна
-  внутренняя оболочка и не пропадает верхний слой волны;
-- сетка текущей сцены занимает 1 069 425 узлов и около 57–58 тыс. вершин / 114–117 тыс. треугольников;
-- 10-кадровая проверка на RTX 5070: 1,85 с/кадр в среднем, пик VRAM 1644 MiB;
-- `validate_water_mesh.py` проверяет связность, индексы, вырожденные треугольники и наличие верхней крышки.
+```bat
+start_v3_rtx5070.bat
+```
 
-## V3.3c — устойчивый поздний mesh и разнообразный город
+Or run from a terminal:
 
-- extreme-брызги больше не входят в bounding box основной сетки: по вертикали используется 99,5-й,
-  а по направлению волны 99,75-й процентиль; полная ширина резервуара сохраняется;
-- на checkpoint 96 воксель сохранился равным 0,65 м, а сетка — 50 674 вершины / 100 924 треугольника
-  вместо провала примерно до 910–960 вершин; отдельно осталось 688 из 91 843 surface-проб;
-- отдельные энергичные брызги рисуются мягкими velocity-aligned foam-splats, а не круглыми шарами;
-- город использует 15 детерминированных физических профилей: podium, setback, stepped taper,
-  offset tower и прямоугольные корпуса; изменяются сами плиты, стены, балки, колонны и ядра;
-- фасады, окна и кровли используют шесть согласованных палитр бетона, камня, кирпича и стекла;
-- `validate_water_mesh_bounds.py` и `validate_city_styles.py` закрепляют обе регрессии.
+```bat
+.venv\Scripts\python.exe deluge_v3.py --config config_v3_rtx5070.json
+```
+
+Useful short runs:
+
+```bat
+.venv\Scripts\python.exe deluge_v3.py --config config_v3_rtx5070.json --frames 100
+.venv\Scripts\python.exe deluge_v3.py --config config_v3_rtx5070.json --duration 0.25
+```
+
+Do not run production V2 and V3 simulations simultaneously. They will compete for the same GPU and invalidate timing measurements.
+
+## Progressive video output
+
+The default configuration writes four views into one `deluge_v3.mp4`. No PNG frame sequence is created.
+
+Frames are encoded in completed one-second segments. After each simulated second, all finished segments are stream-copied into a new preview and atomically replace the public MP4. This has three useful properties:
+
+- the MP4 becomes non-zero and playable after the first 24 frames at 24 FPS;
+- readers never observe a half-written replacement file;
+- if the solver is interrupted, the last public MP4 and completed files in the `.segments` directory remain recoverable.
+
+Reopen the file in VLC or mpv after another simulated second is completed to see the latest version. On normal completion, the temporary segment directory is removed.
+
+## Current RTX 5070 results
+
+The clean 100-frame V3.6 QA run used four cameras in one H.264 video:
+
+- 100 output frames, 4.1667 simulated seconds;
+- 459.4 seconds total wall time;
+- 4.57 seconds average per output frame;
+- 170,131 initial particles and 566,895 peak particles after adaptive refinement;
+- 255,829 peak fluid particles;
+- 1,659.6 MiB peak reported VRAM use;
+- 788 released cohesive fragments and one active rigid cluster;
+- 37,652 late water-mesh vertices and 74,870 triangles;
+- a constant 0.65 m water voxel from frame 0 through frame 99;
+- zero water-mesh LOD changes and no late collapse to spherical spray.
+
+The V3.4 wide-scene validation used a 420 m domain and 45 buildings:
+
+- 508,747 initial particles;
+- 19,320 shallow-water cells;
+- about 1.64 GiB reported VRAM use.
+
+The shallow-water regression measured 0.249% volume drift after one simulated second and a zero float32 residual for the SPH↔2D exchange impulse.
+
+## Water representation
+
+The local impact region is simulated with 3D SPH particles. Only classified free-surface particles contribute to rendering. A compact GPU scalar field is smoothed and reconstructed with Warp Marching Cubes.
+
+Sparse distant droplets do not expand the global reconstruction box. Bounds expand immediately but shrink gradually; improved voxel LOD requires eight stable frames. Dense splash sheets outside the main water body receive up to six local 12 m mesh bricks with a 0.4 m voxel, while isolated droplets stay inexpensive anisotropic spray samples.
+
+The shallow-water far field remains part of the physics and momentum coupling, but is not drawn as a second independent surface. This avoids two overlapping water planes at different heights in side views.
+
+## Structural model
+
+Buildings begin as inexpensive fixed SPH boundaries. A building activates only after a coherent hydrodynamic load reaches enough facade samples. Foundations remain anchored.
+
+Each building contains physically sampled floor slabs, roofs, walls, beams, columns, cores, and glass. Structural particles are grouped into cohesive architectural fragments approximately 3×3×3 m. Joints between fragments can fail, but the fragment interior remains connected, so failure produces slabs and wall sections instead of independent particle dust.
+
+Detached calm fragments can become rigid clusters. Their mass, center of mass, inertia tensor, linear momentum, and angular momentum are fitted in double precision. Rigid motion and contacts then run on CUDA. Concrete, glass, and reinforcement use different contact stiffness and friction. A sufficiently strong later collision reactivates the cohesive deformable model.
+
+## Validation
+
+Run the complete CUDA regression batch:
+
+```bat
+validate_v3_gpu.bat
+```
+
+It covers:
+
+- adaptive refinement and conservation of mass, volume, momentum, and center of mass;
+- rigid fitting, motion, contact force/torque balance, friction, and reactivation;
+- multirate momentum and city-state agreement;
+- shallow-water volume and conservative overlap impulse;
+- free-surface classification and reconstructed top-layer closure;
+- robust late mesh bounds, temporal hysteresis, and splash-brick selection;
+- physical building-style diversity and facade palettes;
+- early opening and finalization of progressive NVENC MP4 output.
+
+## Important files
+
+- `deluge_v3.py` — V3 orchestration, checkpoints, surface reconstruction, and simulation loop integration.
+- `solver_base.py` — shared particle solver and output loop in the standalone repository.
+- `shallow_water.py` — GPU shallow-water solver and conservative SPH interface coupling.
+- `hybrid_kernels.py` — structural LOD, fracture, multirate, rigid-body, contact, and facade CUDA kernels.
+- `hybrid_model.py` — cohesive fragments, refinement axes, and facade generation.
+- `hybrid_renderer.py` — facade and reconstructed-water rendering.
+- `surface_kernels.py` — free-surface classification, sparse fields, temporal blending, and water rasterization.
+- `config_v3_rtx5070.json` — production RTX 5070 configuration.
+- `ROADMAP.md` — development stages and acceptance criteria.
+
+## Status
+
+V3.3d mesh stability, V3.4 shallow-water far field, V3.5 debris contacts, and the 100-frame portion of V3.6 are implemented and validated. The previous 8-second continuation was intentionally stopped after detecting the duplicated far-water rendering plane; the renderer configuration now keeps only the unified local surface visible. A new full 8-second production run should be started from a checkpoint produced with the corrected configuration.
