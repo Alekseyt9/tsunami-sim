@@ -55,7 +55,7 @@ def simulate(levels_host: np.ndarray, steps: int = 4):
             dim=2,
             inputs=[
                 position, velocity, acceleration, kind, fixed, levels, active, dt,
-                100.0, -100.0, 100.0, 100.0, 0.0, 0.0, 0.0,
+                100.0, -100.0, 100.0, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0,
             ],
             device=device,
         )

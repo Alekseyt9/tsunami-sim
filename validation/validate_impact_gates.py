@@ -16,33 +16,40 @@ from kernels import integrate
 
 def validate_velocity_guard(device: str) -> None:
     position = wp.array(
-        np.asarray([[0.0, 10.0, 0.0]] * 4, dtype=np.float32), dtype=wp.vec3, device=device
+        np.asarray([[0.0, 10.0, 0.0]] * 6, dtype=np.float32), dtype=wp.vec3, device=device
     )
     velocity = wp.array(
         np.asarray(
-            [[100.0, 0.0, 0.0], [0.0, 80.0, 0.0], [0.0, -80.0, 0.0], [19.0, 5.0, 0.0]],
+            [
+                [100.0, 0.0, 0.0], [0.0, 80.0, 0.0],
+                [0.0, -80.0, 0.0], [19.0, 5.0, 0.0],
+                [100.0, 0.0, 0.0], [0.0, 80.0, 0.0],
+            ],
             dtype=np.float32,
         ),
         dtype=wp.vec3,
         device=device,
     )
-    acceleration = wp.zeros(4, dtype=wp.vec3, device=device)
-    kind = wp.zeros(4, dtype=wp.int32, device=device)
-    fixed = wp.zeros(4, dtype=wp.int32, device=device)
+    acceleration = wp.zeros(6, dtype=wp.vec3, device=device)
+    kind = wp.array(np.asarray([0, 0, 0, 0, 1, 1], dtype=np.int32), dtype=wp.int32, device=device)
+    fixed = wp.zeros(6, dtype=wp.int32, device=device)
     wp.launch(
         integrate,
-        dim=4,
+        dim=6,
         inputs=[
             position, velocity, acceleration, kind, fixed, 0.001,
-            1000.0, -1000.0, 1000.0, 1000.0, 0.0, 30.0, 18.0,
+            1000.0, -1000.0, 1000.0, 1000.0, 0.0, 30.0, 18.0, 40.0, 12.0,
         ],
         device=device,
     )
     result = velocity.numpy()
-    speed = np.linalg.norm(result, axis=1)
-    if float(speed.max()) > 30.0001 or float(np.abs(result[:, 1]).max()) > 18.0001:
-        raise AssertionError(f"fluid energy guard failed: velocity={result}")
+    fluid_speed = np.linalg.norm(result[:4], axis=1)
+    solid_speed = np.linalg.norm(result[4:], axis=1)
+    if float(fluid_speed.max()) > 30.0001 or float(np.abs(result[:4, 1]).max()) > 18.0001:
+        raise AssertionError(f"fluid energy guard failed: velocity={result[:4]}")
     np.testing.assert_allclose(result[3], [19.0, 5.0, 0.0], atol=1.0e-6)
+    if float(solid_speed.max()) > 40.0001 or float(result[4:, 1].max()) > 12.0001:
+        raise AssertionError(f"solid energy guard failed: velocity={result[4:]}")
 
 
 def count_hits(device: str, elevation: float, force_z: float) -> int:
@@ -103,7 +110,10 @@ def main() -> None:
     device = "cuda:0" if wp.is_cuda_available() else "cpu"
     validate_velocity_guard(device)
     validate_activation_gate(device)
-    print("PASS: fluid speed <=30 m/s, vertical <=18 m/s; only sustained lower-facade +Z load activates")
+    print(
+        "PASS: fluid <=30 m/s / vertical <=18 m/s; solids <=40 m/s / upward <=12 m/s; "
+        "only sustained lower-facade +Z load activates"
+    )
 
 
 if __name__ == "__main__":

@@ -48,6 +48,20 @@ def structural_damage_rate_multiplier(role: int) -> float:
 
 
 @wp.func
+def deformable_contact_magnitude(
+    penetration: float,
+    closing_speed: float,
+    stiffness: float,
+    damping: float,
+) -> float:
+    """Non-attractive penalty contact with dissipative approach damping."""
+    return wp.max(
+        stiffness * penetration + damping * wp.max(-closing_speed, 0.0),
+        0.0,
+    )
+
+
+@wp.func
 def collapse_gravity_fraction(
     damage_integral: float,
     structural_volume: float,
@@ -192,6 +206,8 @@ def compute_clustered_solid_forces(
     facade_support_loss_collapse_threshold: float,
     facade_support_loss_damage_rate: float,
     facade_unsupported_damage_rate: float,
+    elastic_force_cap_multiplier: float,
+    compression_force_cap_multiplier: float,
 ):
     """Break joints between architectural chunks, never atomize a chunk."""
     tid = wp.tid()
@@ -271,11 +287,29 @@ def compute_clustered_solid_forces(
             continue
         if bonded and same_fragment:
             # An architectural chunk may deform, but it cannot dissolve into
-            # individual lattice particles. This is the anti-dust constraint.
+            # individual lattice particles.  Clamp recoverable strain at the
+            # role/material yield envelope: deformation beyond it represents
+            # crushing and microcracking, not energy stored in a giant spring.
             strain = (dist - rest_dist) / wp.max(rest_dist, 1.0e-4)
+            yield_strain = wp.min(
+                material_failure_strain(material[i]),
+                material_failure_strain(material[j]),
+            )
+            yield_strain *= wp.min(
+                structural_failure_strain_multiplier(structural_class[i]),
+                structural_failure_strain_multiplier(structural_class[j]),
+            )
+            yield_strain *= elastic_force_cap_multiplier
+            transmitted_strain = wp.clamp(
+                strain,
+                -yield_strain * compression_force_cap_multiplier,
+                yield_strain,
+            )
             stiffness = wp.min(material_stiffness(material[i]), material_stiffness(material[j]))
             damping = 75000.0 * wp.dot(v[j] - v[i], delta / dist)
-            force += (stiffness * internal_stiffness_multiplier * strain + damping) * (delta / dist) * radius[i] * radius[i]
+            force += (
+                stiffness * internal_stiffness_multiplier * transmitted_strain + damping
+            ) * (delta / dist) * radius[i] * radius[i]
         elif bonded and local_damage < 1.0 and not body_rigid and not neighbour_rigid:
             # Only joints between chunks fracture. Direct water loading starts
             # a crack; propagation into a dry region requires both a mature
@@ -312,7 +346,14 @@ def compute_clustered_solid_forces(
                 stiffness = wp.min(material_stiffness(material[i]), material_stiffness(material[j]))
                 damping = 50000.0 * wp.dot(v[j] - v[i], delta / dist)
                 cohesion = (1.0 - local_damage) * (1.0 - local_damage)
-                force += cohesion * (stiffness * strain + damping) * (delta / dist) * radius[i] * radius[i]
+                transmitted_strain = wp.clamp(
+                    strain,
+                    -limit * elastic_force_cap_multiplier * compression_force_cap_multiplier,
+                    limit * elastic_force_cap_multiplier,
+                )
+                force += cohesion * (
+                    stiffness * transmitted_strain + damping
+                ) * (delta / dist) * radius[i] * radius[i]
         else:
             # Contact remains active after a joint breaks, so chunks collide
             # as rubble instead of passing through one another.
@@ -325,7 +366,9 @@ def compute_clustered_solid_forces(
                 penetration = contact - dist
                 normal = delta / dist
                 closing = wp.dot(v[j] - v[i], normal)
-                force -= normal * (3.0e6 * penetration + 2600.0 * wp.min(closing, 0.0))
+                force -= normal * deformable_contact_magnitude(
+                    penetration, closing, 3.0e6, 9000.0
+                )
 
     if (
         facade_particle and ri[1] > facade_support_loss_minimum_elevation
@@ -802,6 +845,8 @@ def integrate_multirate(
     fluid_bed_drag: float,
     maximum_fluid_speed: float,
     maximum_fluid_vertical_speed: float,
+    maximum_solid_speed: float,
+    maximum_solid_upward_speed: float,
 ):
     i = wp.tid()
     if fixed[i] != 0 or (kind[i] == 0 and time_active[i] == 0):
@@ -825,6 +870,11 @@ def integrate_multirate(
             vi *= maximum_fluid_speed / speed
     if kind[i] != 0:
         vi *= wp.pow(0.9993, dt * 1000.0)
+        if maximum_solid_upward_speed > 0.0 and vi[1] > maximum_solid_upward_speed:
+            vi = wp.vec3(vi[0], maximum_solid_upward_speed, vi[2])
+        solid_speed = wp.length(vi)
+        if maximum_solid_speed > 0.0 and solid_speed > maximum_solid_speed:
+            vi *= maximum_solid_speed / solid_speed
     xi = x[i] + vi * dt
     restitution = -0.12
     if xi[1] < 0.0:
@@ -1011,7 +1061,11 @@ def raster_facade_color(
         particle_damage[anchor[anchor_base]] + particle_damage[anchor[anchor_base + 1]] +
         particle_damage[anchor[anchor_base + 2]] + particle_damage[anchor[anchor_base + 3]]
     )
-    base = wp.lerp(base, wp.vec3(0.18, 0.055, 0.03), wp.clamp(panel_damage, 0.0, 1.0)) * light
+    # Keep the building palette on detached panels.  Damage is expressed as
+    # loss of brightness; exposed particle materials supply concrete/steel
+    # contrast after the facade skin actually tears.
+    base *= 1.0 - 0.32 * wp.clamp(panel_damage, 0.0, 1.0)
+    base *= light
     for py in range(min_y, max_y + 1):
         for px in range(min_x, max_x + 1):
             fx = float(px) + 0.5; fy = float(py) + 0.5

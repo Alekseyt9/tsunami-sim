@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image
 import warp as wp
 
 from kernels import (
@@ -120,16 +120,6 @@ class HybridRenderer(ParticleRenderer):
         rgb = self.color.numpy().reshape(self.height, self.width, 3)
         rgb = np.clip(np.power(np.clip(rgb, 0.0, 1.0), 1.0 / 2.2) * 255.0, 0, 255).astype(np.uint8)
         image = Image.fromarray(rgb, "RGB")
-        draw = ImageDraw.Draw(image, "RGBA")
-        draw.rectangle((20, 18, 450, 88), fill=(4, 14, 18, 190), outline=(80, 214, 228, 95), width=1)
-        draw.text((36, 30), f"DELUGE V3 / {self.view_name.upper()} VIEW", fill=(220, 241, 244, 255))
-        draw.text((36, 54), f"FRAME {frame:05d}   T+{time_s:07.3f}s   {count:,} PARTICLES", fill=(102, 206, 217, 255))
-        draw.rectangle((self.width - 350, 18, self.width - 20, 157), fill=(4, 14, 18, 190), outline=(255, 255, 255, 45), width=1)
-        draw.text((self.width - 332, 30), f"WATER      {stats['fluid']:,}", fill=(92, 198, 215, 255))
-        draw.text((self.width - 332, 53), f"SOLID      {stats['solid']:,}", fill=(190, 194, 188, 255))
-        draw.text((self.width - 332, 76), f"DAMAGE     {stats['damaged']:,}", fill=(232, 112, 76, 255))
-        draw.text((self.width - 332, 99), f"FRAGMENTS  {stats.get('cohesive_fragments', 0):,}", fill=(210, 180, 112, 255))
-        draw.text((self.width - 332, 122), f"RELEASED   {stats.get('released_fragments', 0):,}", fill=(226, 145, 88, 255))
         if output_path is not None:
             output_path.parent.mkdir(parents=True, exist_ok=True)
             image.save(output_path, compress_level=2)

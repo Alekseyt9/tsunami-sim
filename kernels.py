@@ -196,6 +196,19 @@ def material_failure_strain(material: int) -> float:
     return 0.032
 
 
+@wp.func
+def deformable_contact_magnitude(
+    penetration: float,
+    closing_speed: float,
+    stiffness: float,
+    damping: float,
+) -> float:
+    return wp.max(
+        stiffness * penetration + damping * wp.max(-closing_speed, 0.0),
+        0.0,
+    )
+
+
 @wp.kernel
 def compute_solid_forces(
     grid: wp.uint64,
@@ -273,7 +286,9 @@ def compute_solid_forces(
                 penetration = contact - dist
                 normal = delta / dist
                 closing = wp.dot(v[j] - v[i], normal)
-                force -= normal * (3.0e6 * penetration + 2600.0 * wp.min(closing, 0.0))
+                force -= normal * deformable_contact_magnitude(
+                    penetration, closing, 3.0e6, 9000.0
+                )
 
     damage[i] = wp.min(local_damage, 1.0)
     ai = force / wp.max(mass[i], 1.0)
@@ -298,6 +313,8 @@ def integrate(
     fluid_bed_drag: float,
     maximum_fluid_speed: float,
     maximum_fluid_vertical_speed: float,
+    maximum_solid_speed: float,
+    maximum_solid_upward_speed: float,
 ):
     i = wp.tid()
     if fixed[i] != 0:
@@ -315,6 +332,11 @@ def integrate(
             vi *= maximum_fluid_speed / speed
     if kind[i] != 0:
         vi *= wp.pow(0.9993, dt * 1000.0)
+        if maximum_solid_upward_speed > 0.0 and vi[1] > maximum_solid_upward_speed:
+            vi = wp.vec3(vi[0], maximum_solid_upward_speed, vi[2])
+        solid_speed = wp.length(vi)
+        if maximum_solid_speed > 0.0 and solid_speed > maximum_solid_speed:
+            vi *= maximum_solid_speed / solid_speed
     xi = x[i] + vi * dt
 
     restitution = -0.12
@@ -479,7 +501,9 @@ def raster_color(
         base = wp.vec3(0.20, 0.55, 0.68)
     if material[i] == 3:
         base = wp.vec3(0.18, 0.20, 0.21)
-    base = wp.lerp(base, wp.vec3(0.22, 0.045, 0.025), damage[i])
+    # Preserve the physical material hue. Damage lowers brightness instead of
+    # replacing every fragment with the old diagnostic brown overlay.
+    base *= 1.0 - 0.38 * wp.clamp(damage[i], 0.0, 1.0)
 
     for oy in range(-6, 7):
         for ox in range(-6, 7):

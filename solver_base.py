@@ -153,7 +153,9 @@ class DelugeSolver:
                     float(self.cfg["reservoir_z_min"]), float(self.cfg["domain_z_max"]), float(self.cfg["domain_y_max"]),
                     float(self.cfg.get("fluid_bed_drag", 0.12)),
                     float(self.cfg.get("maximum_fluid_speed", 0.0)),
-                    float(self.cfg.get("maximum_fluid_vertical_speed", 0.0))],
+                    float(self.cfg.get("maximum_fluid_vertical_speed", 0.0)),
+                    float(self.cfg.get("maximum_solid_speed", 0.0)),
+                    float(self.cfg.get("maximum_solid_upward_speed", 0.0))],
             device=self.device,
         )
         self.time += dt
@@ -334,6 +336,8 @@ class DelugeSolver:
                 "water_mesh_core_upper_y_m", "water_mesh_core_upper_z_m",
                 "fluid_height_p99_m", "fluid_height_p999_m", "fluid_height_max_m",
                 "fluid_vertical_speed_max_m_s",
+                "solid_speed_p99_m_s", "solid_speed_max_m_s",
+                "solid_upward_speed_max_m_s", "solid_mass_upward_above_10m_s_percent",
                 "structural_slab_volume_m3", "structural_wall_volume_m3",
                 "structural_beam_volume_m3", "structural_column_volume_m3",
                 "structural_core_volume_m3", "structural_glass_volume_m3",

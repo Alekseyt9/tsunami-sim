@@ -7,8 +7,9 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import time
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 import imageio_ffmpeg
 import warp as wp
 
@@ -96,14 +97,6 @@ class ParticleRenderer:
         rgb = self.color.numpy().reshape(self.height, self.width, 3)
         rgb = np.clip(np.power(np.clip(rgb, 0.0, 1.0), 1.0 / 2.2) * 255.0, 0, 255).astype(np.uint8)
         image = Image.fromarray(rgb, "RGB")
-        draw = ImageDraw.Draw(image, "RGBA")
-        draw.rectangle((20, 18, 420, 88), fill=(4, 14, 18, 190), outline=(80, 214, 228, 95), width=1)
-        draw.text((36, 30), "DELUGE V2 / CUDA PARTICLE SOLVER", fill=(220, 241, 244, 255))
-        draw.text((36, 54), f"FRAME {frame:05d}   T+{time_s:07.3f}s   {count:,} PARTICLES", fill=(102, 206, 217, 255))
-        draw.rectangle((self.width - 330, 18, self.width - 20, 112), fill=(4, 14, 18, 190), outline=(255, 255, 255, 45), width=1)
-        draw.text((self.width - 312, 30), f"WATER  {stats['fluid']:,}", fill=(92, 198, 215, 255))
-        draw.text((self.width - 312, 53), f"SOLID  {stats['solid']:,}", fill=(190, 194, 188, 255))
-        draw.text((self.width - 312, 76), f"DAMAGE {stats['damaged']:,}", fill=(232, 112, 76, 255))
         if output_path is not None:
             output_path.parent.mkdir(parents=True, exist_ok=True)
             image.save(output_path, compress_level=2)
@@ -203,13 +196,32 @@ class StreamingVideoWriter:
         self.log_file.flush()
         if result.returncode != 0:
             raise RuntimeError(f"Progressive preview assembly failed; see {self.log_path}")
-        os.replace(preview, self.output_file)
+        self._publish_progressive_preview(preview)
+
+    def _publish_progressive_preview(self, preview: Path) -> bool:
+        """Atomically publish when Windows briefly releases the old MP4."""
+        for attempt in range(50):
+            try:
+                os.replace(preview, self.output_file)
+                return True
+            except PermissionError:
+                # File indexers and video players may briefly retain a handle
+                # without delete sharing.  Physics must not fail after all
+                # frames have already been calculated.
+                if attempt < 49:
+                    time.sleep(0.1)
+        print(
+            f"WARNING: {self.output_file.name} is open/locked; newest playable video "
+            f"was retained as {preview.name}"
+        )
+        return False
 
     def close(self):
         if self.progressive:
             self._flush_progressive_segment()
             self.log_file.close()
-            if self.segment_files:
+            preview = self.output_file.with_suffix(".previewing.mp4")
+            if self.segment_files and not preview.exists():
                 shutil.rmtree(self.segment_dir, ignore_errors=True)
             return
         if self.process.stdin is not None:

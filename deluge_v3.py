@@ -979,7 +979,9 @@ class HybridDelugeSolver(DelugeSolver):
                     float(clustering.get("facade_support_loss_minimum_elevation", 4.0)),
                     float(clustering.get("facade_support_loss_collapse_threshold", 0.75)),
                     float(clustering.get("facade_support_loss_damage_rate", 1.0)),
-                    float(clustering.get("facade_unsupported_damage_rate", 0.75))],
+                    float(clustering.get("facade_unsupported_damage_rate", 0.75)),
+                    float(clustering.get("elastic_force_cap_multiplier", 1.25)),
+                    float(clustering.get("compression_force_cap_multiplier", 2.0))],
             device=self.device,
         )
         rigid_policy = self.v3_cfg.get("rigid_clusters", {})
@@ -1048,7 +1050,9 @@ class HybridDelugeSolver(DelugeSolver):
                         float(self.cfg["domain_z_max"]), float(self.cfg["domain_y_max"]),
                         float(self.cfg.get("fluid_bed_drag", 0.12)),
                         float(self.cfg.get("maximum_fluid_speed", 0.0)),
-                        float(self.cfg.get("maximum_fluid_vertical_speed", 0.0))], device=self.device,
+                        float(self.cfg.get("maximum_fluid_vertical_speed", 0.0)),
+                        float(self.cfg.get("maximum_solid_speed", 0.0)),
+                        float(self.cfg.get("maximum_solid_upward_speed", 0.0))], device=self.device,
             )
             self.multirate_tick += 1
         else:
@@ -1059,7 +1063,9 @@ class HybridDelugeSolver(DelugeSolver):
                         particle_z_min, float(self.cfg["domain_z_max"]),
                         float(self.cfg["domain_y_max"]), float(self.cfg.get("fluid_bed_drag", 0.12)),
                         float(self.cfg.get("maximum_fluid_speed", 0.0)),
-                        float(self.cfg.get("maximum_fluid_vertical_speed", 0.0))],
+                        float(self.cfg.get("maximum_fluid_vertical_speed", 0.0)),
+                        float(self.cfg.get("maximum_solid_speed", 0.0)),
+                        float(self.cfg.get("maximum_solid_upward_speed", 0.0))],
                 device=self.device,
             )
         self.time += dt
@@ -1167,6 +1173,7 @@ class HybridDelugeSolver(DelugeSolver):
         mass_host = self.arrays["mass"][:self.count].numpy()
         velocity_host = self.arrays["v"][:self.count].numpy()
         position_host = self.arrays["x"][:self.count].numpy()
+        fixed_host = self.arrays["fixed"][:self.count].numpy()
         result["fluid_momentum_z_kg_m_s"] = float(
             np.sum(mass_host[fluid_mask] * velocity_host[fluid_mask, 2], dtype=np.float64)
         )
@@ -1182,6 +1189,18 @@ class HybridDelugeSolver(DelugeSolver):
             result["fluid_particles_above_30m"] = int(np.count_nonzero(fluid_height > 30.0))
             result["fluid_particles_above_42m"] = int(np.count_nonzero(fluid_height > 42.0))
             result["fluid_particles_above_60m"] = int(np.count_nonzero(fluid_height > 60.0))
+        movable_solid_mask = (kind_host != 0) & (fixed_host == 0)
+        if np.any(movable_solid_mask):
+            solid_velocity = velocity_host[movable_solid_mask]
+            solid_speed = np.linalg.norm(solid_velocity, axis=1)
+            solid_mass = mass_host[movable_solid_mask]
+            result["solid_speed_p99_m_s"] = float(np.quantile(solid_speed, 0.99))
+            result["solid_speed_max_m_s"] = float(np.max(solid_speed))
+            result["solid_upward_speed_max_m_s"] = float(np.max(solid_velocity[:, 1]))
+            result["solid_mass_upward_above_10m_s_percent"] = float(
+                100.0 * np.sum(solid_mass[solid_velocity[:, 1] > 10.0], dtype=np.float64)
+                / max(np.sum(solid_mass, dtype=np.float64), 1.0)
+            )
         structural_role = self.arrays["structural_class"][:self.count].numpy()
         damage_values = self.arrays["damage"][:self.count].numpy()
         damaged_mask = damage_values > 0.05

@@ -14,10 +14,22 @@ HERE = Path(__file__).resolve().parent
 from hybrid_kernels import (  # noqa: E402
     accumulate_building_damage,
     collapse_gravity_fraction,
+    deformable_contact_magnitude,
     facade_support_loss_rate,
     structural_damage_rate_multiplier,
     structural_failure_strain_multiplier,
 )
+
+
+@wp.kernel
+def sample_contact_damping(
+    closing_speeds: wp.array(dtype=float),
+    result: wp.array(dtype=float),
+):
+    i = wp.tid()
+    result[i] = deformable_contact_magnitude(
+        0.02, closing_speeds[i], 3.0e6, 9000.0
+    )
 
 
 @wp.kernel
@@ -59,6 +71,20 @@ def sample_facade_support_loss(
 def main() -> None:
     wp.init()
     device = "cuda:0" if wp.is_cuda_available() else "cpu"
+    closing = wp.array(
+        np.asarray([-20.0, 0.0, 20.0], dtype=np.float32), dtype=float, device=device
+    )
+    contact = wp.zeros(3, dtype=float, device=device)
+    wp.launch(sample_contact_damping, dim=3, inputs=[closing, contact], device=device)
+    contact_host = contact.numpy()
+    if not (
+        contact_host[0] > contact_host[1]
+        and contact_host[1] == contact_host[2]
+        and contact_host[2] > 0.0
+    ):
+        raise AssertionError(
+            f"deformable contact damping is not dissipative/non-attractive: {contact_host}"
+        )
     # Glass, wall, slab, beam, column, core: weak facade to ductile core.
     role_values = np.asarray([6, 2, 1, 3, 4, 5], dtype=np.int32)
     roles = wp.array(role_values, dtype=wp.int32, device=device)

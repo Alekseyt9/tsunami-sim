@@ -21,6 +21,8 @@
   "fluid_bed_drag": 0.12,
   "maximum_fluid_speed": 30.0,
   "maximum_fluid_vertical_speed": 18.0,
+  "maximum_solid_speed": 40.0,
+  "maximum_solid_upward_speed": 12.0,
   "coarse_spacing": 1.0,
   "fine_spacing": 0.5,
   "fine_surface_band": 2.5,
@@ -115,7 +117,9 @@
         "facade_support_loss_minimum_elevation": 4.0,
         "facade_support_loss_collapse_threshold": 0.75,
         "facade_support_loss_damage_rate": 1.0,
-        "facade_unsupported_damage_rate": 0.75
+        "facade_unsupported_damage_rate": 0.75,
+        "elastic_force_cap_multiplier": 1.25,
+        "compression_force_cap_multiplier": 2.0
     },
     "rigid_clusters": {
       "enabled": true,
