@@ -1,0 +1,108 @@
+"""CUDA regression for spray-energy and sustained building-activation gates."""
+
+from __future__ import annotations
+
+import numpy as np
+from pathlib import Path
+import warp as wp
+
+HERE = Path(__file__).resolve().parent
+
+from hybrid_kernels import activate_buildings_from_hits, count_loaded_building_particles
+from kernels import integrate
+
+
+def validate_velocity_guard(device: str) -> None:
+    position = wp.array(
+        np.asarray([[0.0, 10.0, 0.0]] * 4, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    velocity = wp.array(
+        np.asarray(
+            [[100.0, 0.0, 0.0], [0.0, 80.0, 0.0], [0.0, -80.0, 0.0], [19.0, 5.0, 0.0]],
+            dtype=np.float32,
+        ),
+        dtype=wp.vec3,
+        device=device,
+    )
+    acceleration = wp.zeros(4, dtype=wp.vec3, device=device)
+    kind = wp.zeros(4, dtype=wp.int32, device=device)
+    fixed = wp.zeros(4, dtype=wp.int32, device=device)
+    wp.launch(
+        integrate,
+        dim=4,
+        inputs=[
+            position, velocity, acceleration, kind, fixed, 0.001,
+            1000.0, -1000.0, 1000.0, 1000.0, 0.0, 30.0, 18.0,
+        ],
+        device=device,
+    )
+    result = velocity.numpy()
+    speed = np.linalg.norm(result, axis=1)
+    if float(speed.max()) > 30.0001 or float(np.abs(result[:, 1]).max()) > 18.0001:
+        raise AssertionError(f"fluid energy guard failed: velocity={result}")
+    np.testing.assert_allclose(result[3], [19.0, 5.0, 0.0], atol=1.0e-6)
+
+
+def count_hits(device: str, elevation: float, force_z: float) -> int:
+    count = 16
+    rest = np.zeros((count, 3), dtype=np.float32)
+    rest[:, 1] = elevation
+    force = np.zeros((count, 3), dtype=np.float32)
+    force[:, 2] = force_z
+    hits = wp.zeros(1, dtype=wp.int32, device=device)
+    wp.launch(
+        count_loaded_building_particles,
+        dim=count,
+        inputs=[
+            wp.array(rest, dtype=wp.vec3, device=device),
+            wp.ones(count, dtype=wp.int32, device=device),
+            wp.zeros(count, dtype=wp.int32, device=device),
+            wp.array(np.full(count, 100.0, dtype=np.float32), dtype=float, device=device),
+            wp.array(force, dtype=wp.vec3, device=device),
+            5.0, 8.0, hits,
+        ],
+        device=device,
+    )
+    return int(hits.numpy()[0])
+
+
+def validate_activation_gate(device: str) -> None:
+    if count_hits(device, 20.0, 1000.0) != 0:
+        raise AssertionError("high spray was counted as a foundation load")
+    if count_hits(device, 2.0, -1000.0) != 0:
+        raise AssertionError("reverse/overhead load was counted as the incoming front")
+    if count_hits(device, 2.0, 1000.0) != 16:
+        raise AssertionError("sustained lower-facade front was not counted")
+
+    hits = wp.array(np.asarray([16], dtype=np.int32), dtype=wp.int32, device=device)
+    active = wp.zeros(1, dtype=wp.int32, device=device)
+    exposure = wp.zeros(1, dtype=float, device=device)
+    for _ in range(3):
+        wp.launch(
+            activate_buildings_from_hits,
+            dim=1,
+            inputs=[hits, active, exposure, 12, 0.005, 0.02, 4.0],
+            device=device,
+        )
+    if int(active.numpy()[0]) != 0:
+        raise AssertionError("a sub-threshold transient activated the building")
+    wp.launch(
+        activate_buildings_from_hits,
+        dim=1,
+        inputs=[hits, active, exposure, 12, 0.005, 0.02, 4.0],
+        device=device,
+    )
+    if int(active.numpy()[0]) != 1:
+        raise AssertionError("a sustained tsunami-front load did not activate the building")
+
+
+def main() -> None:
+    wp.init()
+    device = "cuda:0" if wp.is_cuda_available() else "cpu"
+    validate_velocity_guard(device)
+    validate_activation_gate(device)
+    print("PASS: fluid speed <=30 m/s, vertical <=18 m/s; only sustained lower-facade +Z load activates")
+
+
+if __name__ == "__main__":
+    main()

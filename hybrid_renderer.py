@@ -1,0 +1,136 @@
+"""V3 facade renderer: deformable quads instead of solid particle circles."""
+
+from __future__ import annotations
+
+from pathlib import Path
+import numpy as np
+from PIL import Image, ImageDraw
+import warp as wp
+
+from kernels import (
+    bilateral_depth_axis,
+    clear_depth,
+    clear_render,
+    clear_scalar,
+    raster_water_depth,
+    shade_water_surface,
+)
+from renderer import ParticleRenderer
+from hybrid_kernels import deform_facade_vertices, raster_facade_color, raster_facade_depth
+from surface_kernels import raster_anisotropic_water_depth, raster_water_mesh_depth
+
+
+class HybridRenderer(ParticleRenderer):
+    def __init__(self, width: int, height: int, camera: dict, device: str, skin_path: Path,
+                 view_name: str = "main", maximum_panel_stretch: float = 1.8,
+                 water_tangent_scale: float = 2.8, water_normal_scale: float = 2.45):
+        super().__init__(width, height, camera, device)
+        self.view_name = view_name
+        self.maximum_panel_stretch = float(maximum_panel_stretch)
+        self.water_tangent_scale = float(water_tangent_scale)
+        self.water_normal_scale = float(water_normal_scale)
+        with np.load(skin_path, allow_pickle=False) as skin:
+            rest_vertex = skin["vertex"].reshape(-1, 3).copy()
+            anchor = skin["anchor"].reshape(-1).copy()
+            material = skin["material"].copy()
+        self.panel_count = len(material)
+        self.rest_vertex = wp.array(rest_vertex, dtype=wp.vec3, device=device)
+        self.current_vertex = wp.empty(len(rest_vertex), dtype=wp.vec3, device=device)
+        self.anchor = wp.array(anchor, dtype=wp.int32, device=device)
+        self.panel_material = wp.array(material, dtype=wp.int32, device=device)
+
+    def render(self, arrays: dict, count: int, output_path: Path | None, frame: int, time_s: float, stats: dict):
+        pixel_count = self.width * self.height
+        wp.launch(clear_render, dim=pixel_count, inputs=[self.depth, self.color, self.width, self.height], device=self.device)
+        wp.launch(clear_depth, dim=pixel_count, inputs=[self.water_depth], device=self.device)
+        wp.launch(clear_scalar, dim=pixel_count, inputs=[self.water_foam, 0.0], device=self.device)
+        common = [
+            wp.vec3(*self.cam), wp.vec3(*self.right), wp.vec3(*self.up), wp.vec3(*self.forward),
+            self.focal, self.width, self.height,
+        ]
+
+        wp.launch(
+            deform_facade_vertices, dim=self.panel_count * 4,
+            inputs=[self.rest_vertex, self.anchor, arrays["x"], arrays["rest_x"], self.current_vertex],
+            device=self.device,
+        )
+        wp.launch(
+            raster_facade_depth, dim=self.panel_count * 2,
+            inputs=[self.current_vertex, self.rest_vertex, self.depth, *common, self.maximum_panel_stretch], device=self.device,
+        )
+        if "water_mesh_indices" in arrays and len(arrays["water_mesh_indices"]) >= 3:
+            wp.launch(
+                raster_water_mesh_depth, dim=len(arrays["water_mesh_indices"]) // 3,
+                inputs=[arrays["water_mesh_vertices"], arrays["water_mesh_indices"],
+                        self.water_depth, *common], device=self.device,
+            )
+            # Marching cubes supplies a connected base volume.  Surface SPH
+            # samples add only the nearest sub-voxel free-surface layer; atomic
+            # depth composition closes thin/missing top regions without
+            # exposing particle spheres after bilateral reconstruction.
+            wp.launch(
+                raster_anisotropic_water_depth, dim=count,
+                inputs=[arrays["x"][:count], arrays["v"][:count], arrays["radius"][:count], arrays["kind"][:count],
+                        arrays["water_surface_mask"][:count], arrays["water_surface_normal"][:count],
+                        arrays["water_foam_strength"][:count], self.water_depth, self.water_foam, *common,
+                        self.water_tangent_scale, self.water_normal_scale], device=self.device,
+            )
+        elif "water_surface_mask" in arrays:
+            wp.launch(
+                raster_anisotropic_water_depth, dim=count,
+                inputs=[arrays["x"][:count], arrays["v"][:count], arrays["radius"][:count], arrays["kind"][:count],
+                        arrays["water_surface_mask"][:count], arrays["water_surface_normal"][:count],
+                        arrays["water_foam_strength"][:count], self.water_depth, self.water_foam, *common,
+                        self.water_tangent_scale, self.water_normal_scale], device=self.device,
+            )
+        else:
+            wp.launch(
+                raster_water_depth, dim=count,
+                inputs=[arrays["x"][:count], arrays["v"][:count], arrays["radius"][:count], arrays["kind"][:count],
+                        self.water_depth, self.water_foam, *common], device=self.device,
+            )
+
+        smooth_source, smooth_target = self.water_depth, self.water_temp
+        # Sparse anisotropic samples need a wider reconstruction kernel than
+        # the old all-particle splats.  The larger depth sigma removes lattice
+        # banding while the bilateral term still stops at silhouettes.
+        for _ in range(4):
+            wp.launch(
+                bilateral_depth_axis, dim=pixel_count,
+                inputs=[smooth_source, smooth_target, self.width, self.height, 3.2, 1.8, 0], device=self.device,
+            )
+            smooth_source, smooth_target = smooth_target, smooth_source
+            wp.launch(
+                bilateral_depth_axis, dim=pixel_count,
+                inputs=[smooth_source, smooth_target, self.width, self.height, 3.2, 1.8, 1], device=self.device,
+            )
+            smooth_source, smooth_target = smooth_target, smooth_source
+
+        wp.launch(
+            raster_facade_color, dim=self.panel_count * 2,
+            inputs=[self.current_vertex, self.rest_vertex, self.anchor, self.panel_material, arrays["damage"],
+                    self.depth, self.color, *common, self.maximum_panel_stretch], device=self.device,
+        )
+        wp.launch(
+            shade_water_surface, dim=pixel_count,
+            inputs=[smooth_source, self.water_foam, self.depth, self.color, self.width, self.height], device=self.device,
+        )
+        wp.synchronize_device(self.device)
+
+        rgb = self.color.numpy().reshape(self.height, self.width, 3)
+        rgb = np.clip(np.power(np.clip(rgb, 0.0, 1.0), 1.0 / 2.2) * 255.0, 0, 255).astype(np.uint8)
+        image = Image.fromarray(rgb, "RGB")
+        draw = ImageDraw.Draw(image, "RGBA")
+        draw.rectangle((20, 18, 450, 88), fill=(4, 14, 18, 190), outline=(80, 214, 228, 95), width=1)
+        draw.text((36, 30), f"DELUGE V3 / {self.view_name.upper()} VIEW", fill=(220, 241, 244, 255))
+        draw.text((36, 54), f"FRAME {frame:05d}   T+{time_s:07.3f}s   {count:,} PARTICLES", fill=(102, 206, 217, 255))
+        draw.rectangle((self.width - 350, 18, self.width - 20, 157), fill=(4, 14, 18, 190), outline=(255, 255, 255, 45), width=1)
+        draw.text((self.width - 332, 30), f"WATER      {stats['fluid']:,}", fill=(92, 198, 215, 255))
+        draw.text((self.width - 332, 53), f"SOLID      {stats['solid']:,}", fill=(190, 194, 188, 255))
+        draw.text((self.width - 332, 76), f"DAMAGE     {stats['damaged']:,}", fill=(232, 112, 76, 255))
+        draw.text((self.width - 332, 99), f"FRAGMENTS  {stats.get('cohesive_fragments', 0):,}", fill=(210, 180, 112, 255))
+        draw.text((self.width - 332, 122), f"RELEASED   {stats.get('released_fragments', 0):,}", fill=(226, 145, 88, 255))
+        if output_path is not None:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            image.save(output_path, compress_level=2)
+        return np.asarray(image)
