@@ -84,6 +84,8 @@ def main() -> None:
     damage = floats()
     rho_reference = floats()
     solid_force = gpu_array(np.zeros((capacity, 3), dtype=np.float32), wp.vec3, device)
+    impact_impulse = floats()
+    local_impact_active = ints()
     fragment_host = np.full(capacity, -1, dtype=np.int32); fragment_host[:parent_count] = np.arange(parent_count)
     fragment_id = ints(fragment_host)
     axis_host = np.full(capacity, -1, dtype=np.int32); axis_host[:parent_count] = (1, 0, 0, 1, 2, 2)
@@ -99,6 +101,7 @@ def main() -> None:
         inputs=[
             x, rest_x, velocity, radius, mass, volume, kind, material, structural_class,
             building_id, fixed, base_fixed, damage, rho_reference, solid_force,
+            impact_impulse, local_impact_active,
             fragment_id, normal_axis, rigid_state, preimpact, counters, count, parent_count, capacity,
             0.195, 0.0975, 0.39, 0.08, 25.0,
         ],

@@ -27,6 +27,8 @@
   "fine_spacing": 0.5,
   "fine_surface_band": 2.5,
   "adaptive_refinement": true,
+  "adaptive_surface_only": true,
+  "refine_vertical_speed": 2.5,
   "refine_z": 1.0,
   "refine_every_frames": 8,
   "solid_spacing": 0.65,

@@ -10,6 +10,7 @@ if not exist "%PYTHON_EXE%" (
   "%PYTHON_EXE%" -m pip install -r "%REPO_ROOT%\requirements.txt"
 )
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_refinement.py" || exit /b 1
+"%PYTHON_EXE%" "%VALIDATION_DIR%validate_adaptive_water.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_rigid_clusters.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_rigid_transition.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_rigid_contacts.py" || exit /b 1

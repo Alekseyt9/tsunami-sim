@@ -67,7 +67,8 @@ def main():
         "x": vector(), "rest_x": vector(), "v": vector(), "radius": scalar(),
         "mass": scalar(), "volume": scalar(), "kind": integer(), "material": integer(),
         "building_id": integer(), "structural_class": integer(), "fixed": integer(),
-        "damage": scalar(), "rho_reference": scalar(), "rho": scalar(),
+        "damage": scalar(), "impact_impulse": scalar(), "local_impact_active": integer(),
+        "rho_reference": scalar(), "rho": scalar(),
         "acceleration": vector(), "solid_force": vector(), "base_fixed": integer(),
         "fragment_id": integer(), "normal_axis": integer(), "time_level": integer(),
         "time_active": integer(), "surface_mask": integer(), "surface_normal": vector(),
@@ -93,6 +94,7 @@ def main():
             emit_arrays["radius"], emit_arrays["mass"], emit_arrays["volume"],
             emit_arrays["kind"], emit_arrays["material"], emit_arrays["building_id"],
             emit_arrays["structural_class"], emit_arrays["fixed"], emit_arrays["damage"],
+            emit_arrays["impact_impulse"], emit_arrays["local_impact_active"],
             emit_arrays["rho_reference"], emit_arrays["rho"], emit_arrays["acceleration"],
             emit_arrays["solid_force"], emit_arrays["base_fixed"], emit_arrays["fragment_id"],
             emit_arrays["normal_axis"], emit_arrays["time_level"], emit_arrays["time_active"],
@@ -119,6 +121,34 @@ def main():
         raise AssertionError(f"SPH emission volume residual is {volume_residual:.3e} m3")
     if momentum_residual > 1.0e-3:
         raise AssertionError(f"SPH emission momentum residual is {momentum_residual:.3e} kg m/s")
+
+    # Rejected slow sites must not reserve an uninitialized particle slot.
+    rejected_counter = wp.array(
+        np.asarray([old_count], dtype=np.int32), dtype=wp.int32, device=device
+    )
+    wp.launch(
+        emit_sph_interface_particles,
+        dim=(1, 1),
+        inputs=[
+            grid.id, emit_arrays["x"], emit_arrays["rest_x"], emit_arrays["v"],
+            emit_arrays["radius"], emit_arrays["mass"], emit_arrays["volume"],
+            emit_arrays["kind"], emit_arrays["material"], emit_arrays["building_id"],
+            emit_arrays["structural_class"], emit_arrays["fixed"], emit_arrays["damage"],
+            emit_arrays["impact_impulse"], emit_arrays["local_impact_active"],
+            emit_arrays["rho_reference"], emit_arrays["rho"], emit_arrays["acceleration"],
+            emit_arrays["solid_force"], emit_arrays["base_fixed"], emit_arrays["fragment_id"],
+            emit_arrays["normal_axis"], emit_arrays["time_level"], emit_arrays["time_active"],
+            emit_arrays["surface_mask"], emit_arrays["surface_normal"],
+            emit_arrays["foam_strength"], solver.state, exchange_volume, exchange_x, exchange_z,
+            rejected_counter, old_count, capacity, 1, 1, solver.lower_x, solver.lower_z,
+            solver.interface_z, solver.cell_size, solver.nx, solver.nz, 1.0,
+            float(cfg["rest_density"]), 100.0,
+        ],
+        device=device,
+    )
+    wp.synchronize_device(device)
+    if int(rejected_counter.numpy()[0]) != old_count:
+        raise AssertionError("rejected shallow/SPH emission left a zero-valued particle slot")
 
     print(
         f"PASS: shallow field volume drift={volume_error:.3%} after 1 s; "

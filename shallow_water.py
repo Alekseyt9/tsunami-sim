@@ -164,6 +164,8 @@ def emit_sph_interface_particles(
     structural_class: wp.array(dtype=wp.int32),
     fixed: wp.array(dtype=wp.int32),
     damage: wp.array(dtype=float),
+    impact_impulse: wp.array(dtype=float),
+    local_impact_active: wp.array(dtype=wp.int32),
     rho_reference: wp.array(dtype=float),
     rho: wp.array(dtype=float),
     acceleration: wp.array(dtype=wp.vec3),
@@ -238,6 +240,8 @@ def emit_sph_interface_particles(
     structural_class[target] = 0
     fixed[target] = 0
     damage[target] = 0.0
+    impact_impulse[target] = 0.0
+    local_impact_active[target] = 0
     rho_reference[target] = 0.0
     rho[target] = rest_density
     acceleration[target] = wp.vec3(0.0)

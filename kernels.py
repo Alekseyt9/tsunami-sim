@@ -384,10 +384,18 @@ def refine_entering_fluid(
     capacity: int,
     fine_radius: float,
     refine_z: float,
+    surface_only: int,
+    surface_minimum_y: float,
+    turbulent_vertical_speed: float,
 ):
     i = wp.tid()
     if i >= old_count or kind[i] != 0 or radius[i] <= fine_radius * 1.25 or x[i][2] < refine_z:
         return
+    if surface_only != 0:
+        near_surface = x[i][1] >= surface_minimum_y
+        turbulent = wp.abs(v[i][1]) >= turbulent_vertical_speed
+        if not near_surface and not turbulent:
+            return
 
     base = wp.atomic_add(count, 0, 7)
     if base + 6 >= capacity:

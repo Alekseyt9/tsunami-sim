@@ -48,6 +48,51 @@ def structural_damage_rate_multiplier(role: int) -> float:
 
 
 @wp.func
+def material_impact_min_acceleration(role: int) -> float:
+    """Acceleration below this level is treated as harmless local wash."""
+    if role == STRUCT_GLASS:
+        return 3.0
+    if role == STRUCT_WALL:
+        return 8.0
+    if role == STRUCT_SLAB:
+        return 12.0
+    if role == STRUCT_BEAM:
+        return 15.0
+    if role == STRUCT_COLUMN:
+        return 18.0
+    if role == STRUCT_CORE:
+        return 22.0
+    return 10.0
+
+
+@wp.func
+def material_impact_impulse_threshold(role: int) -> float:
+    """Required accumulated impulse per unit mass (equivalent delta-v)."""
+    if role == STRUCT_GLASS:
+        return 0.035
+    if role == STRUCT_WALL:
+        return 0.20
+    if role == STRUCT_SLAB:
+        return 0.35
+    if role == STRUCT_BEAM:
+        return 0.45
+    if role == STRUCT_COLUMN:
+        return 0.65
+    if role == STRUCT_CORE:
+        return 0.85
+    return 0.30
+
+
+@wp.func
+def material_impact_decay_time(role: int) -> float:
+    if role == STRUCT_GLASS:
+        return 0.06
+    if role == STRUCT_WALL:
+        return 0.12
+    return 0.18
+
+
+@wp.func
 def deformable_contact_magnitude(
     penetration: float,
     closing_speed: float,
@@ -157,17 +202,51 @@ def activate_buildings_from_hits(
 
 
 @wp.kernel
+def accumulate_material_impact(
+    kind: wp.array(dtype=wp.int32),
+    structural_class: wp.array(dtype=wp.int32),
+    mass: wp.array(dtype=float),
+    solid_force: wp.array(dtype=wp.vec3),
+    impact_impulse: wp.array(dtype=float),
+    local_impact_active: wp.array(dtype=wp.int32),
+    dt: float,
+):
+    """Low-pass local water impulse so spray and sustained bores differ."""
+    i = wp.tid()
+    if kind[i] == 0:
+        impact_impulse[i] = 0.0
+        local_impact_active[i] = 0
+        return
+    role = structural_class[i]
+    load_acceleration = wp.length(solid_force[i]) / wp.max(mass[i], 1.0)
+    excess = wp.max(load_acceleration - material_impact_min_acceleration(role), 0.0)
+    decay = wp.exp(-dt / material_impact_decay_time(role))
+    accumulated = wp.min(impact_impulse[i] * decay + excess * dt, 5.0)
+    impact_impulse[i] = accumulated
+    # A sufficiently massive isolated splash may release glazing without
+    # waking the entire concrete frame. Other materials still require the
+    # coherent lower-facade building activation gate.
+    if role == STRUCT_GLASS and accumulated >= material_impact_impulse_threshold(role):
+        local_impact_active[i] = 1
+
+
+@wp.kernel
 def apply_building_activity(
     kind: wp.array(dtype=wp.int32),
     building_id: wp.array(dtype=wp.int32),
+    structural_class: wp.array(dtype=wp.int32),
     base_fixed: wp.array(dtype=wp.int32),
     building_active: wp.array(dtype=wp.int32),
+    local_impact_active: wp.array(dtype=wp.int32),
     fixed: wp.array(dtype=wp.int32),
 ):
     i = wp.tid()
     bid = building_id[i]
     if kind[i] != 0 and bid >= 0:
-        if building_active[bid] != 0:
+        locally_released_glass = (
+            structural_class[i] == STRUCT_GLASS and local_impact_active[i] != 0
+        )
+        if building_active[bid] != 0 or locally_released_glass:
             fixed[i] = base_fixed[i]
         else:
             fixed[i] = 1
@@ -190,6 +269,7 @@ def compute_clustered_solid_forces(
     fragment_id: wp.array(dtype=wp.int32),
     rigid_state: wp.array(dtype=wp.int32),
     fragment_support: wp.array(dtype=float),
+    impact_impulse: wp.array(dtype=float),
     fixed: wp.array(dtype=wp.int32),
     damage: wp.array(dtype=float),
     solid_force: wp.array(dtype=wp.vec3),
@@ -247,7 +327,7 @@ def compute_clustered_solid_forces(
     )
     gravity_fraction = wp.max(local_damage * local_damage, building_collapse)
     force = solid_force[i]
-    hydro_loaded = wp.length(solid_force[i]) > mass[i] * 0.8
+    hydro_loaded = impact_impulse[i] >= material_impact_impulse_threshold(structural_class[i])
     facade_particle = structural_class[i] == STRUCT_WALL or structural_class[i] == STRUCT_GLASS
     has_local_support = int(0)
     query = wp.hash_grid_query(grid, xi, max_support)
@@ -1142,6 +1222,8 @@ def refine_impacted_solids(
     damage: wp.array(dtype=float),
     rho_reference: wp.array(dtype=float),
     solid_force: wp.array(dtype=wp.vec3),
+    impact_impulse: wp.array(dtype=float),
+    local_impact_active: wp.array(dtype=wp.int32),
     fragment_id: wp.array(dtype=wp.int32),
     normal_axis: wp.array(dtype=wp.int32),
     rigid_state: wp.array(dtype=wp.int32),
@@ -1168,7 +1250,7 @@ def refine_impacted_solids(
         effective_crack_radius = glass_crack_parent_radius
     if radius[i] <= effective_crack_radius:
         return
-    loaded = wp.length(solid_force[i]) > mass[i] * load_acceleration_trigger
+    loaded = impact_impulse[i] >= material_impact_impulse_threshold(role)
     preimpact = False
     bid = building_id[i]
     if bid >= 0:
@@ -1192,6 +1274,7 @@ def refine_impacted_solids(
     parent_role = structural_class[i]
     parent_fixed = fixed[i]; parent_base_fixed = base_fixed[i]
     parent_damage = damage[i]; parent_rho = rho_reference[i]
+    parent_impact = impact_impulse[i]; parent_local_impact = local_impact_active[i]
     parent_fragment = fragment_id[i]; axis = normal_axis[i]
     child_offset = parent_radius * 0.5208333333
 
@@ -1222,5 +1305,7 @@ def refine_impacted_solids(
         damage[target] = parent_damage
         rho_reference[target] = parent_rho
         solid_force[target] = wp.vec3(0.0)
+        impact_impulse[target] = parent_impact
+        local_impact_active[target] = parent_local_impact
         fragment_id[target] = parent_fragment
         normal_axis[target] = axis

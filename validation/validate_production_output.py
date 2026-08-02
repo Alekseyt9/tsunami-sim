@@ -67,6 +67,9 @@ def main() -> None:
     volume_drift = final_volume / initial_volume - 1.0
     if abs(volume_drift) > args.maximum_volume_drift:
         raise AssertionError(f"combined 2D/3D water drift is {volume_drift:.3%}")
+    invalid_particles = max(row.get("invalid_zero_volume_particles", 0) for row in metrics)
+    if invalid_particles != 0:
+        raise AssertionError(f"run contains {invalid_particles} zero-mass/zero-volume particle slots")
 
     late_start = min(85, max(0, expected - 15))
     late = metrics[late_start:]

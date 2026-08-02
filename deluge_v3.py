@@ -30,6 +30,7 @@ from hybrid_kernels import (  # noqa: E402
     accumulate_rigid_body_loads,
     accumulate_rigid_contacts,
     accumulate_building_damage,
+    accumulate_material_impact,
     activate_buildings_from_hits,
     apply_building_activity,
     clear_body_accumulators,
@@ -189,6 +190,8 @@ class HybridDelugeSolver(DelugeSolver):
 
         base_host = np.zeros(self.capacity, dtype=np.int32)
         base_host[:self.count] = self.arrays["fixed"][:self.count].numpy()
+        impact_host = np.zeros(self.capacity, dtype=np.float32)
+        local_impact_host = np.zeros(self.capacity, dtype=np.int32)
         active_host = np.zeros(max(1, self.building_count), dtype=np.int32)
         activation_exposure_host = np.zeros(max(1, self.building_count), dtype=np.float32)
         v3_resume = self._v3_checkpoint_path(self.resume_path) if self.resume_path else None
@@ -234,6 +237,12 @@ class HybridDelugeSolver(DelugeSolver):
                     normal_capacity.fill(-1)
                     normal_capacity[:len(saved_normal)] = saved_normal
                     self.normal_axis = wp.array(normal_capacity, dtype=wp.int32, device=self.device)
+                if "material_impact_impulse" in state:
+                    saved_impact = state["material_impact_impulse"]
+                    impact_host[:len(saved_impact)] = saved_impact
+                if "local_impact_active" in state:
+                    saved_local_impact = state["local_impact_active"]
+                    local_impact_host[:len(saved_local_impact)] = saved_local_impact
             print(f"V3 state restored from {v3_resume.name}")
         else:
             for bid in self.v3_cfg.get("initially_active_buildings", []):
@@ -243,6 +252,12 @@ class HybridDelugeSolver(DelugeSolver):
                 print("WARNING: matching V3 checkpoint is absent; using configured building activity")
 
         self.base_fixed = wp.array(base_host, dtype=wp.int32, device=self.device)
+        self.arrays["material_impact_impulse"] = wp.array(
+            impact_host, dtype=float, device=self.device
+        )
+        self.arrays["local_impact_active"] = wp.array(
+            local_impact_host, dtype=wp.int32, device=self.device
+        )
         support_policy = self.v3_cfg.get("support_graph", {})
         radius_host = self.arrays["radius"][:self.count].numpy()
         self.fragment_support_graph = build_fragment_support_graph(
@@ -308,7 +323,9 @@ class HybridDelugeSolver(DelugeSolver):
         wp.launch(
             apply_building_activity, dim=self.count,
             inputs=[self.arrays["kind"][:self.count], self.arrays["building_id"][:self.count],
-                    self.base_fixed[:self.count], self.building_active, self.arrays["fixed"][:self.count]],
+                    self.arrays["structural_class"][:self.count], self.base_fixed[:self.count],
+                    self.building_active, self.arrays["local_impact_active"][:self.count],
+                    self.arrays["fixed"][:self.count]],
             device=self.device,
         )
         skin_path = output / "facade_skin.npz"
@@ -770,6 +787,8 @@ class HybridDelugeSolver(DelugeSolver):
             building_active=self.building_active.numpy(),
             building_activation_exposure_seconds=self.building_activation_exposure.numpy(),
             base_fixed=self.base_fixed[:self.count].numpy(),
+            material_impact_impulse=self.arrays["material_impact_impulse"][:self.count].numpy(),
+            local_impact_active=self.arrays["local_impact_active"][:self.count].numpy(),
             fragment_id=self.fragment_id[:self.count].numpy(),
             normal_axis=self.normal_axis[:self.count].numpy(),
             rigid_state=self.rigid_state.numpy(),
@@ -1017,6 +1036,14 @@ class HybridDelugeSolver(DelugeSolver):
             )
         clustering = self.v3_cfg["fragment_clustering"]
         self.shallow_water.couple(a, self.count, dt)
+        wp.launch(
+            accumulate_material_impact, dim=self.count,
+            inputs=[a["kind"][:self.count], a["structural_class"][:self.count],
+                    a["mass"][:self.count], a["solid_force"][:self.count],
+                    a["material_impact_impulse"][:self.count],
+                    a["local_impact_active"][:self.count], dt],
+            device=self.device,
+        )
         self.building_damage_integral.zero_()
         wp.launch(
             accumulate_building_damage, dim=self.count,
@@ -1031,6 +1058,7 @@ class HybridDelugeSolver(DelugeSolver):
                     a["structural_class"][:self.count], a["building_id"][:self.count],
                     self.building_damage_integral, self.building_structural_volume,
                     self.fragment_id[:self.count], self.rigid_state, self.fragment_support,
+                    a["material_impact_impulse"][:self.count],
                     a["fixed"][:self.count],
                     a["damage"][:self.count], a["solid_force"][:self.count], a["acceleration"][:self.count],
                     self.max_support, dt, float(clustering.get("internal_stiffness_multiplier", 2.0)),
@@ -1158,7 +1186,9 @@ class HybridDelugeSolver(DelugeSolver):
         wp.launch(
             apply_building_activity, dim=self.count,
             inputs=[self.arrays["kind"][:self.count], self.arrays["building_id"][:self.count],
-                    self.base_fixed[:self.count], self.building_active, self.arrays["fixed"][:self.count]],
+                    self.arrays["structural_class"][:self.count], self.base_fixed[:self.count],
+                    self.building_active, self.arrays["local_impact_active"][:self.count],
+                    self.arrays["fixed"][:self.count]],
             device=self.device,
         )
 
@@ -1167,6 +1197,11 @@ class HybridDelugeSolver(DelugeSolver):
         # surfaces use planar 1->4 refinement so a thin wall does not become a
         # volumetric cloud when resolution increases near an impact.
         super().refine()
+        # Water refinement appends particles with fragment_id=-1.  Keep the
+        # host mirror aligned even on frames where no structural child is
+        # created; support diagnostics and later compaction use full-length
+        # particle masks.
+        self.fragment_host = self.fragment_id[:self.count].numpy()
         if not bool(self.v3_cfg["solid_refinement"].get("enabled", True)):
             return
         old_count = self.count
@@ -1197,7 +1232,9 @@ class HybridDelugeSolver(DelugeSolver):
                     self.arrays["mass"], self.arrays["volume"], self.arrays["kind"], self.arrays["material"],
                     self.arrays["structural_class"],
                     self.arrays["building_id"], self.arrays["fixed"], self.base_fixed, self.arrays["damage"],
-                    self.arrays["rho_reference"], self.arrays["solid_force"], self.fragment_id, self.normal_axis,
+                    self.arrays["rho_reference"], self.arrays["solid_force"],
+                    self.arrays["material_impact_impulse"], self.arrays["local_impact_active"],
+                    self.fragment_id, self.normal_axis,
                     self.rigid_state, self.preimpact_building, self.refinement_counters,
                     count_device, old_count, self.capacity,
                     float(policy["crack_spacing"]) * 0.48 * 1.25,
@@ -1236,6 +1273,19 @@ class HybridDelugeSolver(DelugeSolver):
         volume_host = self.arrays["volume"][:self.count].numpy()
         result["fluid_volume_m3"] = float(np.sum(volume_host[fluid_mask], dtype=np.float64))
         mass_host = self.arrays["mass"][:self.count].numpy()
+        radius_host = self.arrays["radius"][:self.count].numpy()
+        result["invalid_zero_volume_particles"] = int(np.count_nonzero(
+            (mass_host <= 0.0) | (volume_host <= 0.0)
+        ))
+        fine_fluid_mask = fluid_mask & (
+            radius_host <= float(self.cfg["fine_spacing"]) * 0.5 * 1.25
+        )
+        result["fine_fluid_particles"] = int(np.count_nonzero(fine_fluid_mask))
+        result["coarse_fluid_particles"] = int(np.count_nonzero(fluid_mask & ~fine_fluid_mask))
+        result["fine_fluid_volume_percent"] = float(
+            100.0 * np.sum(volume_host[fine_fluid_mask], dtype=np.float64)
+            / max(np.sum(volume_host[fluid_mask], dtype=np.float64), 1.0e-9)
+        )
         velocity_host = self.arrays["v"][:self.count].numpy()
         position_host = self.arrays["x"][:self.count].numpy()
         fixed_host = self.arrays["fixed"][:self.count].numpy()
@@ -1268,6 +1318,14 @@ class HybridDelugeSolver(DelugeSolver):
             )
         structural_role = self.arrays["structural_class"][:self.count].numpy()
         damage_values = self.arrays["damage"][:self.count].numpy()
+        impact_values = self.arrays["material_impact_impulse"][:self.count].numpy()
+        local_impact_values = self.arrays["local_impact_active"][:self.count].numpy()
+        result["local_impact_glass_particles"] = int(np.count_nonzero(
+            (structural_role == 6) & (local_impact_values != 0)
+        ))
+        result["material_impact_impulse_max_m_s"] = float(
+            np.max(impact_values[kind_host != 0]) if np.any(kind_host != 0) else 0.0
+        )
         self._update_fragment_support_graph(position_host, damage_values)
         damaged_mask = damage_values > 0.05
         for role, role_name in (
@@ -1293,7 +1351,7 @@ class HybridDelugeSolver(DelugeSolver):
             self.last_active_count = active_count
         result["active_buildings"] = active_count
         building_volume = self.building_structural_volume.numpy()
-        particle_fragment = self.fragment_host[:self.count]
+        particle_fragment = self.fragment_id[:self.count].numpy()
         valid_support_particle = (kind_host != 0) & (particle_fragment >= 0)
         unsupported_particle = valid_support_particle.copy()
         unsupported_particle[valid_support_particle] = ~self.fragment_support_host[
@@ -1434,6 +1492,7 @@ class HybridDelugeSolver(DelugeSolver):
                     self.arrays["radius"], self.arrays["mass"], self.arrays["volume"],
                     self.arrays["kind"], self.arrays["material"], self.arrays["building_id"],
                     self.arrays["structural_class"], self.arrays["fixed"], self.arrays["damage"],
+                    self.arrays["material_impact_impulse"], self.arrays["local_impact_active"],
                     self.arrays["rho_reference"], self.arrays["rho"], self.arrays["acceleration"],
                     self.arrays["solid_force"], self.base_fixed, self.fragment_id, self.normal_axis,
                     self.time_level, self.time_active, self.arrays["water_surface_mask"],
@@ -1465,6 +1524,7 @@ class HybridDelugeSolver(DelugeSolver):
         array_names = (
             "x", "rest_x", "v", "radius", "mass", "volume", "kind", "material",
             "building_id", "structural_class", "fixed", "damage", "rho_reference", "rho",
+            "material_impact_impulse", "local_impact_active",
             "acceleration", "solid_force", "water_surface_mask", "water_surface_normal",
             "water_foam_strength",
         )
@@ -1487,9 +1547,13 @@ class HybridDelugeSolver(DelugeSolver):
     def _compact_particle_arrays(self, old_count: int):
         self._ensure_particle_compaction_scratch()
         scratch = self.particle_compaction_scratch
-        float_names = ("radius", "mass", "volume", "damage", "rho_reference", "rho", "water_foam_strength")
+        float_names = (
+            "radius", "mass", "volume", "damage", "rho_reference", "rho",
+            "water_foam_strength", "material_impact_impulse",
+        )
         int_names = (
             "kind", "material", "building_id", "structural_class", "fixed", "water_surface_mask",
+            "local_impact_active",
         )
         vec3_names = ("x", "rest_x", "v", "acceleration", "solid_force", "water_surface_normal")
         for name in float_names:

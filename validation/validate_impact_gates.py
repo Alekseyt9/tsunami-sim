@@ -10,8 +10,14 @@ import warp as wp
 
 HERE = Path(__file__).resolve().parent
 
-from hybrid_kernels import activate_buildings_from_hits, count_loaded_building_particles
+from hybrid_kernels import (
+    accumulate_material_impact,
+    activate_buildings_from_hits,
+    apply_building_activity,
+    count_loaded_building_particles,
+)
 from kernels import integrate
+from scene import STRUCT_CORE, STRUCT_GLASS, STRUCT_WALL
 
 
 def validate_velocity_guard(device: str) -> None:
@@ -105,14 +111,45 @@ def validate_activation_gate(device: str) -> None:
         raise AssertionError("a sustained tsunami-front load did not activate the building")
 
 
+def validate_material_impact_gate(device: str) -> None:
+    roles = wp.array(
+        np.asarray([STRUCT_GLASS, STRUCT_WALL, STRUCT_CORE], dtype=np.int32),
+        dtype=wp.int32, device=device,
+    )
+    kind = wp.ones(3, dtype=wp.int32, device=device)
+    mass = wp.array(np.full(3, 100.0, dtype=np.float32), dtype=float, device=device)
+    force = wp.array(
+        np.asarray([[2000.0, 0.0, 0.0]] * 3, dtype=np.float32),
+        dtype=wp.vec3, device=device,
+    )
+    impulse = wp.zeros(3, dtype=float, device=device)
+    local = wp.zeros(3, dtype=wp.int32, device=device)
+    wp.launch(
+        accumulate_material_impact, dim=3,
+        inputs=[kind, roles, mass, force, impulse, local, 0.01], device=device,
+    )
+    if local.numpy().tolist() != [1, 0, 0]:
+        raise AssertionError(f"isolated impulse did not release only glass: {local.numpy()}")
+    fixed = wp.ones(3, dtype=wp.int32, device=device)
+    wp.launch(
+        apply_building_activity, dim=3,
+        inputs=[kind, wp.zeros(3, dtype=wp.int32, device=device), roles,
+                wp.zeros(3, dtype=wp.int32, device=device),
+                wp.zeros(1, dtype=wp.int32, device=device), local, fixed], device=device,
+    )
+    if fixed.numpy().tolist() != [0, 1, 1]:
+        raise AssertionError(f"local glass release woke concrete or the whole building: {fixed.numpy()}")
+
+
 def main() -> None:
     wp.init()
     device = "cuda:0" if wp.is_cuda_available() else "cpu"
     validate_velocity_guard(device)
     validate_activation_gate(device)
+    validate_material_impact_gate(device)
     print(
         "PASS: fluid <=30 m/s / vertical <=18 m/s; solids <=40 m/s / upward <=12 m/s; "
-        "only sustained lower-facade +Z load activates"
+        "only sustained lower-facade +Z load activates; isolated impact releases only glass"
     )
 
 
