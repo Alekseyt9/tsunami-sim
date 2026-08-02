@@ -11,7 +11,15 @@ from dataclasses import dataclass
 from pathlib import Path
 import numpy as np
 
-from scene import STRUCT_BEAM, STRUCT_COLUMN, building_profile
+from scene import (
+    STRUCT_BEAM,
+    STRUCT_COLUMN,
+    STRUCT_CORE,
+    STRUCT_GLASS,
+    STRUCT_SLAB,
+    STRUCT_WALL,
+    building_profile,
+)
 
 
 @dataclass(frozen=True)
@@ -224,6 +232,7 @@ def build_fragment_ids(
     kind: np.ndarray,
     building_id: np.ndarray,
     cfg: dict,
+    structural_class: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Partition each building into architectural-scale cohesive fragments.
 
@@ -244,31 +253,45 @@ def build_fragment_ids(
     fragment_id = np.full(len(rest_x), -1, dtype=np.int32)
     next_fragment = 0
 
+    # Never place facade, floors and the vertical frame in one unbreakable
+    # chunk.  The previous spatial-only partition could bind a rear facade
+    # panel to a core-dominated fragment, leaving a visually intact wall after
+    # all of its real wall connections had failed.
+    structural_family = np.zeros(len(rest_x), dtype=np.int32)
+    if structural_class is not None:
+        structural_family[np.isin(structural_class, (STRUCT_SLAB, STRUCT_BEAM))] = 1
+        structural_family[np.isin(structural_class, (STRUCT_COLUMN, STRUCT_CORE))] = 2
+        structural_family[np.isin(structural_class, (STRUCT_WALL, STRUCT_GLASS))] = 0
+
     for bid, spec in enumerate(cfg["buildings"]):
-        indices = np.flatnonzero((kind != 0) & (building_id == bid))
-        if len(indices) == 0:
+        building_indices = np.flatnonzero((kind != 0) & (building_id == bid))
+        if len(building_indices) == 0:
             continue
         cx, cz, width, depth, _height = map(float, spec)
         origin = np.asarray((cx - width * 0.5, 0.0, cz - depth * 0.5), dtype=np.float32)
-        coordinates = np.floor((rest_x[indices] - origin) / cell).astype(np.int32)
-        unique_cells, inverse, counts = np.unique(coordinates, axis=0, return_inverse=True, return_counts=True)
+        for family in np.unique(structural_family[building_indices]):
+            indices = building_indices[structural_family[building_indices] == family]
+            coordinates = np.floor((rest_x[indices] - origin) / cell).astype(np.int32)
+            unique_cells, inverse, counts = np.unique(
+                coordinates, axis=0, return_inverse=True, return_counts=True
+            )
 
-        stable = np.flatnonzero(counts >= minimum)
-        if len(stable) == 0:
-            stable = np.asarray([int(np.argmax(counts))], dtype=np.int64)
-        remap = np.arange(len(unique_cells), dtype=np.int64)
-        for source in np.flatnonzero(counts < minimum):
-            delta = (unique_cells[stable] - unique_cells[source]).astype(np.float32)
-            distance2 = np.sum(delta * delta, axis=1)
-            # Prefer a nearby massive cell when two candidates are equidistant.
-            score = distance2 - np.minimum(counts[stable], minimum * 4) * 1.0e-4
-            remap[source] = stable[int(np.argmin(score))]
+            stable = np.flatnonzero(counts >= minimum)
+            if len(stable) == 0:
+                stable = np.asarray([int(np.argmax(counts))], dtype=np.int64)
+            remap = np.arange(len(unique_cells), dtype=np.int64)
+            for source in np.flatnonzero(counts < minimum):
+                delta = (unique_cells[stable] - unique_cells[source]).astype(np.float32)
+                distance2 = np.sum(delta * delta, axis=1)
+                # Prefer a nearby massive cell when two candidates are equidistant.
+                score = distance2 - np.minimum(counts[stable], minimum * 4) * 1.0e-4
+                remap[source] = stable[int(np.argmin(score))]
 
-        merged = remap[inverse]
-        representatives = np.unique(merged)
-        local_ids = np.searchsorted(representatives, merged).astype(np.int32)
-        fragment_id[indices] = local_ids + next_fragment
-        next_fragment += len(representatives)
+            merged = remap[inverse]
+            representatives = np.unique(merged)
+            local_ids = np.searchsorted(representatives, merged).astype(np.int32)
+            fragment_id[indices] = local_ids + next_fragment
+            next_fragment += len(representatives)
 
     counts = np.bincount(fragment_id[fragment_id >= 0], minlength=next_fragment).astype(np.int32)
     return fragment_id, counts

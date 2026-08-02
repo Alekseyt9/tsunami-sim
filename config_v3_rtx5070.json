@@ -99,10 +99,11 @@
       "preimpact_margin": 6.0
     },
     "fragment_clustering": {
+      "schema_version": 2,
       "enabled": true,
       "scan_every_frames": 8,
       "minimum_cluster_particles": 36,
-      "cell_size": [4.5, 3.0, 4.5],
+      "cell_size": [6.0, 3.0, 6.0],
       "internal_stiffness_multiplier": 3.5,
       "damage_rate": 1.0,
         "propagation_threshold": 0.75,
@@ -113,7 +114,8 @@
         "collapse_gravity_damage_full": 0.10,
         "facade_support_loss_minimum_elevation": 4.0,
         "facade_support_loss_collapse_threshold": 0.75,
-        "facade_support_loss_damage_rate": 2.5
+        "facade_support_loss_damage_rate": 1.0,
+        "facade_unsupported_damage_rate": 0.75
     },
     "rigid_clusters": {
       "enabled": true,

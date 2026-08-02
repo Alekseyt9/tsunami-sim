@@ -12,7 +12,7 @@ import warp as wp
 from deluge_v3 import HybridDelugeSolver
 
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parent.parent
 
 
 @wp.kernel

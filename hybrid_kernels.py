@@ -191,6 +191,7 @@ def compute_clustered_solid_forces(
     facade_support_loss_minimum_elevation: float,
     facade_support_loss_collapse_threshold: float,
     facade_support_loss_damage_rate: float,
+    facade_unsupported_damage_rate: float,
 ):
     """Break joints between architectural chunks, never atomize a chunk."""
     tid = wp.tid()
@@ -222,10 +223,10 @@ def compute_clustered_solid_forces(
         facade_support_loss_damage_rate,
     )
     gravity_fraction = wp.max(local_damage * local_damage, building_collapse)
-    if body_rigid:
-        gravity_fraction = 1.0
-    force = solid_force[i] + wp.vec3(0.0, -9.81 * mass[i] * gravity_fraction, 0.0)
+    force = solid_force[i]
     hydro_loaded = wp.length(solid_force[i]) > mass[i] * 0.8
+    facade_particle = structural_class[i] == STRUCT_WALL or structural_class[i] == STRUCT_GLASS
+    has_local_support = int(0)
     query = wp.hash_grid_query(grid, xi, max_support)
 
     for j in query:
@@ -243,6 +244,26 @@ def compute_clustered_solid_forces(
         same_fragment = fid >= 0 and fid == fragment_id[j]
         neighbour_fid = fragment_id[j]
         neighbour_rigid = neighbour_fid >= 0 and rigid_state[neighbour_fid] != 0
+
+        # A facade particle is supported either by an intact neighbour below
+        # it or by a nearby intact diaphragm/frame member.  This is evaluated
+        # in the deformed configuration: once the lower wall has moved away,
+        # lateral springs can no longer suspend the upper panel indefinitely.
+        if facade_particle and bonded and damage[j] < 0.90:
+            horizontal_rest2 = rest_delta[0] * rest_delta[0] + rest_delta[2] * rest_delta[2]
+            below = (
+                rest_delta[1] < -0.25 * bond_range
+                and horizontal_rest2 < 0.56 * bond_range * bond_range
+            )
+            neighbour_role = structural_class[j]
+            frame_member = (
+                neighbour_role == STRUCT_SLAB or neighbour_role == STRUCT_BEAM
+                or neighbour_role == STRUCT_COLUMN or neighbour_role == STRUCT_CORE
+            )
+            diaphragm = frame_member and wp.abs(rest_delta[1]) < 0.55 * bond_range
+            current_attachment_intact = dist < rest_dist * 1.55
+            if (below or diaphragm) and current_attachment_intact:
+                has_local_support = 1
 
         if body_rigid and same_fragment:
             # A rigid cluster is projected from one body transform, so neither
@@ -306,6 +327,18 @@ def compute_clustered_solid_forces(
                 closing = wp.dot(v[j] - v[i], normal)
                 force -= normal * (3.0e6 * penetration + 2600.0 * wp.min(closing, 0.0))
 
+    if (
+        facade_particle and ri[1] > facade_support_loss_minimum_elevation
+        and has_local_support == 0 and not body_rigid
+    ):
+        # Gravity begins immediately after loss of the local load path.  Joint
+        # damage follows more slowly, allowing a wall-sized chunk to fall and
+        # collide instead of disappearing into dust.
+        gravity_fraction = 1.0
+        local_damage += dt * facade_unsupported_damage_rate
+    if body_rigid:
+        gravity_fraction = 1.0
+    force += wp.vec3(0.0, -9.81 * mass[i] * gravity_fraction, 0.0)
     damage[i] = wp.min(local_damage, 1.0)
     ai = force / wp.max(mass[i], 1.0)
     a_len = wp.length(ai)

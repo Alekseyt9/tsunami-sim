@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parent.parent
 
 from scene import ParticleScene, building_profile  # noqa: E402
 from hybrid_model import build_facade_skin  # noqa: E402

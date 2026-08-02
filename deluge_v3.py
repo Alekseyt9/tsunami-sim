@@ -167,7 +167,9 @@ class HybridDelugeSolver(DelugeSolver):
         building_host = self.arrays["building_id"][:self.count].numpy()
         rest_host = self.arrays["rest_x"][:self.count].numpy()
         structural_class_host = self.arrays["structural_class"][:self.count].numpy()
-        fragment_host, fragment_counts = build_fragment_ids(rest_host, kind_host, building_host, cfg)
+        fragment_host, fragment_counts = build_fragment_ids(
+            rest_host, kind_host, building_host, cfg, structural_class_host
+        )
         self.fragment_host = fragment_host
         self.fragment_counts_host = fragment_counts
         fragment_capacity = np.full(self.capacity, -1, dtype=np.int32)
@@ -189,6 +191,19 @@ class HybridDelugeSolver(DelugeSolver):
         v3_resume = self._v3_checkpoint_path(self.resume_path) if self.resume_path else None
         if v3_resume is not None and v3_resume.exists():
             with np.load(v3_resume, allow_pickle=False) as state:
+                expected_fragment_schema = int(
+                    self.v3_cfg["fragment_clustering"].get("schema_version", 1)
+                )
+                saved_fragment_schema = int(
+                    state["fragment_schema_version"]
+                ) if "fragment_schema_version" in state else 1
+                if saved_fragment_schema != expected_fragment_schema:
+                    raise RuntimeError(
+                        "Incompatible V3 fragment topology in checkpoint "
+                        f"{v3_resume.name}: schema {saved_fragment_schema}, expected "
+                        f"{expected_fragment_schema}. Start a fresh simulation so facade, "
+                        "floor and frame particles are clustered independently."
+                    )
                 saved_base = state["base_fixed"]
                 base_host[:len(saved_base)] = saved_base
                 saved_active = state["building_active"]
@@ -685,6 +700,9 @@ class HybridDelugeSolver(DelugeSolver):
         v3_path = self._v3_checkpoint_path(base_path)
         np.savez_compressed(
             v3_path,
+            fragment_schema_version=np.int32(
+                self.v3_cfg["fragment_clustering"].get("schema_version", 1)
+            ),
             building_active=self.building_active.numpy(),
             building_activation_exposure_seconds=self.building_activation_exposure.numpy(),
             base_fixed=self.base_fixed[:self.count].numpy(),
@@ -960,7 +978,8 @@ class HybridDelugeSolver(DelugeSolver):
                     float(clustering.get("collapse_gravity_damage_full", 0.10)),
                     float(clustering.get("facade_support_loss_minimum_elevation", 4.0)),
                     float(clustering.get("facade_support_loss_collapse_threshold", 0.75)),
-                    float(clustering.get("facade_support_loss_damage_rate", 2.5))],
+                    float(clustering.get("facade_support_loss_damage_rate", 1.0)),
+                    float(clustering.get("facade_unsupported_damage_rate", 0.75))],
             device=self.device,
         )
         rigid_policy = self.v3_cfg.get("rigid_clusters", {})

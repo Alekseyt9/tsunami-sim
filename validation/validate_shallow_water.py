@@ -11,7 +11,7 @@ import warp as wp
 from shallow_water import ShallowWaterFarField, emit_sph_interface_particles
 
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parent.parent
 
 
 def main():
