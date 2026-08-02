@@ -36,8 +36,10 @@ def main() -> None:
         solver.arrays["mass"][:solver.count].numpy()[:, None]
         * solver.arrays["v"][:solver.count].numpy(), axis=0, dtype=np.float64,
     )
+    classify_ms = []
     for _ in range(3):
         solver.update_water_surface()
+        classify_ms.append(float(solver.water_surface_classify_ms))
     wp.synchronize_device(solver.device)
     phase = solver.arrays["water_phase"][:solver.count].numpy()
     kind = solver.arrays["kind"][:solver.count].numpy()
@@ -57,9 +59,14 @@ def main() -> None:
     image = solver.renderer.render(solver.arrays, solver.count, None, 96, solver.time, {})
     if image.shape != (180, 320, 3) or not np.any(image):
         raise AssertionError("phase-aware water renderer produced an invalid frame")
+    solver.substep(float(cfg["dt"]))
+    wp.synchronize_device(solver.device)
+    if not np.all(np.isfinite(solver.arrays["x"][:solver.count].numpy())):
+        raise AssertionError("phase-aware production substep produced non-finite positions")
     print(
         f"PASS: checkpoint 96 phases connected={counts[0]:,}, sheet={counts[1]:,}, "
-        f"ballistic={counts[2]:,}; 320x180 phase-aware render is valid"
+        f"ballistic={counts[2]:,}; classifier={np.mean(classify_ms):.2f} ms/frame; "
+        "320x180 phase-aware render is valid"
     )
 
 

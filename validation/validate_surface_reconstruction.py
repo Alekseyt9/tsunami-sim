@@ -22,19 +22,21 @@ def main() -> None:
     v = wp.zeros(count, dtype=wp.vec3, device=device)
     radius = wp.array(np.full(count, 0.5, dtype=np.float32), dtype=float, device=device)
     kind = wp.zeros(count, dtype=wp.int32, device=device)
+    rho_reference = wp.zeros(count, dtype=float, device=device)
     mask = wp.zeros(count, dtype=wp.int32, device=device)
     normal = wp.zeros(count, dtype=wp.vec3, device=device)
     foam = wp.zeros(count, dtype=float, device=device)
     phase = wp.zeros(count, dtype=wp.int32, device=device)
     candidate = wp.zeros(count, dtype=wp.int32, device=device)
     candidate_age = wp.zeros(count, dtype=wp.int32, device=device)
+    transitions = wp.zeros(4, dtype=wp.int32, device=device)
     grid = wp.HashGrid(16, 16, 16, device=device)
     grid.build(x, 2.6)
     wp.launch(
         classify_water_surface,
         dim=count,
-        inputs=[grid.id, x, v, radius, kind, mask, normal, foam, phase, candidate,
-                candidate_age, 2.6, 18, 8, 0.32, 5, 3, 2, 0.86],
+        inputs=[grid.id, x, v, radius, kind, rho_reference, mask, normal, foam, phase, candidate,
+                candidate_age, transitions, 2.6, 18, 8, 0.32, 5, 3, 2, 0.86, 1],
         device=device,
     )
     wp.synchronize_device(device)

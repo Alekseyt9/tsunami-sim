@@ -12,12 +12,13 @@ from surface_kernels import classify_water_surface  # noqa: E402
 
 
 def classify(grid, arrays, count: int) -> None:
-    x, v, radius, kind, mask, normal, foam, phase, candidate, age = arrays
+    x, v, radius, kind, rho_reference, mask, normal, foam, phase, candidate, age, transitions = arrays
     grid.build(x, 2.6)
     wp.launch(
         classify_water_surface, dim=count,
-        inputs=[grid.id, x, v, radius, kind, mask, normal, foam, phase, candidate, age,
-                2.6, 18, 8, 0.32, 5, 3, 2, 0.86], device="cuda:0",
+        inputs=[grid.id, x, v, radius, kind, rho_reference, mask, normal, foam, phase, candidate, age,
+                transitions,
+                2.6, 18, 8, 0.32, 5, 3, 2, 0.86, 1], device="cuda:0",
     )
 
 
@@ -41,13 +42,15 @@ def main() -> None:
     v = wp.array(velocity_host, dtype=wp.vec3, device=device)
     radius = wp.array(np.full(count, 0.5, dtype=np.float32), dtype=float, device=device)
     kind = wp.zeros(count, dtype=wp.int32, device=device)
+    rho_reference = wp.zeros(count, dtype=float, device=device)
     mask = wp.zeros(count, dtype=wp.int32, device=device)
     normal = wp.zeros(count, dtype=wp.vec3, device=device)
     foam = wp.zeros(count, dtype=float, device=device)
     phase = wp.zeros(count, dtype=wp.int32, device=device)
     candidate = wp.zeros(count, dtype=wp.int32, device=device)
     age = wp.zeros(count, dtype=wp.int32, device=device)
-    arrays = (x, v, radius, kind, mask, normal, foam, phase, candidate, age)
+    transitions = wp.zeros(4, dtype=wp.int32, device=device)
+    arrays = (x, v, radius, kind, rho_reference, mask, normal, foam, phase, candidate, age, transitions)
     grid = wp.HashGrid(64, 64, 64, device=device)
 
     mass_before = np.full(count, 125.0, dtype=np.float32)
@@ -68,6 +71,8 @@ def main() -> None:
         raise AssertionError("one-layer lamella was not classified as a thin sheet")
     if phase_host[-1] != 2:
         raise AssertionError("isolated particle did not enter ballistic mode after hysteresis")
+    if int(transitions.numpy()[0]) != 1:
+        raise AssertionError("ballistic entry transition was not counted exactly once")
     if float(foam.numpy()[-1]) <= 0.05:
         raise AssertionError("energetic spray did not create render-only foam")
 
@@ -94,9 +99,25 @@ def main() -> None:
     if not np.allclose(momentum_after_classification, momentum_before, atol=1.0e-5):
         raise AssertionError("phase classification changed particle momentum")
 
+    # Put the drop back onto the connected free surface.  It must retain the
+    # ballistic mode for one classification, then rejoin and request a fresh
+    # SPH density normalization on the second.
+    rejoined_points = points.copy()
+    rejoined_points[-1] = (0.0, 4.0, 0.0)
+    wp.copy(x, wp.array(rejoined_points, dtype=wp.vec3, device=device), count=count)
+    classify(grid, arrays, count)
+    if int(phase.numpy()[-1]) != 2:
+        raise AssertionError("ballistic drop left its mode before exit hysteresis completed")
+    classify(grid, arrays, count)
+    wp.synchronize_device(device)
+    if int(phase.numpy()[-1]) == 2 or abs(float(rho_reference.numpy()[-1])) > 1.0e-7:
+        raise AssertionError("drop did not rejoin SPH with density recalibration")
+    if int(transitions.numpy()[1]) != 1:
+        raise AssertionError("SPH rejoin transition was not counted exactly once")
+
     print(
         "PASS: connected bulk, thin sheet and ballistic drop separate with hysteresis; "
-        "classification preserves mass/momentum and foam remains render-only"
+        "classification preserves mass/momentum, rejoins SPH, and foam remains render-only"
     )
 
 

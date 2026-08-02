@@ -582,6 +582,9 @@ class HybridDelugeSolver(DelugeSolver):
         self.arrays["water_connected_mask"] = wp.zeros(self.capacity, dtype=wp.int32, device=self.device)
         self.arrays["water_sheet_mask"] = wp.zeros(self.capacity, dtype=wp.int32, device=self.device)
         self.arrays["water_droplet_mask"] = wp.zeros(self.capacity, dtype=wp.int32, device=self.device)
+        self.water_phase_transition_counts = wp.zeros(4, dtype=wp.int32, device=self.device)
+        self.water_phase_transition_latest = np.zeros(4, dtype=np.int64)
+        self.water_phase_transition_totals = np.zeros(4, dtype=np.int64)
         self.water_mesh_cfg = self.v3_cfg.get("water_mesh", {})
         self.water_mesh_enabled = bool(self.water_mesh_cfg.get("enabled", True))
         self.water_mesh_frame = 0
@@ -627,6 +630,10 @@ class HybridDelugeSolver(DelugeSolver):
                             wp.array(host, dtype=self.arrays[name].dtype, device=self.device),
                             count=min(self.count, len(host)),
                         )
+                if "water_phase_transition_totals" in saved:
+                    self.water_phase_transition_totals = saved[
+                        "water_phase_transition_totals"
+                    ].astype(np.int64)
 
     def update_water_surface(self):
         if not self.surface_enabled:
@@ -638,22 +645,26 @@ class HybridDelugeSolver(DelugeSolver):
             float(self.cfg.get("coarse_spacing", 1.0)) * float(self.surface_cfg.get("query_scale", 2.5)),
         )
         self.grid.build(view, query_radius)
+        wp.launch(clear_int, dim=4, inputs=[self.water_phase_transition_counts], device=self.device)
         wp.launch(
             classify_water_surface, dim=self.count,
             inputs=[self.grid.id, view, self.arrays["v"][:self.count], self.arrays["radius"][:self.count],
-                    self.arrays["kind"][:self.count], self.arrays["water_surface_mask"][:self.count],
+                    self.arrays["kind"][:self.count], self.arrays["rho_reference"][:self.count],
+                    self.arrays["water_surface_mask"][:self.count],
                     self.arrays["water_surface_normal"][:self.count],
                     self.arrays["water_foam_strength"][:self.count],
                     self.arrays["water_phase"][:self.count],
                     self.arrays["water_phase_candidate"][:self.count],
-                    self.arrays["water_phase_candidate_age"][:self.count], query_radius,
+                    self.arrays["water_phase_candidate_age"][:self.count],
+                    self.water_phase_transition_counts, query_radius,
                     int(self.surface_cfg.get("minimum_neighbours", 18)),
-                    int(self.surface_cfg.get("sheet_minimum_neighbours", 8)),
-                    float(self.surface_cfg.get("sheet_thickness_ratio", 0.32)),
-                    int(self.surface_cfg.get("droplet_maximum_neighbours", 5)),
-                    int(self.surface_cfg.get("droplet_enter_classifications", 3)),
+                    int(self.surface_cfg.get("sheet_minimum_neighbours", 6)),
+                    float(self.surface_cfg.get("sheet_thickness_ratio", 0.42)),
+                    int(self.surface_cfg.get("droplet_maximum_neighbours", 4)),
+                    int(self.surface_cfg.get("droplet_enter_classifications", 4)),
                     int(self.surface_cfg.get("droplet_exit_classifications", 2)),
-                    float(self.surface_cfg.get("foam_decay", 0.86))], device=self.device,
+                    float(self.surface_cfg.get("foam_decay", 0.80)),
+                    int(bool(self.surface_cfg.get("phase_separation_enabled", True)))], device=self.device,
         )
         wp.launch(
             build_water_phase_masks, dim=self.count,
@@ -664,6 +675,8 @@ class HybridDelugeSolver(DelugeSolver):
                     self.arrays["water_droplet_mask"][:self.count]], device=self.device,
         )
         wp.synchronize_device(self.device)
+        self.water_phase_transition_latest = self.water_phase_transition_counts.numpy().astype(np.int64)
+        self.water_phase_transition_totals += self.water_phase_transition_latest
         self.water_surface_classify_ms = (time.perf_counter() - classify_started) * 1000.0
         if self.water_mesh_enabled:
             self._build_water_mesh()
@@ -1002,6 +1015,7 @@ class HybridDelugeSolver(DelugeSolver):
             water_phase_candidate=self.arrays["water_phase_candidate"][:self.count].numpy(),
             water_phase_candidate_age=self.arrays["water_phase_candidate_age"][:self.count].numpy(),
             water_foam_strength=self.arrays["water_foam_strength"][:self.count].numpy(),
+            water_phase_transition_totals=self.water_phase_transition_totals,
             shallow_water_state=self.shallow_water.state.numpy(),
             shallow_water_accumulated_dt=np.float32(self.shallow_water.accumulated_dt),
             shallow_emitted_particles_total=np.int64(self.shallow_water.emitted_particles_total),
@@ -1789,6 +1803,16 @@ class HybridDelugeSolver(DelugeSolver):
             result["foam_particles"] = int(np.count_nonzero(
                 fluid_surface & (self.arrays["water_foam_strength"][:self.count].numpy() > 0.05)
             ))
+            transition_names = (
+                "droplet_entries", "droplet_rejoins", "sheet_entries", "sheet_returns"
+            )
+            for transition_index, transition_name in enumerate(transition_names):
+                result[f"water_phase_{transition_name}"] = int(
+                    self.water_phase_transition_latest[transition_index]
+                )
+                result[f"water_phase_{transition_name}_total"] = int(
+                    self.water_phase_transition_totals[transition_index]
+                )
             result["water_mesh_vertices"] = len(self.water_mesh_vertices)
             result["water_mesh_triangles"] = self.water_mesh_triangle_count
             result["water_field_nodes"] = int(np.prod(self.water_field_shape, dtype=np.int64))

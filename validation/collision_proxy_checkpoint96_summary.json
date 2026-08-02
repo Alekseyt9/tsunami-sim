@@ -1,0 +1,39 @@
+{
+  "schema": "deluge-v3-collision-proxy-ab-v1",
+  "checkpoint_frame": 96,
+  "particles": 584394,
+  "rigid_bodies": 1,
+  "rigid_proxy_pairs": 0,
+  "profile_substeps": 12,
+  "substeps_per_output_frame": 348,
+  "proxy_off": {
+    "contact_ms_per_substep": 0.29722399792323506,
+    "structural_and_contact_ms_per_substep": 13.575397206159929,
+    "physics_output_frame_ms": 8504.017900006147,
+    "stats_render_compose_ms": 197.2401999955764,
+    "complete_output_frame_ms": 8701.258100001724
+  },
+  "proxy_on": {
+    "contact_ms_per_substep": 0.28495733259478584,
+    "structural_and_contact_ms_per_substep": 13.549696051263405,
+    "physics_output_frame_ms": 8555.547700001625,
+    "stats_render_compose_ms": 203.96769999933895,
+    "complete_output_frame_ms": 8759.515400000964
+  },
+  "comparison": {
+    "contact_speedup": 1.0430473756079568,
+    "physics_frame_speedup": 0.9939770308339853,
+    "complete_frame_speedup": 0.9933492553709953,
+    "solid_position_rms_m": 0.000016737130863475613,
+    "solid_position_max_m": 0.00887289922684431,
+    "solid_velocity_rms_m_s": 0.0029812802094966173,
+    "solid_velocity_max_m_s": 0.8878727555274963,
+    "solid_damage_max": 0.0005656182765960693,
+    "rigid_center_rms_m": 0.0,
+    "rigid_center_max_m": 0.0,
+    "rigid_velocity_rms_m_s": 0.0000021326889054762432,
+    "rigid_velocity_max_m_s": 0.0000021326889054762432,
+    "rigid_state_changes": 0
+  },
+  "interpretation": "This late state contains one rigid body and no rigid-rigid proxy pairs. It validates close trajectories but cannot demonstrate the many-body proxy speedup."
+}

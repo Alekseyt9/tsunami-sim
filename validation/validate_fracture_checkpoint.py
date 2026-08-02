@@ -42,6 +42,19 @@ def main() -> None:
         solver.rigid_proxy_local_center_host[5] = (0.2, -0.1, 0.4)
         solver.rigid_proxy_half_extent_host[5] = (1.5, 0.7, 2.0)
         solver.rigid_proxy_material_host[5] = 3
+        phase_seed = np.asarray((0, 1, 2, 2), dtype=np.int32)
+        candidate_seed = np.asarray((0, 1, 2, 0), dtype=np.int32)
+        age_seed = np.asarray((0, 0, 1, 1), dtype=np.int32)
+        foam_seed = np.asarray((0.0, 0.2, 0.7, 0.4), dtype=np.float32)
+        for name, seed, dtype in (
+            ("water_phase", phase_seed, wp.int32),
+            ("water_phase_candidate", candidate_seed, wp.int32),
+            ("water_phase_candidate_age", age_seed, wp.int32),
+            ("water_foam_strength", foam_seed, float),
+        ):
+            wp.copy(solver.arrays[name], wp.array(seed, dtype=dtype, device=solver.device), count=len(seed))
+        transition_totals_seed = np.asarray((17, 9, 31, 22), dtype=np.int64)
+        solver.water_phase_transition_totals = transition_totals_seed.copy()
         solver.save_checkpoint(7)
 
         base_checkpoint = output / "checkpoints" / "state_00007.npz"
@@ -58,9 +71,20 @@ def main() -> None:
             or resumed.rigid_proxy_material_host[5] != 3
         ):
             raise AssertionError("rigid collision proxy changed across checkpoint restore")
+        for name, expected_seed in (
+            ("water_phase", phase_seed),
+            ("water_phase_candidate", candidate_seed),
+            ("water_phase_candidate_age", age_seed),
+            ("water_foam_strength", foam_seed),
+        ):
+            restored_seed = resumed.arrays[name][:len(expected_seed)].numpy()
+            if not np.array_equal(restored_seed, expected_seed):
+                raise AssertionError(f"water phase state {name} changed across checkpoint restore")
+        if not np.array_equal(resumed.water_phase_transition_totals, transition_totals_seed):
+            raise AssertionError("water phase transition totals changed across checkpoint restore")
         print(
             f"PASS: checkpoint preserved {len(restored):,} irreversible edge-energy values; "
-            f"seed={restored[:3].tolist()}; collision proxies=2"
+            f"seed={restored[:3].tolist()}; collision proxies=2; water phase/lifetime state exact"
         )
 
 

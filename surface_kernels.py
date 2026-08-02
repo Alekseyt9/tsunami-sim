@@ -12,12 +12,14 @@ def classify_water_surface(
     v: wp.array(dtype=wp.vec3),
     radius: wp.array(dtype=float),
     kind: wp.array(dtype=wp.int32),
+    rho_reference: wp.array(dtype=float),
     surface_mask: wp.array(dtype=wp.int32),
     surface_normal: wp.array(dtype=wp.vec3),
     foam_strength: wp.array(dtype=float),
     water_phase: wp.array(dtype=wp.int32),
     phase_candidate: wp.array(dtype=wp.int32),
     phase_candidate_age: wp.array(dtype=wp.int32),
+    phase_transitions: wp.array(dtype=wp.int32),
     query_radius: float,
     minimum_neighbours: int,
     sheet_minimum_neighbours: int,
@@ -26,6 +28,7 @@ def classify_water_surface(
     droplet_enter_classifications: int,
     droplet_exit_classifications: int,
     foam_decay: float,
+    phase_separation_enabled: int,
 ):
     tid = wp.tid()
     i = wp.hash_grid_point_id(grid, tid)
@@ -91,39 +94,53 @@ def classify_water_surface(
         # stable than classifying every low-neighbour surface sample as spray:
         # the ordinary top of the wave has a deep inward normal extent, while
         # an overturning lamella is genuinely thin on both sides.
-        normal_extent = float(0.0)
-        tangent_extent = float(0.0)
-        extent_query = wp.hash_grid_query(grid, xi, query_radius)
-        for j in extent_query:
-            if j == i or kind[j] != 0:
-                continue
-            delta = x[j] - xi
-            distance = wp.length(delta)
-            support = 5.0 * wp.max(radius[i], radius[j])
-            if distance <= 1.0e-5 or distance >= support:
-                continue
-            along_normal = wp.abs(wp.dot(delta, normal))
-            tangent = wp.sqrt(wp.max(distance * distance - along_normal * along_normal, 0.0))
-            normal_extent = wp.max(normal_extent, along_normal)
-            tangent_extent = wp.max(tangent_extent, tangent)
+        if phase_separation_enabled != 0:
+            normal_extent = float(0.0)
+            tangent_extent = float(0.0)
+            extent_query = wp.hash_grid_query(grid, xi, query_radius)
+            for j in extent_query:
+                if j == i or kind[j] != 0:
+                    continue
+                delta = x[j] - xi
+                distance = wp.length(delta)
+                support = 5.0 * wp.max(radius[i], radius[j])
+                if distance <= 1.0e-5 or distance >= support:
+                    continue
+                along_normal = wp.abs(wp.dot(delta, normal))
+                tangent = wp.sqrt(wp.max(distance * distance - along_normal * along_normal, 0.0))
+                normal_extent = wp.max(normal_extent, along_normal)
+                tangent_extent = wp.max(tangent_extent, tangent)
 
-        isolated = neighbours <= droplet_maximum_neighbours
-        thin = (
-            neighbours >= sheet_minimum_neighbours
-            and tangent_extent > radius[i] * 2.5
-            and normal_extent < tangent_extent * sheet_thickness_ratio
-        )
-        if isolated:
-            candidate = 2
-            foam_source = wp.max(foam_source, 0.35 + 0.45 * wp.smoothstep(3.0, 12.0, wp.length(vi)))
-        elif thin:
-            candidate = 1
-            foam_source = wp.max(foam_source, 0.15 * wp.smoothstep(4.0, 12.0, wp.length(vi)))
+            isolated = neighbours <= droplet_maximum_neighbours
+            thin = (
+                neighbours >= sheet_minimum_neighbours
+                and tangent_extent > radius[i] * 2.5
+                and normal_extent < tangent_extent * sheet_thickness_ratio
+            )
+            if isolated:
+                candidate = 2
+                # A detached drop is not automatically whitewater.  Reserve
+                # strong foam for fast drops that are also moving vertically;
+                # otherwise distant spray becomes a field of bright capsules.
+                spray_energy = wp.smoothstep(8.0, 18.0, wp.length(vi))
+                spray_energy *= wp.smoothstep(2.0, 10.0, wp.abs(vi[1]))
+                foam_source = wp.max(foam_source, 0.08 + 0.48 * spray_energy)
+            elif thin:
+                candidate = 1
+                foam_source = wp.max(foam_source, 0.15 * wp.smoothstep(4.0, 12.0, wp.length(vi)))
         foam_strength[i] = wp.clamp(wp.max(foam_strength[i] * foam_decay, foam_source), 0.0, 1.0)
     else:
         surface_mask[i] = 0
         surface_normal[i] = wp.vec3(0.0, 1.0, 0.0)
         foam_strength[i] *= foam_decay
+
+    if phase_separation_enabled == 0:
+        if water_phase[i] == 2:
+            rho_reference[i] = 0.0
+        water_phase[i] = 0
+        phase_candidate[i] = 0
+        phase_candidate_age[i] = 0
+        return
 
     # Core/sheet switches are harmless representation changes.  Entering or
     # leaving the ballistic mode changes the force model, so require a stable
@@ -139,9 +156,28 @@ def classify_water_surface(
         if current == 2:
             required = droplet_exit_classifications
         if phase_candidate_age[i] >= required:
+            if current != candidate:
+                if candidate == 2:
+                    wp.atomic_add(phase_transitions, 0, 1)
+                elif current == 2:
+                    wp.atomic_add(phase_transitions, 1, 1)
+                if candidate == 1:
+                    wp.atomic_add(phase_transitions, 2, 1)
+                elif current == 1 and candidate == 0:
+                    wp.atomic_add(phase_transitions, 3, 1)
             water_phase[i] = candidate
             phase_candidate_age[i] = 0
+            if current == 2 and candidate != 2:
+                # Rejoining SPH must recalibrate the density normalization at
+                # the receiving free surface instead of retaining the
+                # ballistic sentinel written by the density kernel.
+                rho_reference[i] = 0.0
     else:
+        if current != candidate:
+            if candidate == 1:
+                wp.atomic_add(phase_transitions, 2, 1)
+            elif current == 1 and candidate == 0:
+                wp.atomic_add(phase_transitions, 3, 1)
         water_phase[i] = candidate
         phase_candidate[i] = candidate
         phase_candidate_age[i] = 0
@@ -227,9 +263,9 @@ def raster_anisotropic_water_depth(
         if travel_length > 1.0e-4:
             screen_tangent = travel / travel_length
             screen_normal = wp.vec2(-screen_tangent[1], screen_tangent[0])
-        spray = wp.max(foam, 0.45 if phase == 2 else 0.0)
+        spray = wp.max(foam, 0.20 if phase == 2 else 0.0)
         speed_stretch = 1.0 + spray * wp.clamp(wp.length(v[i]) / 12.0, 0.0, 1.0)
-        tangent_radius = wp.clamp(tangent_radius * speed_stretch, 1.5, 10.0)
+        tangent_radius = wp.clamp(tangent_radius * speed_stretch, 1.35, 8.0)
         normal_radius = wp.clamp(normal_radius * (0.82 - 0.12 * spray), 0.7, 5.5)
     cx = int(p[0]); cy = int(p[1])
     for oy in range(-14, 15):
