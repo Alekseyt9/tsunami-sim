@@ -60,7 +60,7 @@ def main() -> None:
             raise AssertionError("rigid collision proxy changed across checkpoint restore")
         print(
             f"PASS: checkpoint preserved {len(restored):,} irreversible edge-energy values; "
-            f"seed={restored[:3].tolist()}"
+            f"seed={restored[:3].tolist()}; collision proxies=2"
         )
 
 

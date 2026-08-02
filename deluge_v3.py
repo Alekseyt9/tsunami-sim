@@ -76,6 +76,7 @@ from shallow_water import (  # noqa: E402
 )
 from surface_kernels import (  # noqa: E402
     blend_sparse_fields,
+    build_water_phase_masks,
     classify_water_surface,
     smooth_sparse_field_axis,
     splat_sparse_surface_field,
@@ -573,6 +574,14 @@ class HybridDelugeSolver(DelugeSolver):
         self.arrays["water_surface_mask"] = wp.zeros(self.capacity, dtype=wp.int32, device=self.device)
         self.arrays["water_surface_normal"] = wp.zeros(self.capacity, dtype=wp.vec3, device=self.device)
         self.arrays["water_foam_strength"] = wp.zeros(self.capacity, dtype=float, device=self.device)
+        # 0 = connected body, 1 = thin sheet, 2 = ballistic droplet.  Candidate
+        # history prevents pressure-mode chatter around the spray threshold.
+        self.arrays["water_phase"] = wp.zeros(self.capacity, dtype=wp.int32, device=self.device)
+        self.arrays["water_phase_candidate"] = wp.zeros(self.capacity, dtype=wp.int32, device=self.device)
+        self.arrays["water_phase_candidate_age"] = wp.zeros(self.capacity, dtype=wp.int32, device=self.device)
+        self.arrays["water_connected_mask"] = wp.zeros(self.capacity, dtype=wp.int32, device=self.device)
+        self.arrays["water_sheet_mask"] = wp.zeros(self.capacity, dtype=wp.int32, device=self.device)
+        self.arrays["water_droplet_mask"] = wp.zeros(self.capacity, dtype=wp.int32, device=self.device)
         self.water_mesh_cfg = self.v3_cfg.get("water_mesh", {})
         self.water_mesh_enabled = bool(self.water_mesh_cfg.get("enabled", True))
         self.water_mesh_frame = 0
@@ -609,6 +618,15 @@ class HybridDelugeSolver(DelugeSolver):
                     self.water_mesh_lod_recovery_count = int(saved["water_mesh_lod_recovery_count"])
                 if "water_mesh_lod_change_count" in saved:
                     self.water_mesh_lod_change_count = int(saved["water_mesh_lod_change_count"])
+                for name in ("water_phase", "water_phase_candidate", "water_phase_candidate_age",
+                             "water_foam_strength"):
+                    if name in saved:
+                        host = saved[name]
+                        wp.copy(
+                            self.arrays[name],
+                            wp.array(host, dtype=self.arrays[name].dtype, device=self.device),
+                            count=min(self.count, len(host)),
+                        )
 
     def update_water_surface(self):
         if not self.surface_enabled:
@@ -625,8 +643,25 @@ class HybridDelugeSolver(DelugeSolver):
             inputs=[self.grid.id, view, self.arrays["v"][:self.count], self.arrays["radius"][:self.count],
                     self.arrays["kind"][:self.count], self.arrays["water_surface_mask"][:self.count],
                     self.arrays["water_surface_normal"][:self.count],
-                    self.arrays["water_foam_strength"][:self.count], query_radius,
-                    int(self.surface_cfg.get("minimum_neighbours", 18))], device=self.device,
+                    self.arrays["water_foam_strength"][:self.count],
+                    self.arrays["water_phase"][:self.count],
+                    self.arrays["water_phase_candidate"][:self.count],
+                    self.arrays["water_phase_candidate_age"][:self.count], query_radius,
+                    int(self.surface_cfg.get("minimum_neighbours", 18)),
+                    int(self.surface_cfg.get("sheet_minimum_neighbours", 8)),
+                    float(self.surface_cfg.get("sheet_thickness_ratio", 0.32)),
+                    int(self.surface_cfg.get("droplet_maximum_neighbours", 5)),
+                    int(self.surface_cfg.get("droplet_enter_classifications", 3)),
+                    int(self.surface_cfg.get("droplet_exit_classifications", 2)),
+                    float(self.surface_cfg.get("foam_decay", 0.86))], device=self.device,
+        )
+        wp.launch(
+            build_water_phase_masks, dim=self.count,
+            inputs=[self.arrays["kind"][:self.count], self.arrays["water_surface_mask"][:self.count],
+                    self.arrays["water_phase"][:self.count],
+                    self.arrays["water_connected_mask"][:self.count],
+                    self.arrays["water_sheet_mask"][:self.count],
+                    self.arrays["water_droplet_mask"][:self.count]], device=self.device,
         )
         wp.synchronize_device(self.device)
         self.water_surface_classify_ms = (time.perf_counter() - classify_started) * 1000.0
@@ -642,14 +677,18 @@ class HybridDelugeSolver(DelugeSolver):
         self.water_mesh_frame += 1
         mask = self.arrays["water_surface_mask"][:self.count].numpy() != 0
         kind = self.arrays["kind"][:self.count].numpy()
+        phase = self.arrays["water_phase"][:self.count].numpy()
         surface_indices = np.flatnonzero(mask & (kind == 0))
-        if len(surface_indices) == 0:
+        connected_indices = np.flatnonzero(mask & (kind == 0) & (phase == 0))
+        if len(connected_indices) == 0:
             self.water_mesh_vertices = wp.zeros(0, dtype=wp.vec3, device=self.device)
             self.water_mesh_indices = wp.zeros(0, dtype=wp.int32, device=self.device)
             self.water_mesh_triangle_count = 0
             return
-        positions = self.arrays["x"][:self.count].numpy()[surface_indices]
-        surface_radii = self.arrays["radius"][:self.count].numpy()[surface_indices]
+        all_positions = self.arrays["x"][:self.count].numpy()
+        all_radii = self.arrays["radius"][:self.count].numpy()
+        positions = all_positions[connected_indices]
+        surface_radii = all_radii[connected_indices]
         voxel = float(self.water_mesh_cfg.get("voxel_size", 0.65))
         max_nodes = int(self.water_mesh_cfg.get("maximum_field_nodes", 2500000))
         margin_cells = float(self.water_mesh_cfg.get("margin_cells", 3.0))
@@ -734,7 +773,7 @@ class HybridDelugeSolver(DelugeSolver):
         wp.launch(
             splat_sparse_surface_field, dim=self.count,
             inputs=[self.arrays["x"][:self.count], self.arrays["radius"][:self.count],
-                    self.arrays["kind"][:self.count], self.arrays["water_surface_mask"][:self.count],
+                    self.arrays["kind"][:self.count], self.arrays["water_connected_mask"][:self.count],
                     field, wp.vec3(*lower), voxel, nx, ny, nz], device=self.device,
         )
         if len(stitch_positions):
@@ -785,8 +824,19 @@ class HybridDelugeSolver(DelugeSolver):
         wp.synchronize_device(self.device)
         self.water_mesh_marching_cubes_ms = (time.perf_counter() - marching_started) * 1000.0
         splash_started = time.perf_counter()
+        # Reconstruct connected outliers and coherent thin sheets in local
+        # bricks.  Ballistic droplets deliberately stay out of Marching Cubes
+        # so a remote drop cannot enlarge/coarsen the connected water field.
+        sheet_indices = np.flatnonzero(mask & (kind == 0) & (phase == 1))
+        detail_positions = np.concatenate(
+            [positions[excluded], all_positions[sheet_indices]], axis=0
+        )
+        detail_radii = np.concatenate(
+            [surface_radii[excluded], all_radii[sheet_indices]], axis=0
+        )
         vertices, indices = self._append_splash_brick_meshes(
-            vertices, indices, positions, surface_radii, excluded
+            vertices, indices, detail_positions, detail_radii,
+            np.ones(len(detail_positions), dtype=bool),
         )
         wp.synchronize_device(self.device)
         self.water_mesh_splash_ms = (time.perf_counter() - splash_started) * 1000.0
@@ -948,6 +998,10 @@ class HybridDelugeSolver(DelugeSolver):
             water_mesh_voxel_size=np.float32(self.water_mesh_voxel_size),
             water_mesh_lod_recovery_count=np.int32(self.water_mesh_lod_recovery_count),
             water_mesh_lod_change_count=np.int32(self.water_mesh_lod_change_count),
+            water_phase=self.arrays["water_phase"][:self.count].numpy(),
+            water_phase_candidate=self.arrays["water_phase_candidate"][:self.count].numpy(),
+            water_phase_candidate_age=self.arrays["water_phase_candidate_age"][:self.count].numpy(),
+            water_foam_strength=self.arrays["water_foam_strength"][:self.count].numpy(),
             shallow_water_state=self.shallow_water.state.numpy(),
             shallow_water_accumulated_dt=np.float32(self.shallow_water.accumulated_dt),
             shallow_emitted_particles_total=np.int64(self.shallow_water.emitted_particles_total),
@@ -998,7 +1052,9 @@ class HybridDelugeSolver(DelugeSolver):
                 restored_proxy_state = "rigid_proxy_enabled" in saved
 
         proxy_policy = self.v3_cfg.get("rigid_clusters", {}).get("collision_proxy", {})
-        if bool(proxy_policy.get("enabled", True)) and not restored_proxy_state:
+        if not bool(proxy_policy.get("enabled", True)):
+            proxy_enabled.fill(0)
+        elif not restored_proxy_state:
             fragment = self.fragment_host
             radius = self.arrays["radius"][:self.count].numpy()
             material = self.arrays["material"][:self.count].numpy()
@@ -1057,7 +1113,9 @@ class HybridDelugeSolver(DelugeSolver):
                     self.last_rigid_reactivated_count = int(restored[0])
 
     def _refresh_collision_proxy_pairs(self):
-        proxy_ids = np.flatnonzero(self.rigid_proxy_enabled_host != 0).astype(np.int32)
+        proxy_ids = np.flatnonzero(
+            (self.rigid_proxy_enabled_host != 0) & (self.rigid_state_host != 0)
+        ).astype(np.int32)
         if len(proxy_ids) >= 2:
             left_index, right_index = np.triu_indices(len(proxy_ids), 1)
             pair_left = proxy_ids[left_index]
@@ -1079,11 +1137,14 @@ class HybridDelugeSolver(DelugeSolver):
         # A strong rubble collision may switch a body back to its cohesive
         # deformable fragment on the GPU. Preserve that transition before the
         # host-side quiet-fragment scanner uploads new rigid conversions.
+        previous_proxy_active_count = self.rigid_proxy_active_count
         self.rigid_state_host[:] = self.rigid_state.numpy()
         self.rigid_active_count = int(np.count_nonzero(self.rigid_state_host))
         self.rigid_proxy_active_count = int(np.count_nonzero(
             (self.rigid_proxy_enabled_host != 0) & (self.rigid_state_host != 0)
         ))
+        if self.rigid_proxy_active_count != previous_proxy_active_count:
+            self._refresh_collision_proxy_pairs()
         self.rigid_stats_calls += 1
         if self.rigid_stats_calls % max(1, int(policy.get("scan_every_frames", 8))) != 0:
             return
@@ -1222,7 +1283,8 @@ class HybridDelugeSolver(DelugeSolver):
             wp.launch(
                 compute_density_multirate, dim=self.count,
                 inputs=[self.grid.id, view, a["radius"][:self.count], a["mass"][:self.count],
-                        a["volume"][:self.count], a["kind"][:self.count], self.time_active[:self.count],
+                        a["volume"][:self.count], a["kind"][:self.count],
+                        a["water_phase"][:self.count], self.time_active[:self.count],
                         a["rho"][:self.count], a["rho_reference"][:self.count],
                         float(self.cfg["rest_density"]), float(self.cfg["sound_speed"]),
                         float(self.cfg["water_depth"]), float(self.cfg["wave_height"]),
@@ -1232,7 +1294,8 @@ class HybridDelugeSolver(DelugeSolver):
                 compute_fluid_forces_multirate, dim=self.count,
                 inputs=[self.grid.id, view, a["v"][:self.count], a["radius"][:self.count],
                         a["mass"][:self.count], a["volume"][:self.count], a["kind"][:self.count],
-                        a["rho"][:self.count], self.time_level[:self.count], self.time_active[:self.count],
+                        a["water_phase"][:self.count], a["rho"][:self.count],
+                        self.time_level[:self.count], self.time_active[:self.count],
                         self.deferred_fluid_impulse, a["acceleration"][:self.count],
                         a["solid_force"][:self.count], float(self.cfg["rest_density"]),
                         float(self.cfg["sound_speed"]), float(self.cfg.get("max_density_ratio", 1.08)),
@@ -1463,7 +1526,13 @@ class HybridDelugeSolver(DelugeSolver):
         # Water keeps V2's conservative 1->8 volume refinement. Structural
         # surfaces use planar 1->4 refinement so a thin wall does not become a
         # volumetric cloud when resolution increases near an impact.
+        water_count_before_refine = self.count
         super().refine()
+        if self.count > water_count_before_refine:
+            for name in ("water_surface_mask", "water_surface_normal", "water_foam_strength",
+                         "water_phase", "water_phase_candidate", "water_phase_candidate_age",
+                         "water_connected_mask", "water_sheet_mask", "water_droplet_mask"):
+                self.arrays[name][water_count_before_refine:self.count].zero_()
         # Water refinement appends particles with fragment_id=-1.  Keep the
         # host mirror aligned even on frames where no structural child is
         # created; support diagnostics and later compaction use full-length
@@ -1712,6 +1781,14 @@ class HybridDelugeSolver(DelugeSolver):
         if self.surface_enabled:
             surface_mask = self.arrays["water_surface_mask"][:self.count].numpy()
             result["surface_water_particles"] = int(np.count_nonzero(surface_mask))
+            water_phase = self.arrays["water_phase"][:self.count].numpy()
+            fluid_surface = (surface_mask != 0) & fluid_mask
+            result["connected_surface_particles"] = int(np.count_nonzero(fluid_surface & (water_phase == 0)))
+            result["thin_sheet_particles"] = int(np.count_nonzero(fluid_surface & (water_phase == 1)))
+            result["ballistic_droplet_particles"] = int(np.count_nonzero(fluid_surface & (water_phase == 2)))
+            result["foam_particles"] = int(np.count_nonzero(
+                fluid_surface & (self.arrays["water_foam_strength"][:self.count].numpy() > 0.05)
+            ))
             result["water_mesh_vertices"] = len(self.water_mesh_vertices)
             result["water_mesh_triangles"] = self.water_mesh_triangle_count
             result["water_field_nodes"] = int(np.prod(self.water_field_shape, dtype=np.int64))
@@ -1798,6 +1875,10 @@ class HybridDelugeSolver(DelugeSolver):
         self.count = min(int(counter.numpy()[0]), self.capacity)
         emitted = self.count - old_count
         if emitted > 0:
+            for name in ("water_surface_mask", "water_surface_normal", "water_foam_strength",
+                         "water_phase", "water_phase_candidate", "water_phase_candidate_age",
+                         "water_connected_mask", "water_sheet_mask", "water_droplet_mask"):
+                self.arrays[name][old_count:self.count].zero_()
             self.shallow_water.emitted_particles_total += emitted
             self.shallow_water.emitted_volume_total += emitted * spacing ** 3
             self.shallow_water.commit_exchange(float(self.cfg["rest_density"]))
@@ -1815,7 +1896,9 @@ class HybridDelugeSolver(DelugeSolver):
             "material_impact_impulse", "local_impact_active",
             "fluid_group_id",
             "acceleration", "solid_force", "water_surface_mask", "water_surface_normal",
-            "water_foam_strength",
+            "water_foam_strength", "water_phase", "water_phase_candidate",
+            "water_phase_candidate_age", "water_connected_mask", "water_sheet_mask",
+            "water_droplet_mask",
         )
         self.particle_compaction_scratch = {
             "arrays": {
@@ -1842,7 +1925,9 @@ class HybridDelugeSolver(DelugeSolver):
         )
         int_names = (
             "kind", "material", "building_id", "structural_class", "fixed", "water_surface_mask",
-            "local_impact_active", "fluid_group_id",
+            "local_impact_active", "fluid_group_id", "water_phase", "water_phase_candidate",
+            "water_phase_candidate_age", "water_connected_mask", "water_sheet_mask",
+            "water_droplet_mask",
         )
         vec3_names = ("x", "rest_x", "v", "acceleration", "solid_force", "water_surface_normal")
         for name in float_names:
@@ -1967,6 +2052,8 @@ class HybridDelugeSolver(DelugeSolver):
                 self.arrays["acceleration"], self.arrays["solid_force"],
                 self.arrays["fluid_group_id"], self.arrays["water_surface_mask"],
                 self.arrays["water_surface_normal"], self.arrays["water_foam_strength"],
+                self.arrays["water_phase"], self.arrays["water_phase_candidate"],
+                self.arrays["water_phase_candidate_age"],
             ],
             device=self.device,
         )

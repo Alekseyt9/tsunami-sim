@@ -227,10 +227,18 @@ This state is irreversible: removing the load cannot visually heal a crack. A fa
 
 Both edge and fragment crack states are stored in compressed V3 checkpoints. The end-to-end regression preserved all 21,508 production edge values exactly across save and resume while the V3 checkpoint remained about 0.6 MiB. New metrics report visible-energy edge count and maximum normalized fracture energy. A calm smoke scene reports zero visible edges, zero maximum energy, and zero damaged particles.
 
+## V3.21 rigid-debris collision proxies
+
+A released fragment that has passed the existing quiet-motion audit and becomes a rigid cluster now receives an eight-vertex convex oriented-box collision proxy fitted in body-local coordinates. The proxy includes particle radius padding and keeps the mass-dominant concrete, glass, or reinforcement contact material. A 15-axis separating-axis test resolves proxy-to-proxy overlap on CUDA; equal/opposite normal and Coulomb-friction forces are applied at one shared contact point, preserving net force and world-space torque.
+
+The proxy replaces only rigid-to-rigid and rigid-to-domain particle contacts. The underlying structural particles remain in the hash grid and continue to collect pressure, drag, and buoyant loading from water, as well as contacts with deformable fragments. A strong later proxy collision uses the existing acceleration threshold to restore the complete deformable particle model. This prevents a coarse box from permanently replacing fracture physics.
+
+Ground and domain contacts use projected OBB radius instead of accumulating one penalty force per rigid particle. Pair tables contain only proxy bodies, so 19 settled fragments require 171 SAT tests rather than a city-wide all-body quadratic launch. Proxy geometry and material are checkpointed; old checkpoints reconstruct proxies from saved rigid local particles. `validation\validate_rigid_collision_proxy.py` covers enclosure, SAT force/torque conservation, friction, ground support, and deformable reactivation.
+
 ## Next stages
 
-1. Add collision-proxy convex hulls only for settled rigid debris, while deformable fracture and water coupling continue to use the underlying particles.
-2. Separate connected water, thin sheets, entrained foam, and ballistic droplets; give droplets a lifetime and merge them back into the connected surface on contact.
-3. Move conservative sibling-group selection fully onto CUDA. The current CPU audit runs only every eight output frames and is already small, but a sorted GPU group table will scale better beyond one million active SPH samples.
-4. Run a focused impact sequence and calibrate the 35% crack-energy onset against visible panel opening before starting the longer production run.
-5. Run the complete eight-second V3.20 sequence and audit crack timing, late debris contacts, water balance, surface LOD, checkpoint resume, and progressive-video recovery.
+1. Separate connected water, thin sheets, entrained foam, and ballistic droplets; give droplets a lifetime and merge them back into the connected surface on contact.
+2. Move conservative sibling-group selection fully onto CUDA. The current CPU audit runs only every eight output frames and is already small, but a sorted GPU group table will scale better beyond one million active SPH samples.
+3. Run a focused impact sequence and calibrate the 35% crack-energy onset and proxy padding against visible panel opening and settled rubble contacts.
+4. Profile a late checkpoint with and without V3.21 proxies, retaining them only if the particle-contact reduction exceeds the SAT/pair overhead.
+5. Run the complete eight-second V3.21 sequence and audit crack timing, proxy reactivation, late debris contacts, water balance, surface LOD, checkpoint resume, and progressive-video recovery.

@@ -29,6 +29,9 @@ def apply_conservative_fluid_merges(
     surface_mask: wp.array(dtype=wp.int32),
     surface_normal: wp.array(dtype=wp.vec3),
     foam_strength: wp.array(dtype=float),
+    water_phase: wp.array(dtype=wp.int32),
+    phase_candidate: wp.array(dtype=wp.int32),
+    phase_candidate_age: wp.array(dtype=wp.int32),
 ):
     merge_index = wp.tid()
     particle = representatives[merge_index]
@@ -46,6 +49,9 @@ def apply_conservative_fluid_merges(
     surface_mask[particle] = 0
     surface_normal[particle] = wp.vec3(0.0)
     foam_strength[particle] = 0.0
+    water_phase[particle] = 0
+    phase_candidate[particle] = 0
+    phase_candidate_age[particle] = 0
 
 from kernels import (
     material_failure_strain,
@@ -1065,6 +1071,7 @@ def compute_density_multirate(
     mass: wp.array(dtype=float),
     volume: wp.array(dtype=float),
     kind: wp.array(dtype=wp.int32),
+    water_phase: wp.array(dtype=wp.int32),
     time_active: wp.array(dtype=wp.int32),
     rho: wp.array(dtype=float),
     rho_reference: wp.array(dtype=float),
@@ -1079,10 +1086,16 @@ def compute_density_multirate(
     i = wp.hash_grid_point_id(grid, tid)
     if kind[i] != 0 or time_active[i] == 0:
         return
+    if water_phase[i] == 2:
+        rho[i] = rest_density
+        rho_reference[i] = rest_density
+        return
     xi = x[i]
     rhoi = float(0.0)
     query = wp.hash_grid_query(grid, xi, max_support)
     for j in query:
+        if kind[j] == 0 and water_phase[j] == 2:
+            continue
         rij = xi - x[j]
         r2 = wp.dot(rij, rij)
         support = 4.0 * wp.max(radius[i], radius[j])
@@ -1115,6 +1128,7 @@ def compute_fluid_forces_multirate(
     mass: wp.array(dtype=float),
     volume: wp.array(dtype=float),
     kind: wp.array(dtype=wp.int32),
+    water_phase: wp.array(dtype=wp.int32),
     rho: wp.array(dtype=float),
     time_level: wp.array(dtype=wp.int32),
     time_active: wp.array(dtype=wp.int32),
@@ -1142,6 +1156,29 @@ def compute_fluid_forces_multirate(
     effective_dt = base_dt * float(stride_i)
     xi = x[i]
     vi = v[i]
+    if water_phase[i] == 2:
+        # Detached drops carry the same particle mass and momentum, but no
+        # longer receive bulk pressure/viscosity from the connected phase.
+        # They remain collision-active against solid particles and transfer
+        # the equal-and-opposite contact force back to the structure.
+        ballistic_acceleration = wp.vec3(0.0, -9.81, 0.0)
+        ballistic_query = wp.hash_grid_query(grid, xi, max_support)
+        for j in ballistic_query:
+            if kind[j] == 0:
+                continue
+            delta = xi - x[j]
+            distance = wp.length(delta)
+            contact_distance = radius[i] + radius[j]
+            if distance <= 1.0e-5 or distance >= contact_distance:
+                continue
+            normal = delta / distance
+            penetration = contact_distance - distance
+            approach_speed = wp.min(wp.dot(vi - v[j], normal), 0.0)
+            contact_acceleration = normal * (2400.0 * penetration - 55.0 * approach_speed)
+            ballistic_acceleration += contact_acceleration
+            wp.atomic_add(solid_force, j, -contact_acceleration * mass[i] * float(stride_i))
+        acceleration[i] = ballistic_acceleration
+        return
     rhoi = rho[i]
     gamma = 7.0
     stiffness = rest_density * sound_speed * sound_speed / gamma
@@ -1152,6 +1189,8 @@ def compute_fluid_forces_multirate(
     query = wp.hash_grid_query(grid, xi, max_support)
     for j in query:
         if j == i:
+            continue
+        if kind[j] == 0 and water_phase[j] == 2:
             continue
         r = xi - x[j]
         dist = wp.length(r)

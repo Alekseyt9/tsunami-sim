@@ -98,6 +98,7 @@ def main() -> None:
             merge_x, merge_rest, merge_velocity, merge_mass_gpu, merge_volume_gpu,
             merge_radius_gpu, merge_scalar(), merge_scalar(), merge_vector(), merge_vector(),
             merge_group_gpu, merge_integer(), merge_vector(), merge_scalar(),
+            merge_integer(), merge_integer(), merge_integer(),
         ], device=device,
     )
     wp.synchronize_device(device)

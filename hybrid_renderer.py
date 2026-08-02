@@ -83,7 +83,8 @@ class HybridRenderer(ParticleRenderer):
                 raster_anisotropic_water_depth, dim=count,
                 inputs=[arrays["x"][:count], arrays["v"][:count], arrays["radius"][:count], arrays["kind"][:count],
                         arrays["water_surface_mask"][:count], arrays["water_surface_normal"][:count],
-                        arrays["water_foam_strength"][:count], self.water_depth, self.water_foam, *common,
+                        arrays["water_foam_strength"][:count], arrays["water_phase"][:count],
+                        self.water_depth, self.water_foam, *common,
                         self.water_tangent_scale, self.water_normal_scale], device=self.device,
             )
         elif "water_surface_mask" in arrays:
@@ -91,7 +92,8 @@ class HybridRenderer(ParticleRenderer):
                 raster_anisotropic_water_depth, dim=count,
                 inputs=[arrays["x"][:count], arrays["v"][:count], arrays["radius"][:count], arrays["kind"][:count],
                         arrays["water_surface_mask"][:count], arrays["water_surface_normal"][:count],
-                        arrays["water_foam_strength"][:count], self.water_depth, self.water_foam, *common,
+                        arrays["water_foam_strength"][:count], arrays["water_phase"][:count],
+                        self.water_depth, self.water_foam, *common,
                         self.water_tangent_scale, self.water_normal_scale], device=self.device,
             )
         else:

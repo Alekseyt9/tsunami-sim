@@ -64,7 +64,7 @@ def main() -> None:
                     float(cfg["reservoir_z_max"]), solver.max_support]
     timed("density_baseline", compute_density, solver.count, common_density + density_tail)
     timed("density_multirate", compute_density_multirate, solver.count,
-          common_density + [solver.time_active[:solver.count]] + density_tail)
+          common_density + [a["water_phase"][:solver.count], solver.time_active[:solver.count]] + density_tail)
     wp.launch(clear_vec3, dim=solver.count, inputs=[a["solid_force"][:solver.count]], device=solver.device)
     force_common = [solver.grid.id, view, a["v"][:solver.count], a["radius"][:solver.count],
                     a["mass"][:solver.count], a["volume"][:solver.count], a["kind"][:solver.count],
@@ -75,7 +75,8 @@ def main() -> None:
     timed("force_baseline", compute_fluid_forces, solver.count, force_common + force_tail)
     wp.launch(clear_vec3, dim=solver.count, inputs=[a["solid_force"][:solver.count]], device=solver.device)
     timed("force_multirate", compute_fluid_forces_multirate, solver.count,
-          force_common + [solver.time_level[:solver.count], solver.time_active[:solver.count],
+          force_common[:7] + [a["water_phase"][:solver.count]] + force_common[7:] +
+          [solver.time_level[:solver.count], solver.time_active[:solver.count],
                           solver.deferred_fluid_impulse] + force_tail)
     timed("consume", consume_deferred_fluid_impulse, solver.count,
           [a["mass"][:solver.count], a["kind"][:solver.count], solver.time_level[:solver.count],

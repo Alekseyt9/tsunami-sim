@@ -57,7 +57,14 @@ def main() -> None:
     )
     wp.synchronize_device(device)
     force_host = force.numpy()
+    torque_host = torque.numpy()
     np.testing.assert_allclose(force_host[0] + force_host[1], 0.0, atol=1.0e-4)
+    center_host = center.numpy()
+    world_torque = (
+        torque_host[0] + np.cross(center_host[0], force_host[0])
+        + torque_host[1] + np.cross(center_host[1], force_host[1])
+    )
+    np.testing.assert_allclose(world_torque, 0.0, atol=2.0e-3)
     if force_host[0, 0] >= 0.0 or force_host[0, 2] <= 0.0:
         raise AssertionError(f"proxy normal/friction direction is wrong: {force_host[0]}")
     if not np.all(peak.numpy() > 120.0):

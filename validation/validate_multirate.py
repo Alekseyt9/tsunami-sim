@@ -23,6 +23,7 @@ def simulate(levels_host: np.ndarray, steps: int = 4):
     mass = wp.array(np.full(2, 1000.0, dtype=np.float32), dtype=float, device=device)
     volume = wp.array(np.ones(2, dtype=np.float32), dtype=float, device=device)
     kind = wp.array(np.zeros(2, dtype=np.int32), dtype=wp.int32, device=device)
+    phase = wp.zeros(2, dtype=wp.int32, device=device)
     rho = wp.array(np.full(2, 1012.0, dtype=np.float32), dtype=float, device=device)
     levels = wp.array(levels_host.astype(np.int32), dtype=wp.int32, device=device)
     active = wp.ones(2, dtype=wp.int32, device=device)
@@ -39,7 +40,7 @@ def simulate(levels_host: np.ndarray, steps: int = 4):
             compute_fluid_forces_multirate,
             dim=2,
             inputs=[
-                grid.id, position, velocity, radius, mass, volume, kind, rho, levels, active,
+                grid.id, position, velocity, radius, mass, volume, kind, phase, rho, levels, active,
                 deferred, acceleration, solid_force, 1000.0, 140.0, 1.08, 0.0, 0.0, 2.0, dt,
             ],
             device=device,

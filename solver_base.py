@@ -203,6 +203,8 @@ class DelugeSolver:
         data = {name: arr[:self.count].numpy() for name, arr in self.arrays.items()
                 if name not in ("rho", "acceleration", "solid_force", "damage_counter",
                                 "water_surface_mask", "water_surface_normal", "water_foam_strength",
+                                "water_phase", "water_phase_candidate", "water_phase_candidate_age",
+                                "water_connected_mask", "water_sheet_mask", "water_droplet_mask",
                                 "water_mesh_vertices", "water_mesh_indices")}
         data.update(time=np.asarray(self.time), frame=np.asarray(frame), config=np.asarray(json.dumps(self.cfg)))
         path = self.checkpoint_dir / f"state_{frame:05d}.npz"
