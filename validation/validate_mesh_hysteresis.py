@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from _bootstrap import ROOT  # noqa: F401
+
 import numpy as np
 
 from deluge_v3 import hysteretic_bounds, select_splash_bricks
