@@ -192,10 +192,20 @@ The coarse city now contains 2,991 apartment-scale cohesive fragments with a med
 
 Diagnostics report damaged physical volume and volume-integrated damage per structural role, in addition to legacy particle counts. At 2.5 seconds, damage began one frame after causal activation; columns had 2.08% damaged volume and cores 2.57%, while more exposed walls, beams, and glass reached 3.17%, 4.50%, and 4.44%. Adaptive refinement therefore no longer corrupts the comparison by multiplying sample counts.
 
+## V3.14-V3.17 causal collapse, adaptive water, and debris skins
+
+V3.14 propagates gravity release through a sparse fragment support graph. Upper floors and walls fall when their load path to a foundation is actually broken; the solver no longer relies on a delayed whole-building collapse patch. V3.15 adds material-specific local impact impulse. A sufficiently massive splash can break glass locally, while complete building activation still requires a sustained coherent lower-facade water load.
+
+V3.16 refines only free-surface or strongly vertical/turbulent SPH samples. Every 1-to-8 split records a sibling ID. A complete octet may merge back only below the surface band when its vertical speed, internal velocity RMS, and spatial span are all small. The replacement preserves total mass, volume, center of mass, and linear momentum. In the 100-frame RTX 5070 validation, 1,855 calm octets merged back, removing 12,985 fine samples without changing the fixed 0.65 m water-mesh voxel.
+
+V3.17 adds six-face render hulls for all 3,060 apartment-scale cohesive fragments. The 18,360 extra faces are culled before rasterization while their fragment has a live foundation path. When support is lost, the closed hull becomes visible with the original building palette, so detached concrete, slabs, and frame pieces remain large volumetric debris instead of reverting to particle circles.
+
+The V3.17 100-frame four-view run completed in 269.75 seconds on an RTX 5070. It peaked at 409,831 particles, 1,963.6 MiB VRAM, 251 released fragments, 36 unsupported fragments, and 19 rigid clusters. The connected water mesh stayed at 0.65 m and reached 56,868 vertices; combined shallow/SPH water-volume drift was -0.813%.
+
 ## Next stages
 
-1. Add explicit crack-surface energy and material-dependent minimum detachable area, so panels develop visible local cracks before complete separation.
-2. Convert detached facade panels, floor plates, and beams to shape-preserving rigid bodies earlier during violent transport, while retaining deformable joints at attachment lines.
-3. Separate connected water, thin sheets, entrained foam, and ballistic droplets in the renderer; add droplet lifetime and suppress isolated spherical splats.
-4. Add a deterministic benchmark mode and cached structural adjacency for intact fragments, rebuilding only around active crack fronts.
-5. Run the complete eight-second V3.11 production sequence and validate late debris contacts, role-weighted fracture volume, water balance, and mesh stability.
+1. Add explicit crack-surface energy and visible crack decals before a complete fragment boundary separates.
+2. Replace axis-aligned debris hulls with cached fragment convex hulls or low-resolution tetrahedral boundary skins.
+3. Separate connected water, thin sheets, entrained foam, and ballistic droplets; give droplets a lifetime and merge them back into the connected surface on contact.
+4. Move conservative sibling-group selection fully onto CUDA. The current CPU audit runs only every eight output frames and is already small, but a sorted GPU group table will scale better beyond one million active SPH samples.
+5. Run the complete eight-second V3.17 sequence and audit late debris contacts, water balance, surface LOD, and progressive-video recovery.

@@ -1030,11 +1030,19 @@ def integrate_multirate(
 def deform_facade_vertices(
     rest_vertex: wp.array(dtype=wp.vec3),
     anchor: wp.array(dtype=wp.int32),
+    panel_mode: wp.array(dtype=wp.int32),
+    owner_fragment: wp.array(dtype=wp.int32),
+    fragment_support: wp.array(dtype=float),
     x: wp.array(dtype=wp.vec3),
     rest_x: wp.array(dtype=wp.vec3),
     current_vertex: wp.array(dtype=wp.vec3),
 ):
     i = wp.tid()
+    panel = i // 4
+    if panel_mode[panel] != 0:
+        owner = owner_fragment[panel]
+        if owner < 0 or fragment_support[owner] > 0.5:
+            return
     a = anchor[i]
     current_vertex[i] = rest_vertex[i] + (x[a] - rest_x[a])
 
@@ -1068,6 +1076,9 @@ def facade_triangle_torn(
 def raster_facade_depth(
     vertex: wp.array(dtype=wp.vec3),
     rest_vertex: wp.array(dtype=wp.vec3),
+    panel_mode: wp.array(dtype=wp.int32),
+    owner_fragment: wp.array(dtype=wp.int32),
+    fragment_support: wp.array(dtype=float),
     depth: wp.array(dtype=float),
     cam: wp.vec3,
     right: wp.vec3,
@@ -1079,6 +1090,11 @@ def raster_facade_depth(
     maximum_stretch: float,
 ):
     triangle = wp.tid()
+    panel = triangle // 2
+    if panel_mode[panel] != 0:
+        owner = owner_fragment[panel]
+        if owner < 0 or fragment_support[owner] > 0.5:
+            return
     ids = facade_triangle_indices(triangle)
     world_a = vertex[ids[0]]; world_b = vertex[ids[1]]; world_c = vertex[ids[2]]
     if facade_triangle_torn(
@@ -1138,6 +1154,10 @@ def facade_material_color(code: int) -> wp.vec3:
         elif palette == 5: base = wp.vec3(0.16, 0.38, 0.50)
     elif family == 3:
         base *= 0.68
+    elif family == 4:
+        # Exposed structural fragment hull: darker concrete/steel aggregate,
+        # while retaining a trace of the original building palette.
+        base = base * 0.48 + wp.vec3(0.18, 0.19, 0.18)
     return base
 
 
@@ -1147,6 +1167,9 @@ def raster_facade_color(
     rest_vertex: wp.array(dtype=wp.vec3),
     anchor: wp.array(dtype=wp.int32),
     material: wp.array(dtype=wp.int32),
+    panel_mode: wp.array(dtype=wp.int32),
+    owner_fragment: wp.array(dtype=wp.int32),
+    fragment_support: wp.array(dtype=float),
     particle_damage: wp.array(dtype=float),
     depth: wp.array(dtype=float),
     color: wp.array(dtype=wp.vec3),
@@ -1161,6 +1184,10 @@ def raster_facade_color(
 ):
     triangle = wp.tid()
     panel = triangle // 2
+    if panel_mode[panel] != 0:
+        owner = owner_fragment[panel]
+        if owner < 0 or fragment_support[owner] > 0.5:
+            return
     ids = facade_triangle_indices(triangle)
     world_a = vertex[ids[0]]; world_b = vertex[ids[1]]; world_c = vertex[ids[2]]
     if facade_triangle_torn(

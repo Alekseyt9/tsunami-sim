@@ -9,7 +9,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import hashlib
+import json
+import shutil
 import numpy as np
+
+try:
+    from scipy.spatial import ConvexHull, QhullError
+except ImportError:  # The renderer retains its box fallback in minimal environments.
+    ConvexHull = None
+    QhullError = RuntimeError
 
 from scene import (
     STRUCT_BEAM,
@@ -278,6 +287,143 @@ def build_facade_skin(cfg: dict) -> dict[str, np.ndarray]:
         "material": np.asarray(materials, dtype=np.int32),
         "building_id": np.asarray(building_ids, dtype=np.int32),
         "vertex": np.asarray(vertices, dtype=np.float32),
+        "panel_mode": np.zeros(len(materials), dtype=np.int32),
+        "owner_fragment": np.full(len(materials), -1, dtype=np.int32),
+    }
+
+
+def build_convex_fragment_triangles(
+    position: np.ndarray,
+    radius: np.ndarray,
+    plane_tolerance: float = 0.025,
+) -> np.ndarray:
+    """Return a small deterministic convex boundary around one particle group."""
+    position = np.asarray(position, dtype=np.float64)
+    radius = np.asarray(radius, dtype=np.float64)
+    directions = np.asarray([
+        (x, y, z)
+        for x in (-1.0, 0.0, 1.0)
+        for y in (-1.0, 0.0, 1.0)
+        for z in (-1.0, 0.0, 1.0)
+        if x != 0.0 or y != 0.0 or z != 0.0
+    ], dtype=np.float64)
+    directions /= np.linalg.norm(directions, axis=1)[:, None]
+    support: list[np.ndarray] = []
+    for direction in directions:
+        cube_extension = radius * np.sum(np.abs(direction))
+        particle = int(np.argmax(position @ direction + cube_extension))
+        point = position[particle] + np.sign(direction) * radius[particle]
+        if not any(np.linalg.norm(point - existing) <= 1.0e-5 for existing in support):
+            support.append(point)
+    points = np.asarray(support, dtype=np.float64)
+    if len(points) < 4:
+        return np.empty((0, 3, 3), dtype=np.float32)
+
+    if ConvexHull is None:
+        return np.empty((0, 3, 3), dtype=np.float32)
+    try:
+        hull = ConvexHull(points)
+    except QhullError:
+        return np.empty((0, 3, 3), dtype=np.float32)
+    triangles = points[np.asarray(hull.simplices, dtype=np.int32)].copy()
+    for index, outward_plane in enumerate(hull.equations):
+        triangle_normal = np.cross(
+            triangles[index, 1] - triangles[index, 0],
+            triangles[index, 2] - triangles[index, 0],
+        )
+        if float(np.dot(triangle_normal, outward_plane[:3])) < 0.0:
+            triangles[index] = triangles[index, (0, 2, 1)]
+    return np.asarray(triangles, dtype=np.float32)
+
+
+def build_fragment_debris_skin(
+    cfg: dict,
+    rest_x: np.ndarray,
+    kind: np.ndarray,
+    building_id: np.ndarray,
+    fragment_id: np.ndarray,
+    radius: np.ndarray,
+    structural_class: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Build hidden box hulls that become visible after a fragment detaches."""
+    centers: list[np.ndarray] = []
+    sizes: list[np.ndarray] = []
+    normals: list[tuple[float, float, float]] = []
+    materials: list[int] = []
+    building_ids: list[int] = []
+    vertices: list[tuple[tuple[float, float, float], ...]] = []
+    owners: list[int] = []
+    palettes = cfg.get("building_palettes", [])
+
+    def add_face(fid: int, bid: int, center: np.ndarray, size: np.ndarray,
+                 normal: tuple[float, float, float], material: int) -> None:
+        cx, cy, cz = map(float, center)
+        sx, sy, sz = map(float, size)
+        centers.append(np.asarray((cx, cy, cz), dtype=np.float32))
+        sizes.append(np.asarray((sx, sy, sz), dtype=np.float32))
+        normals.append(normal); materials.append(material); building_ids.append(bid); owners.append(fid)
+        if abs(normal[0]) > 0.5:
+            vertices.append(((cx, cy - sy * 0.5, cz - sz * 0.5), (cx, cy + sy * 0.5, cz - sz * 0.5),
+                             (cx, cy + sy * 0.5, cz + sz * 0.5), (cx, cy - sy * 0.5, cz + sz * 0.5)))
+        elif abs(normal[1]) > 0.5:
+            vertices.append(((cx - sx * 0.5, cy, cz - sz * 0.5), (cx - sx * 0.5, cy, cz + sz * 0.5),
+                             (cx + sx * 0.5, cy, cz + sz * 0.5), (cx + sx * 0.5, cy, cz - sz * 0.5)))
+        else:
+            vertices.append(((cx - sx * 0.5, cy - sy * 0.5, cz), (cx - sx * 0.5, cy + sy * 0.5, cz),
+                             (cx + sx * 0.5, cy + sy * 0.5, cz), (cx + sx * 0.5, cy - sy * 0.5, cz)))
+
+    def add_triangle(fid: int, bid: int, triangle: np.ndarray, material: int) -> None:
+        normal = np.cross(triangle[1] - triangle[0], triangle[2] - triangle[0])
+        normal /= max(float(np.linalg.norm(normal)), 1.0e-12)
+        lower = np.min(triangle, axis=0); upper = np.max(triangle, axis=0)
+        centers.append(np.mean(triangle, axis=0).astype(np.float32))
+        sizes.append(np.maximum(upper - lower, 0.08).astype(np.float32))
+        normals.append(tuple(float(value) for value in normal))
+        materials.append(material); building_ids.append(bid); owners.append(fid)
+        a, b, c = (tuple(float(value) for value in point) for point in triangle)
+        vertices.append((a, b, c, c))
+
+    valid_fragments = np.unique(fragment_id[(fragment_id >= 0) & (kind != 0)])
+    for fid_value in valid_fragments:
+        fid = int(fid_value)
+        indices = np.flatnonzero((fragment_id == fid) & (kind != 0))
+        if len(indices) == 0:
+            continue
+        bid = int(building_id[indices[0]])
+        palette = int(palettes[bid]) % 6 if 0 <= bid < len(palettes) else max(bid, 0) % 6
+        roles, role_counts = np.unique(structural_class[indices], return_counts=True)
+        role = int(roles[int(np.argmax(role_counts))])
+        material = 40 + palette
+        if role == STRUCT_WALL:
+            material = 10 + palette
+        elif role == STRUCT_GLASS:
+            material = 20 + palette
+        elif role == STRUCT_SLAB:
+            material = 30 + palette
+        triangles = build_convex_fragment_triangles(rest_x[indices], radius[indices])
+        if len(triangles):
+            for triangle in triangles:
+                add_triangle(fid, bid, triangle, material)
+        else:
+            padding = max(0.18, float(np.median(radius[indices])) * 0.72)
+            lower = np.min(rest_x[indices], axis=0).astype(np.float64) - padding
+            upper = np.max(rest_x[indices], axis=0).astype(np.float64) + padding
+            center = ((lower + upper) * 0.5).astype(np.float32)
+            size = np.maximum(upper - lower, 2.0 * padding).astype(np.float32)
+            for axis, sign in ((0, -1.0), (0, 1.0), (1, -1.0), (1, 1.0), (2, -1.0), (2, 1.0)):
+                face_center = center.copy()
+                face_center[axis] += sign * size[axis] * 0.5
+                normal = [0.0, 0.0, 0.0]; normal[axis] = sign
+                add_face(fid, bid, face_center, size, tuple(normal), material)
+    return {
+        "center": np.asarray(centers, dtype=np.float32).reshape(-1, 3),
+        "size": np.asarray(sizes, dtype=np.float32).reshape(-1, 3),
+        "normal": np.asarray(normals, dtype=np.float32).reshape(-1, 3),
+        "material": np.asarray(materials, dtype=np.int32),
+        "building_id": np.asarray(building_ids, dtype=np.int32),
+        "vertex": np.asarray(vertices, dtype=np.float32).reshape(-1, 4, 3),
+        "panel_mode": np.ones(len(materials), dtype=np.int32),
+        "owner_fragment": np.asarray(owners, dtype=np.int32),
     }
 
 
@@ -291,7 +437,40 @@ def bind_facade_anchors(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Bind each panel to particles belonging to one cohesive fragment."""
     anchors = np.full((len(skin["vertex"]), 4), -1, dtype=np.int32)
+    preferred_owner = np.asarray(
+        skin.get("owner_fragment", np.full(len(skin["vertex"]), -1, dtype=np.int32)),
+        dtype=np.int32,
+    )
     owner_fragment = np.full(len(skin["vertex"]), -1, dtype=np.int32)
+    # Debris hulls already know their cohesive owner. Bind all of one hull's
+    # vertices in vectorized chunks instead of repeating a bucket query for
+    # every triangle corner. This is especially important when a resumed,
+    # refined fragment contains hundreds of physical samples.
+    if fragment_id is not None:
+        valid_particles = np.flatnonzero((kind != 0) & (fragment_id >= 0))
+        order = np.argsort(fragment_id[valid_particles], kind="stable")
+        sorted_particles = valid_particles[order]
+        sorted_fragments = fragment_id[sorted_particles]
+        unique_fragments, starts = np.unique(sorted_fragments, return_index=True)
+        fragment_particles = {
+            int(owner): indices
+            for owner, indices in zip(unique_fragments, np.split(sorted_particles, starts[1:]))
+        }
+        for owner in np.unique(preferred_owner[preferred_owner >= 0]):
+            panel_indices = np.flatnonzero(preferred_owner == owner)
+            particle_indices = fragment_particles.get(int(owner), np.empty(0, dtype=np.int32))
+            if len(panel_indices) == 0 or len(particle_indices) == 0:
+                continue
+            points = rest_x[particle_indices]
+            panel_vertices = skin["vertex"][panel_indices].reshape(-1, 3)
+            nearest_global = np.empty(len(panel_vertices), dtype=np.int32)
+            for start in range(0, len(panel_vertices), 512):
+                stop = min(start + 512, len(panel_vertices))
+                delta = panel_vertices[start:stop, None, :] - points[None, :, :]
+                distance2 = np.sum(delta * delta, axis=2)
+                nearest_global[start:stop] = particle_indices[np.argmin(distance2, axis=1)]
+            anchors[panel_indices] = nearest_global.reshape(-1, 4)
+            owner_fragment[panel_indices] = int(owner)
     cache: dict[tuple[int, ...], int] = {}
     for bid in np.unique(skin["building_id"]):
         particle_indices = np.flatnonzero((kind != 0) & (building_id == bid))
@@ -323,10 +502,12 @@ def bind_facade_anchors(
                 local = np.flatnonzero(particle_fragments == required_fragment) if required_fragment >= 0 else np.arange(len(points))
             return int(local[int(np.argmin(np.sum((points[local] - point) ** 2, axis=1)))])
 
-        panel_indices = np.flatnonzero(skin["building_id"] == bid)
+        panel_indices = np.flatnonzero((skin["building_id"] == bid) & (preferred_owner < 0))
         for panel_index in panel_indices:
-            center_local = nearest_particle(skin["center"][panel_index])
-            owner = int(particle_fragments[center_local])
+            owner = int(preferred_owner[panel_index])
+            if owner < 0:
+                center_local = nearest_particle(skin["center"][panel_index])
+                owner = int(particle_fragments[center_local])
             owner_fragment[panel_index] = owner
             for corner in range(4):
                 vertex = skin["vertex"][panel_index, corner]
@@ -348,13 +529,60 @@ def write_facade_skin(
     kind: np.ndarray | None = None,
     building_id: np.ndarray | None = None,
     fragment_id: np.ndarray | None = None,
+    radius: np.ndarray | None = None,
+    structural_class: np.ndarray | None = None,
 ) -> int:
+    debris_policy = cfg.get("v3", {}).get("debris_skin", {})
+    complete_geometry = all(
+        value is not None
+        for value in (rest_x, kind, building_id, fragment_id, radius, structural_class)
+    )
+    cache_path: Path | None = None
+    if complete_geometry and bool(debris_policy.get("cache", True)):
+        geometry_cfg = {
+            "schema": "convex-fragment-skin-v2-vectorized-binding",
+            "solid_spacing": cfg.get("solid_spacing"),
+            "buildings": cfg.get("buildings"),
+            "building_styles": cfg.get("building_styles"),
+            "building_palettes": cfg.get("building_palettes"),
+            "fragment_clustering": cfg.get("v3", {}).get("fragment_clustering"),
+            "debris_skin": debris_policy,
+        }
+        digest = hashlib.sha256(
+            json.dumps(geometry_cfg, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        )
+        for values in (rest_x, kind, building_id, fragment_id, radius, structural_class):
+            digest.update(np.ascontiguousarray(values).view(np.uint8))
+        cache_dir = path.parent.parent / "_geometry_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = cache_dir / f"facade_skin_{digest.hexdigest()[:20]}.npz"
+        if cache_path.exists():
+            shutil.copyfile(cache_path, path)
+            with np.load(cache_path, allow_pickle=False) as cached:
+                panel_count = len(cached["building_id"])
+            print(f"Facade/debris skin cache hit: {cache_path.name}")
+            return panel_count
+
     skin = build_facade_skin(cfg)
+    if (
+        rest_x is not None and kind is not None and building_id is not None
+        and fragment_id is not None and radius is not None and structural_class is not None
+        and bool(debris_policy.get("enabled", True))
+    ):
+        debris = build_fragment_debris_skin(
+            cfg, rest_x, kind, building_id, fragment_id, radius, structural_class
+        )
+        skin = {name: np.concatenate((skin[name], debris[name]), axis=0) for name in skin}
     if rest_x is not None and kind is not None and building_id is not None:
         skin["anchor"], skin["owner_fragment"] = bind_facade_anchors(
             skin, rest_x, kind, building_id, float(cfg["solid_spacing"]), fragment_id
         )
     np.savez_compressed(path, **skin)
+    if cache_path is not None:
+        temporary_cache = cache_path.with_suffix(".tmp.npz")
+        shutil.copyfile(path, temporary_cache)
+        temporary_cache.replace(cache_path)
+        print(f"Facade/debris skin cached: {cache_path.name}")
     return len(skin["building_id"])
 
 

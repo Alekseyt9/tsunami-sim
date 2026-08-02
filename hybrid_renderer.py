@@ -33,11 +33,17 @@ class HybridRenderer(ParticleRenderer):
             rest_vertex = skin["vertex"].reshape(-1, 3).copy()
             anchor = skin["anchor"].reshape(-1).copy()
             material = skin["material"].copy()
+            panel_mode = skin["panel_mode"].copy() if "panel_mode" in skin else np.zeros(len(material), dtype=np.int32)
+            owner_fragment = skin["owner_fragment"].copy() if "owner_fragment" in skin else np.full(len(material), -1, dtype=np.int32)
         self.panel_count = len(material)
         self.rest_vertex = wp.array(rest_vertex, dtype=wp.vec3, device=device)
         self.current_vertex = wp.empty(len(rest_vertex), dtype=wp.vec3, device=device)
         self.anchor = wp.array(anchor, dtype=wp.int32, device=device)
         self.panel_material = wp.array(material, dtype=wp.int32, device=device)
+        self.panel_mode = wp.array(panel_mode, dtype=wp.int32, device=device)
+        self.owner_fragment = wp.array(owner_fragment, dtype=wp.int32, device=device)
+        fragment_count = int(owner_fragment[owner_fragment >= 0].max()) + 1 if np.any(owner_fragment >= 0) else 1
+        self.fragment_support = wp.ones(fragment_count, dtype=float, device=device)
 
     def render(self, arrays: dict, count: int, output_path: Path | None, frame: int, time_s: float, stats: dict):
         pixel_count = self.width * self.height
@@ -51,12 +57,14 @@ class HybridRenderer(ParticleRenderer):
 
         wp.launch(
             deform_facade_vertices, dim=self.panel_count * 4,
-            inputs=[self.rest_vertex, self.anchor, arrays["x"], arrays["rest_x"], self.current_vertex],
+            inputs=[self.rest_vertex, self.anchor, self.panel_mode, self.owner_fragment,
+                    self.fragment_support, arrays["x"], arrays["rest_x"], self.current_vertex],
             device=self.device,
         )
         wp.launch(
             raster_facade_depth, dim=self.panel_count * 2,
-            inputs=[self.current_vertex, self.rest_vertex, self.depth, *common, self.maximum_panel_stretch], device=self.device,
+            inputs=[self.current_vertex, self.rest_vertex, self.panel_mode, self.owner_fragment,
+                    self.fragment_support, self.depth, *common, self.maximum_panel_stretch], device=self.device,
         )
         if "water_mesh_indices" in arrays and len(arrays["water_mesh_indices"]) >= 3:
             wp.launch(
@@ -108,7 +116,8 @@ class HybridRenderer(ParticleRenderer):
 
         wp.launch(
             raster_facade_color, dim=self.panel_count * 2,
-            inputs=[self.current_vertex, self.rest_vertex, self.anchor, self.panel_material, arrays["damage"],
+            inputs=[self.current_vertex, self.rest_vertex, self.anchor, self.panel_material,
+                    self.panel_mode, self.owner_fragment, self.fragment_support, arrays["damage"],
                     self.depth, self.color, *common, self.maximum_panel_stretch], device=self.device,
         )
         wp.launch(

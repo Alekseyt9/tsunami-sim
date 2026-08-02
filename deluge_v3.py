@@ -196,6 +196,8 @@ class HybridDelugeSolver(DelugeSolver):
         local_impact_host = np.zeros(self.capacity, dtype=np.int32)
         active_host = np.zeros(max(1, self.building_count), dtype=np.int32)
         activation_exposure_host = np.zeros(max(1, self.building_count), dtype=np.float32)
+        self.adaptive_merged_groups_total = 0
+        self.adaptive_merged_particles_total = 0
         v3_resume = self._v3_checkpoint_path(self.resume_path) if self.resume_path else None
         if v3_resume is not None and v3_resume.exists():
             with np.load(v3_resume, allow_pickle=False) as state:
@@ -245,6 +247,10 @@ class HybridDelugeSolver(DelugeSolver):
                 if "local_impact_active" in state:
                     saved_local_impact = state["local_impact_active"]
                     local_impact_host[:len(saved_local_impact)] = saved_local_impact
+                if "adaptive_merged_groups_total" in state:
+                    self.adaptive_merged_groups_total = int(state["adaptive_merged_groups_total"])
+                if "adaptive_merged_particles_total" in state:
+                    self.adaptive_merged_particles_total = int(state["adaptive_merged_particles_total"])
             print(f"V3 state restored from {v3_resume.name}")
         else:
             for bid in self.v3_cfg.get("initially_active_buildings", []):
@@ -314,8 +320,6 @@ class HybridDelugeSolver(DelugeSolver):
         self.return_keep = wp.zeros(self.capacity, dtype=wp.int32, device=self.device)
         self.return_offsets = wp.zeros(self.capacity, dtype=wp.int32, device=self.device)
         self.particle_compaction_scratch = None
-        self.adaptive_merged_groups_total = 0
-        self.adaptive_merged_particles_total = 0
         self.last_adaptive_merge_frame = -1
         self._initialize_water_surface(v3_resume)
 
@@ -335,7 +339,8 @@ class HybridDelugeSolver(DelugeSolver):
         )
         skin_path = output / "facade_skin.npz"
         panel_count = write_facade_skin(
-            skin_path, cfg, rest_host, kind_host, building_host, fragment_host
+            skin_path, cfg, rest_host, kind_host, building_host, fragment_host,
+            self.arrays["radius"][:self.count].numpy(), structural_class_host,
         )
         render = cfg["render"]
         configured_views = render.get("views", {"original": render["camera"]})
@@ -794,6 +799,8 @@ class HybridDelugeSolver(DelugeSolver):
             base_fixed=self.base_fixed[:self.count].numpy(),
             material_impact_impulse=self.arrays["material_impact_impulse"][:self.count].numpy(),
             local_impact_active=self.arrays["local_impact_active"][:self.count].numpy(),
+            adaptive_merged_groups_total=np.int64(self.adaptive_merged_groups_total),
+            adaptive_merged_particles_total=np.int64(self.adaptive_merged_particles_total),
             fragment_id=self.fragment_id[:self.count].numpy(),
             normal_axis=self.normal_axis[:self.count].numpy(),
             rigid_state=self.rigid_state.numpy(),
@@ -1335,6 +1342,8 @@ class HybridDelugeSolver(DelugeSolver):
             np.max(impact_values[kind_host != 0]) if np.any(kind_host != 0) else 0.0
         )
         self._update_fragment_support_graph(position_host, damage_values)
+        for renderer in self.renderers.values():
+            renderer.fragment_support = self.fragment_support
         damaged_mask = damage_values > 0.05
         for role, role_name in (
             (1, "slab"), (2, "wall"), (3, "beam"), (4, "column"), (5, "core"), (6, "glass")

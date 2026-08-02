@@ -73,6 +73,9 @@ def main():
         "fragment_id": integer(), "normal_axis": integer(), "time_level": integer(),
         "time_active": integer(), "surface_mask": integer(), "surface_normal": vector(),
         "foam_strength": scalar(),
+        "fluid_group_id": wp.array(
+            np.full(capacity, -1, dtype=np.int32), dtype=wp.int32, device=device
+        ),
     }
     emit_arrays["x"] = wp.array(
         np.asarray([[0.0, 0.0, 0.0]] * capacity, dtype=np.float32),
@@ -99,7 +102,8 @@ def main():
             emit_arrays["solid_force"], emit_arrays["base_fixed"], emit_arrays["fragment_id"],
             emit_arrays["normal_axis"], emit_arrays["time_level"], emit_arrays["time_active"],
             emit_arrays["surface_mask"], emit_arrays["surface_normal"],
-            emit_arrays["foam_strength"], solver.state, exchange_volume, exchange_x, exchange_z,
+            emit_arrays["foam_strength"], emit_arrays["fluid_group_id"],
+            solver.state, exchange_volume, exchange_x, exchange_z,
             counter, old_count, capacity, 1, 1, solver.lower_x, solver.lower_z,
             solver.interface_z, solver.cell_size, solver.nx, solver.nz, 1.0,
             float(cfg["rest_density"]), 0.25,
@@ -121,6 +125,8 @@ def main():
         raise AssertionError(f"SPH emission volume residual is {volume_residual:.3e} m3")
     if momentum_residual > 1.0e-3:
         raise AssertionError(f"SPH emission momentum residual is {momentum_residual:.3e} kg m/s")
+    if int(emit_arrays["fluid_group_id"].numpy()[old_count]) != -1:
+        raise AssertionError("fresh shallow/SPH particle inherited an adaptive sibling group")
 
     # Rejected slow sites must not reserve an uninitialized particle slot.
     rejected_counter = wp.array(
@@ -139,7 +145,8 @@ def main():
             emit_arrays["solid_force"], emit_arrays["base_fixed"], emit_arrays["fragment_id"],
             emit_arrays["normal_axis"], emit_arrays["time_level"], emit_arrays["time_active"],
             emit_arrays["surface_mask"], emit_arrays["surface_normal"],
-            emit_arrays["foam_strength"], solver.state, exchange_volume, exchange_x, exchange_z,
+            emit_arrays["foam_strength"], emit_arrays["fluid_group_id"],
+            solver.state, exchange_volume, exchange_x, exchange_z,
             rejected_counter, old_count, capacity, 1, 1, solver.lower_x, solver.lower_z,
             solver.interface_z, solver.cell_size, solver.nx, solver.nz, 1.0,
             float(cfg["rest_density"]), 100.0,

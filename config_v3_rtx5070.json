@@ -60,6 +60,18 @@
   "building_palettes": [4, 0, 5, 2, 3, 1, 4, 0, 2, 5, 3, 1, 4, 0, 2],
   "v3": {
     "initially_active_buildings": [],
+    "adaptive_water_merge": {
+      "enabled": true,
+      "every_frames": 8,
+      "surface_margin": 0.75,
+      "maximum_vertical_speed": 0.8,
+      "maximum_velocity_rms": 0.6,
+      "maximum_span": 0.9
+    },
+    "debris_skin": {
+      "enabled": true,
+      "cache": true
+    },
     "shallow_water": {
       "enabled": true,
       "replace_far_sph": true,
