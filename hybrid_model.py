@@ -37,6 +37,137 @@ class SolidRefinementPolicy:
         return cls(**{name: float(data[name]) for name in cls.__dataclass_fields__})
 
 
+@dataclass(frozen=True)
+class FragmentSupportGraph:
+    """Sparse breakable load paths between architectural solid fragments."""
+
+    edge_fragments: np.ndarray
+    sample_offsets: np.ndarray
+    sample_pairs: np.ndarray
+    sample_rest_length: np.ndarray
+    anchored_fragments: np.ndarray
+
+
+def build_fragment_support_graph(
+    rest_x: np.ndarray,
+    radius: np.ndarray,
+    kind: np.ndarray,
+    building_id: np.ndarray,
+    base_fixed: np.ndarray,
+    fragment_id: np.ndarray,
+    maximum_samples_per_edge: int = 12,
+) -> FragmentSupportGraph:
+    """Build fragment adjacency and retain representative boundary bonds.
+
+    The particle solver still resolves every local spring.  This much smaller
+    graph only answers whether a fragment has an intact load path to a fixed
+    foundation fragment, avoiding a nonlinear global FEM solve every substep.
+    """
+    fragment_count = int(fragment_id[fragment_id >= 0].max()) + 1 if np.any(fragment_id >= 0) else 0
+    anchored = np.zeros(fragment_count, dtype=bool)
+    anchored_ids = fragment_id[(kind != 0) & (base_fixed != 0) & (fragment_id >= 0)]
+    anchored[anchored_ids] = True
+    solid = np.flatnonzero((kind != 0) & (building_id >= 0) & (fragment_id >= 0))
+    if len(solid) == 0:
+        empty2 = np.empty((0, 2), dtype=np.int32)
+        return FragmentSupportGraph(
+            empty2, np.zeros(1, dtype=np.int32), empty2,
+            np.empty(0, dtype=np.float32), anchored,
+        )
+
+    maximum_samples_per_edge = max(1, int(maximum_samples_per_edge))
+    maximum_bond = 3.2 * float(np.max(radius[solid]))
+    bucket_size = max(maximum_bond, 1.0e-4)
+    cell = np.floor(rest_x[solid] / bucket_size).astype(np.int32)
+    buckets: dict[tuple[int, int, int, int], list[int]] = {}
+    for particle, key in zip(solid, cell):
+        bucket = (int(building_id[particle]), int(key[0]), int(key[1]), int(key[2]))
+        buckets.setdefault(bucket, []).append(int(particle))
+
+    edge_samples: dict[tuple[int, int], list[tuple[int, int, float]]] = {}
+    for particle, key in zip(solid, cell):
+        bid = int(building_id[particle])
+        fi = int(fragment_id[particle])
+        for dz in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    neighbours = buckets.get(
+                        (bid, int(key[0] + dx), int(key[1] + dy), int(key[2] + dz)), ()
+                    )
+                    for other in neighbours:
+                        if other <= particle:
+                            continue
+                        fj = int(fragment_id[other])
+                        if fj == fi:
+                            continue
+                        delta = rest_x[other] - rest_x[particle]
+                        distance = float(np.linalg.norm(delta))
+                        bond_range = 3.2 * max(float(radius[particle]), float(radius[other]))
+                        if distance <= 1.0e-5 or distance >= bond_range:
+                            continue
+                        edge = (fi, fj) if fi < fj else (fj, fi)
+                        edge_samples.setdefault(edge, []).append((int(particle), int(other), distance))
+
+    edges = np.asarray(sorted(edge_samples), dtype=np.int32).reshape(-1, 2)
+    offsets = [0]
+    pairs: list[tuple[int, int]] = []
+    lengths: list[float] = []
+    for edge in map(tuple, edges):
+        candidates = edge_samples[edge]
+        if len(candidates) > maximum_samples_per_edge:
+            selection = np.linspace(0, len(candidates) - 1, maximum_samples_per_edge, dtype=np.int32)
+            candidates = [candidates[int(index)] for index in selection]
+        for left, right, distance in candidates:
+            pairs.append((left, right)); lengths.append(distance)
+        offsets.append(len(pairs))
+    return FragmentSupportGraph(
+        edges,
+        np.asarray(offsets, dtype=np.int32),
+        np.asarray(pairs, dtype=np.int32).reshape(-1, 2),
+        np.asarray(lengths, dtype=np.float32),
+        anchored,
+    )
+
+
+def evaluate_fragment_support(
+    graph: FragmentSupportGraph,
+    position: np.ndarray,
+    damage: np.ndarray,
+    damage_threshold: float = 0.95,
+    maximum_stretch: float = 1.60,
+    minimum_intact_sample_fraction: float = 0.25,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return foundation-connected fragments and currently intact graph edges."""
+    edge_count = len(graph.edge_fragments)
+    if edge_count == 0:
+        return graph.anchored_fragments.copy(), np.empty(0, dtype=bool)
+    pair = graph.sample_pairs
+    current_length = np.linalg.norm(position[pair[:, 1]] - position[pair[:, 0]], axis=1)
+    intact_sample = (
+        (damage[pair[:, 0]] < damage_threshold)
+        & (damage[pair[:, 1]] < damage_threshold)
+        & (current_length < graph.sample_rest_length * maximum_stretch)
+    )
+    sample_edge = np.repeat(np.arange(edge_count, dtype=np.int32), np.diff(graph.sample_offsets))
+    intact_count = np.bincount(sample_edge, weights=intact_sample.astype(np.int32), minlength=edge_count)
+    sample_count = np.diff(graph.sample_offsets)
+    required = np.maximum(1, np.ceil(sample_count * minimum_intact_sample_fraction)).astype(np.int32)
+    edge_intact = intact_count >= required
+
+    supported = graph.anchored_fragments.copy()
+    live = graph.edge_fragments[edge_intact]
+    for _ in range(len(supported)):
+        before = int(np.count_nonzero(supported))
+        if len(live):
+            from_left = supported[live[:, 0]]
+            from_right = supported[live[:, 1]]
+            supported[live[from_left, 1]] = True
+            supported[live[from_right, 0]] = True
+        if int(np.count_nonzero(supported)) == before:
+            break
+    return supported, edge_intact
+
+
 def build_facade_skin(cfg: dict) -> dict[str, np.ndarray]:
     """Create continuous facade panels at architectural, not particle, scale."""
     centers: list[tuple[float, float, float]] = []

@@ -18,6 +18,7 @@ if not exist "%PYTHON_EXE%" (
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_impact_gates.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_fragment_scale.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_structural_hierarchy.py" || exit /b 1
+"%PYTHON_EXE%" "%VALIDATION_DIR%validate_support_graph.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_shallow_water.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_shallow_return.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_surface_reconstruction.py" || exit /b 1

@@ -216,15 +216,15 @@ def emit_sph_interface_particles(
                 break
     if occupied != 0:
         return
+    velocity_x = state[1] / wp.max(state[0], 1.0e-5)
+    velocity_z = state[2] / wp.max(state[0], 1.0e-5)
+    if velocity_z < minimum_emission_velocity:
+        return
     target = wp.atomic_add(count, 0, 1)
     if target >= capacity:
         return
     particle_volume = particle_spacing * particle_spacing * particle_spacing
     particle_mass = particle_volume * rest_density
-    velocity_x = state[1] / wp.max(state[0], 1.0e-5)
-    velocity_z = state[2] / wp.max(state[0], 1.0e-5)
-    if velocity_z < minimum_emission_velocity:
-        return
     velocity = wp.vec3(velocity_x, 0.0, velocity_z)
     x[target] = position
     rest_x[target] = position

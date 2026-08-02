@@ -189,6 +189,7 @@ def compute_clustered_solid_forces(
     building_structural_volume: wp.array(dtype=float),
     fragment_id: wp.array(dtype=wp.int32),
     rigid_state: wp.array(dtype=wp.int32),
+    fragment_support: wp.array(dtype=float),
     fixed: wp.array(dtype=wp.int32),
     damage: wp.array(dtype=float),
     solid_force: wp.array(dtype=wp.vec3),
@@ -224,7 +225,13 @@ def compute_clustered_solid_forces(
     body_rigid = fid >= 0 and rigid_state[fid] != 0
     bid = building_id[i]
     building_collapse = float(0.0)
-    if bid >= 0:
+    if fid >= 0:
+        # The sparse architectural graph follows intact bonds from this
+        # fragment to a fixed foundation fragment.  It supersedes the former
+        # building-wide damage percentage, which could make an intact upper
+        # storey fall merely because an unrelated facade was damaged.
+        building_collapse = 1.0 - wp.clamp(fragment_support[fid], 0.0, 1.0)
+    elif bid >= 0:
         building_collapse = collapse_gravity_fraction(
             building_damage_integral[bid],
             building_structural_volume[bid],

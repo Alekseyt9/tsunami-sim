@@ -303,6 +303,7 @@ class DelugeSolver:
             }
             for optional_stat in ("active_buildings", "released_fragments", "rigid_clusters", "rigid_particles",
                                   "rigid_reactivated_fragments",
+                                  "unsupported_fragments", "support_graph_edges", "support_graph_intact_edges",
                                   "time_level_0_particles", "time_level_1_particles", "time_level_2_particles",
                                   "surface_water_particles", "water_mesh_vertices", "water_mesh_triangles",
                                   "water_field_nodes", "water_field_nx", "water_field_ny", "water_field_nz",
@@ -408,6 +409,7 @@ class DelugeSolver:
             }
             for optional_stat in ("active_buildings", "released_fragments", "rigid_clusters", "rigid_particles",
                                   "rigid_reactivated_fragments",
+                                  "unsupported_fragments", "support_graph_edges", "support_graph_intact_edges",
                                   "time_level_0_particles", "time_level_1_particles", "time_level_2_particles",
                                   "surface_water_particles", "water_mesh_vertices", "water_mesh_triangles",
                                   "water_field_nodes", "water_mesh_lod_changes", "water_splash_bricks",

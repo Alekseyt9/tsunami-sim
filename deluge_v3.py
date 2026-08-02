@@ -48,9 +48,12 @@ from hybrid_kernels import (  # noqa: E402
     select_active_time_level,
 )
 from hybrid_model import (  # noqa: E402
+    FragmentSupportGraph,
     SolidRefinementPolicy,
     build_fragment_ids,
+    build_fragment_support_graph,
     build_refinement_axes,
+    evaluate_fragment_support,
     write_facade_skin,
 )
 from hybrid_renderer import HybridRenderer  # noqa: E402
@@ -240,6 +243,30 @@ class HybridDelugeSolver(DelugeSolver):
                 print("WARNING: matching V3 checkpoint is absent; using configured building activity")
 
         self.base_fixed = wp.array(base_host, dtype=wp.int32, device=self.device)
+        support_policy = self.v3_cfg.get("support_graph", {})
+        radius_host = self.arrays["radius"][:self.count].numpy()
+        self.fragment_support_graph = build_fragment_support_graph(
+            rest_host, radius_host, kind_host, building_host, base_host[:self.count],
+            self.fragment_host,
+            int(support_policy.get("maximum_samples_per_edge", 12)),
+        )
+        self.fragment_support_host = np.ones(self.fragment_count, dtype=np.float32)
+        self.fragment_edge_intact_host = np.ones(
+            len(self.fragment_support_graph.edge_fragments), dtype=bool
+        )
+        self.fragment_support = wp.array(
+            self.fragment_support_host, dtype=float, device=self.device
+        )
+        self.fragment_building_host = np.full(self.fragment_count, -1, dtype=np.int32)
+        valid_fragment_particles = np.flatnonzero(self.fragment_host >= 0)
+        if len(valid_fragment_particles):
+            unique_fragment, first = np.unique(
+                self.fragment_host[valid_fragment_particles], return_index=True
+            )
+            self.fragment_building_host[unique_fragment] = building_host[
+                valid_fragment_particles[first]
+            ]
+        self.last_unsupported_fragment_count = 0
         volume_host = self.arrays["volume"][:self.count].numpy()
         solid_building_mask = (kind_host != 0) & (building_host >= 0)
         building_volume_host = np.bincount(
@@ -271,6 +298,12 @@ class HybridDelugeSolver(DelugeSolver):
         self.return_offsets = wp.zeros(self.capacity, dtype=wp.int32, device=self.device)
         self.particle_compaction_scratch = None
         self._initialize_water_surface(v3_resume)
+
+        self._update_fragment_support_graph(
+            self.arrays["x"][:self.count].numpy(),
+            self.arrays["damage"][:self.count].numpy(),
+            force=True,
+        )
 
         wp.launch(
             apply_building_activity, dim=self.count,
@@ -304,6 +337,37 @@ class HybridDelugeSolver(DelugeSolver):
             f"cohesive fragments: {self.fragment_count:,} ({smallest}-{largest} particles); "
             f"facade skin: {panel_count:,} panels; views: {', '.join(self.renderers)}"
         )
+
+    def _update_fragment_support_graph(
+        self, position_host: np.ndarray, damage_host: np.ndarray, force: bool = False
+    ) -> None:
+        policy = self.v3_cfg.get("support_graph", {})
+        if not bool(policy.get("enabled", True)) or self.fragment_count == 0:
+            return
+        update_every = max(1, int(policy.get("update_every_frames", 1)))
+        frame_index = int(round(self.time * float(self.cfg["output_fps"])))
+        if not force and frame_index % update_every != 0:
+            return
+        support, intact_edges = evaluate_fragment_support(
+            self.fragment_support_graph,
+            position_host,
+            damage_host,
+            float(policy.get("intact_damage_threshold", 0.95)),
+            float(policy.get("maximum_bond_stretch", 1.60)),
+            float(policy.get("minimum_intact_sample_fraction", 0.25)),
+        )
+        self.fragment_support_host = support.astype(np.float32, copy=False)
+        self.fragment_edge_intact_host = intact_edges
+        self.fragment_support = wp.array(
+            self.fragment_support_host, dtype=float, device=self.device
+        )
+        unsupported = int(np.count_nonzero(~support))
+        if unsupported != self.last_unsupported_fragment_count:
+            print(
+                f"  V3 support graph: {unsupported:,}/{self.fragment_count:,} fragments "
+                "disconnected from foundations"
+            )
+            self.last_unsupported_fragment_count = unsupported
 
     def _build_fragment_roles(self) -> np.ndarray:
         """Return the dominant structural role of each cohesive fragment by volume.
@@ -966,7 +1030,7 @@ class HybridDelugeSolver(DelugeSolver):
                     a["mass"][:self.count], a["kind"][:self.count], a["material"][:self.count],
                     a["structural_class"][:self.count], a["building_id"][:self.count],
                     self.building_damage_integral, self.building_structural_volume,
-                    self.fragment_id[:self.count], self.rigid_state,
+                    self.fragment_id[:self.count], self.rigid_state, self.fragment_support,
                     a["fixed"][:self.count],
                     a["damage"][:self.count], a["solid_force"][:self.count], a["acceleration"][:self.count],
                     self.max_support, dt, float(clustering.get("internal_stiffness_multiplier", 2.0)),
@@ -1167,6 +1231,7 @@ class HybridDelugeSolver(DelugeSolver):
         self.update_rigid_clusters()
         result = super().stats()
         kind_host = self.arrays["kind"][:self.count].numpy()
+        building_host = self.arrays["building_id"][:self.count].numpy()
         fluid_mask = kind_host == 0
         volume_host = self.arrays["volume"][:self.count].numpy()
         result["fluid_volume_m3"] = float(np.sum(volume_host[fluid_mask], dtype=np.float64))
@@ -1203,6 +1268,7 @@ class HybridDelugeSolver(DelugeSolver):
             )
         structural_role = self.arrays["structural_class"][:self.count].numpy()
         damage_values = self.arrays["damage"][:self.count].numpy()
+        self._update_fragment_support_graph(position_host, damage_values)
         damaged_mask = damage_values > 0.05
         for role, role_name in (
             (1, "slab"), (2, "wall"), (3, "beam"), (4, "column"), (5, "core"), (6, "glass")
@@ -1227,25 +1293,30 @@ class HybridDelugeSolver(DelugeSolver):
             self.last_active_count = active_count
         result["active_buildings"] = active_count
         building_volume = self.building_structural_volume.numpy()
-        building_damage_integral = self.building_damage_integral.numpy()
-        collapse_onset = float(
-            self.v3_cfg["fragment_clustering"].get("collapse_gravity_damage_onset", 0.015)
-        )
-        collapse_full = float(
-            self.v3_cfg["fragment_clustering"].get("collapse_gravity_damage_full", 0.10)
-        )
-        building_damage_fraction = np.divide(
-            building_damage_integral,
-            np.maximum(building_volume, 1.0e-6),
-        )
-        building_gravity_fraction = np.clip(
-            (building_damage_fraction - collapse_onset) / max(collapse_full - collapse_onset, 1.0e-6),
-            0.0,
-            1.0,
+        particle_fragment = self.fragment_host[:self.count]
+        valid_support_particle = (kind_host != 0) & (particle_fragment >= 0)
+        unsupported_particle = valid_support_particle.copy()
+        unsupported_particle[valid_support_particle] = ~self.fragment_support_host[
+            particle_fragment[valid_support_particle]
+        ].astype(bool)
+        unsupported_volume = np.bincount(
+            building_host[unsupported_particle],
+            weights=volume_host[unsupported_particle].astype(np.float64, copy=False),
+            minlength=max(1, self.building_count),
+        ) if np.any(unsupported_particle) else np.zeros(max(1, self.building_count))
+        building_gravity_fraction = np.divide(
+            unsupported_volume, np.maximum(building_volume, 1.0e-6)
         )
         result["collapse_gravity_buildings"] = int(np.count_nonzero(building_gravity_fraction > 0.0))
         result["structural_collapse_gravity_max"] = float(
             np.max(building_gravity_fraction) if len(building_gravity_fraction) else 0.0
+        )
+        result["unsupported_fragments"] = int(
+            np.count_nonzero(self.fragment_support_host < 0.5)
+        )
+        result["support_graph_edges"] = int(len(self.fragment_edge_intact_host))
+        result["support_graph_intact_edges"] = int(
+            np.count_nonzero(self.fragment_edge_intact_host)
         )
         result["cohesive_fragments"] = self.fragment_count
         damage_host = self.arrays["damage"][:len(self.fragment_host)].numpy()
@@ -1468,6 +1539,21 @@ class HybridDelugeSolver(DelugeSolver):
             wp.launch(
                 remap_particle_indices, dim=len(renderer.anchor),
                 inputs=[renderer.anchor, self.return_keep, self.return_offsets], device=self.device,
+            )
+        # Shallow-water return compacts the shared particle arrays. Structural
+        # particles are retained, but their indices shift when earlier fluid
+        # entries are removed; keep the sparse load-path boundary samples in
+        # the same index space as the solver and facade anchors.
+        graph = self.fragment_support_graph
+        if len(graph.sample_pairs):
+            old_to_new = self.return_offsets[:old_count].numpy().astype(np.int32, copy=False)
+            remapped_pairs = old_to_new[graph.sample_pairs]
+            self.fragment_support_graph = FragmentSupportGraph(
+                graph.edge_fragments,
+                graph.sample_offsets,
+                remapped_pairs,
+                graph.sample_rest_length,
+                graph.anchored_fragments,
             )
 
     def _merge_sph_interface_particles(self):

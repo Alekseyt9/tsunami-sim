@@ -63,6 +63,14 @@
     "maximum_activation_elevation": 8.0,
     "activation_required_seconds": 0.02,
     "activation_exposure_decay_multiplier": 4.0,
+    "support_graph": {
+      "enabled": true,
+      "update_every_frames": 1,
+      "maximum_samples_per_edge": 12,
+      "intact_damage_threshold": 0.95,
+      "maximum_bond_stretch": 1.6,
+      "minimum_intact_sample_fraction": 0.25
+    },
     "solid_refinement": {
       "enabled": true,
       "start_coarse": true,
