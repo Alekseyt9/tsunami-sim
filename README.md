@@ -128,13 +128,13 @@ Detached calm fragments can become rigid clusters. Their mass, center of mass, i
 Run the complete CUDA regression batch:
 
 ```bat
-validate_v3_gpu.bat
+validation\validate_v3_gpu.bat
 ```
 
 Validate a completed 100-frame production directory:
 
 ```bat
-.venv\Scripts\python.exe validate_production_output.py outputs\your_run --expected-frames 100
+.venv\Scripts\python.exe validation\validate_production_output.py outputs\your_run --expected-frames 100
 ```
 
 It covers:
@@ -155,11 +155,11 @@ It covers:
 - `deluge_v3.py` — V3 orchestration, checkpoints, surface reconstruction, and simulation loop integration.
 - `solver_base.py` — shared particle solver and output loop in the standalone repository.
 - `shallow_water.py` — GPU shallow-water solver and conservative SPH interface coupling.
-- `validate_production_output.py` — MP4, water-balance, late-mesh, and metric validation.
+- `validation\validate_production_output.py` — MP4, water-balance, late-mesh, and metric validation.
 - `assemble_resumed_run.py` — lossless MP4 and metric assembly for checkpoint-resumed runs.
-- `validate_shallow_return.py` — end-to-end return-flow, compaction, and facade-anchor validation.
-- `validate_fragment_scale.py` — apartment-scale anti-dust fragment validation.
-- `validate_structural_hierarchy.py` — CUDA fracture-resistance hierarchy validation.
+- `validation\validate_shallow_return.py` — end-to-end return-flow, compaction, and facade-anchor validation.
+- `validation\validate_fragment_scale.py` — apartment-scale anti-dust fragment validation.
+- `validation\validate_structural_hierarchy.py` — CUDA fracture-resistance hierarchy validation.
 - `profile_v3_kernels.py` — per-kernel CUDA timing at a fresh scene or checkpoint.
 - `hybrid_kernels.py` — structural LOD, fracture, multirate, rigid-body, contact, and facade CUDA kernels.
 - `hybrid_model.py` — cohesive fragments, refinement axes, and facade generation.
@@ -184,7 +184,7 @@ The first V3.8 full-run review found a non-physical WCSPH tail: checkpoint 144 c
 
 Building activation now requires at least 12 lower-facade samples (rest elevation at most 8 m) to carry a +Z load above 5 m/s2 for 0.02 continuous seconds. Exposure decays four times faster when the load disappears. High, lateral, reverse, or momentary splash impacts no longer unlock the complete deformable building graph.
 
-In the clean 60-frame / 2.5-second impact validation, the first row activated at 0.875 s, with zero active buildings and zero damage beforehand. The second and third rows remained dormant. Peak water height was 22.01 m; the final 99th and 99.9th percentiles were 15.36 m and 17.03 m, and no water particle exceeded 30 m. `validate_impact_gates.py` covers the CUDA speed and sustained-load gates.
+In the clean 60-frame / 2.5-second impact validation, the first row activated at 0.875 s, with zero active buildings and zero damage beforehand. The second and third rows remained dormant. Peak water height was 22.01 m; the final 99th and 99.9th percentiles were 15.36 m and 17.03 m, and no water particle exceeded 30 m. `validation\validate_impact_gates.py` covers the CUDA speed and sustained-load gates.
 
 ## V3.10 architectural fracture and volume diagnostics
 
