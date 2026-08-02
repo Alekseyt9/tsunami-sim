@@ -23,6 +23,50 @@ class RigidClusterFit:
     internal_velocity_rms: float
 
 
+@dataclass(frozen=True)
+class RigidCollisionProxy:
+    """Body-local convex OBB enclosing the fragment's physical samples."""
+
+    local_center: np.ndarray
+    half_extent: np.ndarray
+    material: int
+
+
+def fit_rigid_collision_proxy(
+    local_positions: np.ndarray,
+    radius: np.ndarray,
+    material: np.ndarray,
+    mass: np.ndarray | None = None,
+    padding_scale: float = 1.0,
+) -> RigidCollisionProxy:
+    """Fit the eight-vertex convex proxy used after rigid conversion.
+
+    The box lives in the fitted body's local coordinates, so later rotation is
+    exact. Particle radii are included in the envelope; the underlying samples
+    remain present for water/deformable coupling and reactivation fallback.
+    """
+    local = np.asarray(local_positions, dtype=np.float64)
+    radius = np.asarray(radius, dtype=np.float64)
+    material = np.asarray(material, dtype=np.int32)
+    if len(local) == 0 or len(radius) != len(local) or len(material) != len(local):
+        raise ValueError("collision proxy needs equally sized non-empty particle arrays")
+    padding = max(float(np.median(radius)) * float(padding_scale), 1.0e-4)
+    lower = np.min(local, axis=0) - padding
+    upper = np.max(local, axis=0) + padding
+    local_center = 0.5 * (lower + upper)
+    half_extent = np.maximum(0.5 * (upper - lower), padding)
+    weights = np.ones(len(material), dtype=np.float64) if mass is None else np.asarray(mass, dtype=np.float64)
+    if len(weights) != len(material):
+        raise ValueError("collision proxy material weights must match the particle arrays")
+    maximum_material = max(3, int(np.max(material)))
+    dominant = int(np.argmax(np.bincount(material, weights=weights, minlength=maximum_material + 1)))
+    return RigidCollisionProxy(
+        local_center=local_center.astype(np.float32),
+        half_extent=half_extent.astype(np.float32),
+        material=dominant,
+    )
+
+
 def fit_rigid_cluster(position: np.ndarray, velocity: np.ndarray, mass: np.ndarray) -> RigidClusterFit:
     """Fit the momentum-equivalent rigid motion of one particle cluster."""
     x = np.asarray(position, dtype=np.float64)

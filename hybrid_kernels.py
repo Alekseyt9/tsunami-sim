@@ -309,6 +309,7 @@ def compute_clustered_solid_forces(
     building_structural_volume: wp.array(dtype=float),
     fragment_id: wp.array(dtype=wp.int32),
     rigid_state: wp.array(dtype=wp.int32),
+    proxy_enabled: wp.array(dtype=wp.int32),
     fragment_support: wp.array(dtype=float),
     impact_impulse: wp.array(dtype=float),
     fixed: wp.array(dtype=wp.int32),
@@ -561,28 +562,29 @@ def accumulate_rigid_body_loads(
     # Penalty contacts are accumulated at the actual sample locations, so bed
     # and domain collisions produce both translation and physically useful
     # torque instead of clamping every particle independently.
-    penetration = particle_radius - xi[1]
-    if penetration > 0.0:
-        force += wp.vec3(
-            -vi[0] * boundary_damping * 0.12,
-            penetration * boundary_stiffness - wp.min(vi[1], 0.0) * boundary_damping,
-            -vi[2] * boundary_damping * 0.12,
-        )
-    if xi[0] - particle_radius < -x_bound:
-        depth = -x_bound - (xi[0] - particle_radius)
-        force += wp.vec3(depth * boundary_stiffness - wp.min(vi[0], 0.0) * boundary_damping, 0.0, 0.0)
-    if xi[0] + particle_radius > x_bound:
-        depth = xi[0] + particle_radius - x_bound
-        force += wp.vec3(-depth * boundary_stiffness - wp.max(vi[0], 0.0) * boundary_damping, 0.0, 0.0)
-    if xi[2] - particle_radius < z_min:
-        depth = z_min - (xi[2] - particle_radius)
-        force += wp.vec3(0.0, 0.0, depth * boundary_stiffness - wp.min(vi[2], 0.0) * boundary_damping)
-    if xi[2] + particle_radius > z_max:
-        depth = xi[2] + particle_radius - z_max
-        force += wp.vec3(0.0, 0.0, -depth * boundary_stiffness - wp.max(vi[2], 0.0) * boundary_damping)
-    if xi[1] + particle_radius > y_max:
-        depth = xi[1] + particle_radius - y_max
-        force += wp.vec3(0.0, -depth * boundary_stiffness - wp.max(vi[1], 0.0) * boundary_damping, 0.0)
+    if proxy_enabled[fid] == 0:
+        penetration = particle_radius - xi[1]
+        if penetration > 0.0:
+            force += wp.vec3(
+                -vi[0] * boundary_damping * 0.12,
+                penetration * boundary_stiffness - wp.min(vi[1], 0.0) * boundary_damping,
+                -vi[2] * boundary_damping * 0.12,
+            )
+        if xi[0] - particle_radius < -x_bound:
+            depth = -x_bound - (xi[0] - particle_radius)
+            force += wp.vec3(depth * boundary_stiffness - wp.min(vi[0], 0.0) * boundary_damping, 0.0, 0.0)
+        if xi[0] + particle_radius > x_bound:
+            depth = xi[0] + particle_radius - x_bound
+            force += wp.vec3(-depth * boundary_stiffness - wp.max(vi[0], 0.0) * boundary_damping, 0.0, 0.0)
+        if xi[2] - particle_radius < z_min:
+            depth = z_min - (xi[2] - particle_radius)
+            force += wp.vec3(0.0, 0.0, depth * boundary_stiffness - wp.min(vi[2], 0.0) * boundary_damping)
+        if xi[2] + particle_radius > z_max:
+            depth = xi[2] + particle_radius - z_max
+            force += wp.vec3(0.0, 0.0, -depth * boundary_stiffness - wp.max(vi[2], 0.0) * boundary_damping)
+        if xi[1] + particle_radius > y_max:
+            depth = xi[1] + particle_radius - y_max
+            force += wp.vec3(0.0, -depth * boundary_stiffness - wp.max(vi[1], 0.0) * boundary_damping, 0.0)
 
     torque = wp.cross(xi - body_center[fid], force)
     for axis in range(3):
@@ -608,6 +610,257 @@ def contact_stiffness(material: int) -> float:
     return 4.0e6
 
 
+@wp.func
+def proxy_axis(orientation: wp.quat, axis: int) -> wp.vec3:
+    if axis == 0:
+        return wp.quat_rotate(orientation, wp.vec3(1.0, 0.0, 0.0))
+    if axis == 1:
+        return wp.quat_rotate(orientation, wp.vec3(0.0, 1.0, 0.0))
+    return wp.quat_rotate(orientation, wp.vec3(0.0, 0.0, 1.0))
+
+
+@wp.func
+def proxy_projection_radius(
+    axis: wp.vec3,
+    orientation: wp.quat,
+    half_extent: wp.vec3,
+) -> float:
+    return (
+        wp.abs(wp.dot(axis, proxy_axis(orientation, 0))) * half_extent[0]
+        + wp.abs(wp.dot(axis, proxy_axis(orientation, 1))) * half_extent[1]
+        + wp.abs(wp.dot(axis, proxy_axis(orientation, 2))) * half_extent[2]
+    )
+
+
+@wp.func
+def proxy_support_point(
+    center: wp.vec3,
+    orientation: wp.quat,
+    half_extent: wp.vec3,
+    direction: wp.vec3,
+) -> wp.vec3:
+    result = center
+    for axis in range(3):
+        basis = proxy_axis(orientation, axis)
+        sign = -1.0
+        if wp.dot(direction, basis) >= 0.0:
+            sign = 1.0
+        result += basis * (sign * half_extent[axis])
+    return result
+
+
+@wp.func
+def proxy_sat_contact(
+    center_a: wp.vec3,
+    orientation_a: wp.quat,
+    extent_a: wp.vec3,
+    center_b: wp.vec3,
+    orientation_b: wp.quat,
+    extent_b: wp.vec3,
+) -> wp.vec4:
+    """Minimum-translation axis and penetration for two convex OBBs."""
+    delta = center_b - center_a
+    minimum_overlap = 1.0e9
+    minimum_axis = wp.vec3(1.0, 0.0, 0.0)
+    for source in range(2):
+        for index in range(3):
+            axis = proxy_axis(orientation_a, index)
+            if source == 1:
+                axis = proxy_axis(orientation_b, index)
+            ra = proxy_projection_radius(axis, orientation_a, extent_a)
+            rb = proxy_projection_radius(axis, orientation_b, extent_b)
+            overlap = ra + rb - wp.abs(wp.dot(delta, axis))
+            if overlap <= 0.0:
+                return wp.vec4(0.0, 0.0, 0.0, 0.0)
+            if overlap < minimum_overlap:
+                if wp.dot(delta, axis) < 0.0:
+                    axis = -axis
+                minimum_overlap = overlap
+                minimum_axis = axis
+    for axis_a in range(3):
+        for axis_b in range(3):
+            axis = wp.cross(
+                proxy_axis(orientation_a, axis_a), proxy_axis(orientation_b, axis_b)
+            )
+            axis_length = wp.length(axis)
+            if axis_length > 1.0e-5:
+                axis /= axis_length
+                ra = proxy_projection_radius(axis, orientation_a, extent_a)
+                rb = proxy_projection_radius(axis, orientation_b, extent_b)
+                overlap = ra + rb - wp.abs(wp.dot(delta, axis))
+                if overlap <= 0.0:
+                    return wp.vec4(0.0, 0.0, 0.0, 0.0)
+                if overlap < minimum_overlap:
+                    if wp.dot(delta, axis) < 0.0:
+                        axis = -axis
+                    minimum_overlap = overlap
+                    minimum_axis = axis
+    return wp.vec4(minimum_axis[0], minimum_axis[1], minimum_axis[2], minimum_overlap)
+
+
+@wp.kernel
+def accumulate_rigid_proxy_contacts(
+    pair_left: wp.array(dtype=wp.int32),
+    pair_right: wp.array(dtype=wp.int32),
+    rigid_state: wp.array(dtype=wp.int32),
+    proxy_enabled: wp.array(dtype=wp.int32),
+    proxy_local_center: wp.array(dtype=wp.vec3),
+    proxy_half_extent: wp.array(dtype=wp.vec3),
+    proxy_material: wp.array(dtype=wp.int32),
+    body_center: wp.array(dtype=wp.vec3),
+    body_orientation: wp.array(dtype=wp.quat),
+    body_linear_velocity: wp.array(dtype=wp.vec3),
+    body_angular_velocity: wp.array(dtype=wp.vec3),
+    body_mass: wp.array(dtype=float),
+    body_force: wp.array2d(dtype=float),
+    body_torque: wp.array2d(dtype=float),
+    contact_acceleration_peak: wp.array(dtype=float),
+    normal_damping: float,
+    tangential_damping: float,
+    maximum_penetration: float,
+):
+    pair = wp.tid()
+    left = pair_left[pair]
+    right = pair_right[pair]
+    if (
+        rigid_state[left] == 0 or rigid_state[right] == 0
+        or proxy_enabled[left] == 0 or proxy_enabled[right] == 0
+    ):
+        return
+    orientation_left = body_orientation[left]
+    orientation_right = body_orientation[right]
+    center_left = body_center[left] + wp.quat_rotate(
+        orientation_left, proxy_local_center[left]
+    )
+    center_right = body_center[right] + wp.quat_rotate(
+        orientation_right, proxy_local_center[right]
+    )
+    contact = proxy_sat_contact(
+        center_left, orientation_left, proxy_half_extent[left],
+        center_right, orientation_right, proxy_half_extent[right],
+    )
+    if contact[3] <= 0.0:
+        return
+    normal = wp.vec3(contact[0], contact[1], contact[2])
+    point_left = proxy_support_point(
+        center_left, orientation_left, proxy_half_extent[left], normal
+    )
+    point_right = proxy_support_point(
+        center_right, orientation_right, proxy_half_extent[right], -normal
+    )
+    point = (point_left + point_right) * 0.5
+    arm_left = point - body_center[left]
+    arm_right = point - body_center[right]
+    velocity_left = body_linear_velocity[left] + wp.cross(body_angular_velocity[left], arm_left)
+    velocity_right = body_linear_velocity[right] + wp.cross(body_angular_velocity[right], arm_right)
+    relative = velocity_right - velocity_left
+    normal_speed = wp.dot(relative, normal)
+    stiffness = wp.min(
+        contact_stiffness(proxy_material[left]), contact_stiffness(proxy_material[right])
+    )
+    penetration = wp.min(contact[3], maximum_penetration)
+    normal_magnitude = stiffness * penetration + normal_damping * wp.max(-normal_speed, 0.0)
+    normal_magnitude = wp.max(normal_magnitude, 0.0)
+    tangent_velocity = relative - normal * normal_speed
+    tangent_speed = wp.length(tangent_velocity)
+    friction_force = wp.vec3(0.0)
+    if tangent_speed > 1.0e-5:
+        friction = wp.min(
+            contact_friction(proxy_material[left]), contact_friction(proxy_material[right])
+        )
+        friction_magnitude = wp.min(
+            friction * normal_magnitude, tangential_damping * tangent_speed
+        )
+        friction_force = tangent_velocity * (friction_magnitude / tangent_speed)
+    force_left = -normal * normal_magnitude + friction_force
+    force_right = -force_left
+    torque_left = wp.cross(arm_left, force_left)
+    torque_right = wp.cross(arm_right, force_right)
+    for axis in range(3):
+        wp.atomic_add(body_force, left, axis, force_left[axis])
+        wp.atomic_add(body_force, right, axis, force_right[axis])
+        wp.atomic_add(body_torque, left, axis, torque_left[axis])
+        wp.atomic_add(body_torque, right, axis, torque_right[axis])
+    wp.atomic_max(
+        contact_acceleration_peak, left, normal_magnitude / wp.max(body_mass[left], 1.0)
+    )
+    wp.atomic_max(
+        contact_acceleration_peak, right, normal_magnitude / wp.max(body_mass[right], 1.0)
+    )
+
+
+@wp.kernel
+def accumulate_rigid_proxy_boundaries(
+    rigid_state: wp.array(dtype=wp.int32),
+    proxy_enabled: wp.array(dtype=wp.int32),
+    proxy_local_center: wp.array(dtype=wp.vec3),
+    proxy_half_extent: wp.array(dtype=wp.vec3),
+    proxy_material: wp.array(dtype=wp.int32),
+    body_center: wp.array(dtype=wp.vec3),
+    body_orientation: wp.array(dtype=wp.quat),
+    body_linear_velocity: wp.array(dtype=wp.vec3),
+    body_angular_velocity: wp.array(dtype=wp.vec3),
+    body_force: wp.array2d(dtype=float),
+    body_torque: wp.array2d(dtype=float),
+    x_bound: float,
+    z_min: float,
+    z_max: float,
+    y_max: float,
+    stiffness: float,
+    normal_damping: float,
+    tangential_damping: float,
+    maximum_penetration: float,
+):
+    body = wp.tid()
+    if rigid_state[body] == 0 or proxy_enabled[body] == 0:
+        return
+    orientation = body_orientation[body]
+    center = body_center[body] + wp.quat_rotate(
+        orientation, proxy_local_center[body]
+    )
+    extent = proxy_half_extent[body]
+    for plane in range(6):
+        normal = wp.vec3(0.0, 1.0, 0.0)
+        offset = 0.0
+        if plane == 1:
+            normal = wp.vec3(1.0, 0.0, 0.0); offset = -x_bound
+        elif plane == 2:
+            normal = wp.vec3(-1.0, 0.0, 0.0); offset = -x_bound
+        elif plane == 3:
+            normal = wp.vec3(0.0, 0.0, 1.0); offset = z_min
+        elif plane == 4:
+            normal = wp.vec3(0.0, 0.0, -1.0); offset = -z_max
+        elif plane == 5:
+            normal = wp.vec3(0.0, -1.0, 0.0); offset = -y_max
+        projection = proxy_projection_radius(normal, orientation, extent)
+        penetration = offset - (wp.dot(center, normal) - projection)
+        if penetration > 0.0:
+            point = proxy_support_point(center, orientation, extent, -normal)
+            arm = point - body_center[body]
+            point_velocity = body_linear_velocity[body] + wp.cross(
+                body_angular_velocity[body], arm
+            )
+            normal_speed = wp.dot(point_velocity, normal)
+            normal_magnitude = (
+                stiffness * wp.min(penetration, maximum_penetration)
+                + normal_damping * wp.max(-normal_speed, 0.0)
+            )
+            tangent_velocity = point_velocity - normal * normal_speed
+            tangent_speed = wp.length(tangent_velocity)
+            friction_force = wp.vec3(0.0)
+            if tangent_speed > 1.0e-5:
+                friction_magnitude = wp.min(
+                    contact_friction(proxy_material[body]) * normal_magnitude,
+                    tangential_damping * tangent_speed,
+                )
+                friction_force = -tangent_velocity * (friction_magnitude / tangent_speed)
+            force = normal * normal_magnitude + friction_force
+            torque = wp.cross(arm, force)
+            for axis in range(3):
+                wp.atomic_add(body_force, body, axis, force[axis])
+                wp.atomic_add(body_torque, body, axis, torque[axis])
+
+
 @wp.kernel
 def accumulate_rigid_contacts(
     grid: wp.uint64,
@@ -618,6 +871,7 @@ def accumulate_rigid_contacts(
     material: wp.array(dtype=wp.int32),
     fragment_id: wp.array(dtype=wp.int32),
     rigid_state: wp.array(dtype=wp.int32),
+    proxy_enabled: wp.array(dtype=wp.int32),
     body_center: wp.array(dtype=wp.vec3),
     body_mass: wp.array(dtype=float),
     body_force: wp.array2d(dtype=float),
@@ -638,6 +892,8 @@ def accumulate_rigid_contacts(
     for j in query:
         other = fragment_id[j]
         if j <= i or kind[j] == 0 or other < 0 or other == fid or rigid_state[other] == 0:
+            continue
+        if proxy_enabled[fid] != 0 and proxy_enabled[other] != 0:
             continue
         delta = x[j] - xi
         distance = wp.length(delta)
@@ -1161,6 +1417,66 @@ def facade_material_color(code: int) -> wp.vec3:
     return base
 
 
+@wp.func
+def facade_hash01(panel: int, salt: int) -> float:
+    value = wp.sin(float(panel * 37 + salt * 101) * 12.9898) * 43758.5453
+    return value - wp.floor(value)
+
+
+@wp.func
+def facade_segment_distance(uv: wp.vec2, start: wp.vec2, end: wp.vec2) -> float:
+    segment = end - start
+    amount = wp.clamp(wp.dot(uv - start, segment) / wp.max(wp.dot(segment, segment), 1.0e-8), 0.0, 1.0)
+    return wp.length(uv - (start + segment * amount))
+
+
+@wp.func
+def facade_crack_mask(panel: int, uv: wp.vec2, damage: float, material: int) -> float:
+    family = material // 10
+    threshold = 0.08
+    if family == 2:  # brittle facade glass
+        threshold = 0.012
+    elif family == 3:  # floor/roof plates
+        threshold = 0.12
+    if damage <= threshold:
+        return 0.0
+    intensity = wp.clamp((damage - threshold) / wp.max(0.62 - threshold, 1.0e-5), 0.0, 1.0)
+    seed = wp.vec2(
+        0.34 + 0.32 * facade_hash01(panel, 1),
+        0.34 + 0.32 * facade_hash01(panel, 2),
+    )
+    phase = facade_hash01(panel, 3) * 6.2831853
+    minimum_distance = 10.0
+    for ray in range(4):
+        # Two hairline rays appear first. Additional rays and branches are
+        # admitted gradually, which avoids a repeated four-point star on every
+        # damaged panel while keeping the pattern deterministic per panel.
+        ray_visible = ray < 2
+        if ray == 2 and intensity > 0.16 + 0.22 * facade_hash01(panel, 31):
+            ray_visible = True
+        if ray == 3 and intensity > 0.42 + 0.30 * facade_hash01(panel, 37):
+            ray_visible = True
+        if ray_visible:
+            angle = phase + float(ray) * 1.5707963 + (facade_hash01(panel, ray + 7) - 0.5) * 0.72
+            direction = wp.vec2(wp.cos(angle), wp.sin(angle))
+            endpoint = seed + direction * (0.72 + 0.50 * facade_hash01(panel, ray + 41))
+            minimum_distance = wp.min(minimum_distance, facade_segment_distance(uv, seed, endpoint))
+            if intensity > 0.13 + 0.32 * facade_hash01(panel, ray + 47):
+                branch_start = seed + direction * (0.28 + 0.24 * facade_hash01(panel, ray + 13))
+                branch_angle = angle + (facade_hash01(panel, ray + 19) - 0.5) * 1.45
+                branch_end = branch_start + wp.vec2(wp.cos(branch_angle), wp.sin(branch_angle)) * 0.38
+                minimum_distance = wp.min(
+                    minimum_distance, facade_segment_distance(uv, branch_start, branch_end)
+                )
+    width = 0.003 + 0.006 * intensity
+    line = wp.clamp((width * 2.0 - minimum_distance) / wp.max(width, 1.0e-5), 0.0, 1.0)
+    if damage > 0.55:
+        chip_radius = 0.025 + 0.055 * wp.clamp((damage - 0.55) / 0.45, 0.0, 1.0)
+        chip = wp.clamp((chip_radius - wp.length(uv - seed)) / wp.max(chip_radius * 0.35, 1.0e-5), 0.0, 1.0)
+        line = wp.max(line, chip)
+    return line * (0.30 + 0.70 * intensity)
+
+
 @wp.kernel
 def raster_facade_color(
     vertex: wp.array(dtype=wp.vec3),
@@ -1171,6 +1487,7 @@ def raster_facade_color(
     owner_fragment: wp.array(dtype=wp.int32),
     fragment_support: wp.array(dtype=float),
     particle_damage: wp.array(dtype=float),
+    fragment_fracture_energy: wp.array(dtype=float),
     depth: wp.array(dtype=float),
     color: wp.array(dtype=wp.vec3),
     cam: wp.vec3,
@@ -1181,6 +1498,7 @@ def raster_facade_color(
     width: int,
     height: int,
     maximum_stretch: float,
+    crack_strength: float,
 ):
     triangle = wp.tid()
     panel = triangle // 2
@@ -1212,15 +1530,30 @@ def raster_facade_color(
     normal = wp.normalize(wp.cross(world_b - world_a, world_c - world_a))
     light = 0.34 + 0.66 * wp.abs(wp.dot(normal, wp.normalize(wp.vec3(-0.35, 0.72, -0.42))))
     anchor_base = panel * 4
-    panel_damage = 0.25 * (
-        particle_damage[anchor[anchor_base]] + particle_damage[anchor[anchor_base + 1]] +
-        particle_damage[anchor[anchor_base + 2]] + particle_damage[anchor[anchor_base + 3]]
-    )
+    damage_0 = particle_damage[anchor[anchor_base]]
+    damage_1 = particle_damage[anchor[anchor_base + 1]]
+    damage_2 = particle_damage[anchor[anchor_base + 2]]
+    damage_3 = particle_damage[anchor[anchor_base + 3]]
+    panel_damage = 0.25 * (damage_0 + damage_1 + damage_2 + damage_3)
+    crack_damage = wp.max(damage_0, wp.max(damage_1, wp.max(damage_2, damage_3)))
+    owner = owner_fragment[panel]
+    if owner >= 0:
+        # Boundary energy is irreversible and comes from the same sampled
+        # inter-fragment joints that determine structural support. Anchor
+        # damage remains useful for highly local glass and impact cracks.
+        crack_damage = wp.max(crack_damage, fragment_fracture_energy[owner])
     # Keep the building palette on detached panels.  Damage is expressed as
     # loss of brightness; exposed particle materials supply concrete/steel
     # contrast after the facade skin actually tears.
     base *= 1.0 - 0.32 * wp.clamp(panel_damage, 0.0, 1.0)
     base *= light
+    rest_a = rest_vertex[ids[0]]; rest_b = rest_vertex[ids[1]]; rest_c = rest_vertex[ids[2]]
+    panel_vertex = panel * 4
+    rest_origin = rest_vertex[panel_vertex]
+    rest_u = rest_vertex[panel_vertex + 3] - rest_origin
+    rest_v = rest_vertex[panel_vertex + 1] - rest_origin
+    rest_u_length2 = wp.max(wp.dot(rest_u, rest_u), 1.0e-8)
+    rest_v_length2 = wp.max(wp.dot(rest_v, rest_v), 1.0e-8)
     for py in range(min_y, max_y + 1):
         for px in range(min_x, max_x + 1):
             fx = float(px) + 0.5; fy = float(py) + 0.5
@@ -1231,7 +1564,23 @@ def raster_facade_color(
                 z = w0 * a[2] + w1 * b[2] + w2 * c[2]
                 index = py * width + px
                 if z <= depth[index] + 0.02:
-                    color[index] = base
+                    pixel_color = base
+                    if panel_mode[panel] == 0 and crack_strength > 0.0:
+                        rest_point = rest_a * w0 + rest_b * w1 + rest_c * w2
+                        relative = rest_point - rest_origin
+                        uv = wp.vec2(
+                            wp.dot(relative, rest_u) / rest_u_length2,
+                            wp.dot(relative, rest_v) / rest_v_length2,
+                        )
+                        crack = facade_crack_mask(
+                            panel, uv, crack_damage, material[panel]
+                        ) * crack_strength
+                        if material[panel] // 10 == 2:
+                            crack_color = wp.vec3(0.58, 0.78, 0.86) * light
+                            pixel_color = pixel_color * (1.0 - crack) + crack_color * crack
+                        else:
+                            pixel_color *= 1.0 - 0.82 * crack
+                    color[index] = pixel_color
 
 
 @wp.func

@@ -20,6 +20,7 @@ if not exist "%PYTHON_EXE%" (
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_fragment_scale.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_structural_hierarchy.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_support_graph.py" || exit /b 1
+"%PYTHON_EXE%" "%VALIDATION_DIR%validate_fracture_checkpoint.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_shallow_water.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_shallow_return.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_surface_reconstruction.py" || exit /b 1
@@ -27,6 +28,7 @@ if not exist "%PYTHON_EXE%" (
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_water_mesh_bounds.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_mesh_hysteresis.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_city_styles.py" || exit /b 1
+"%PYTHON_EXE%" "%VALIDATION_DIR%validate_crack_rendering.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_progressive_video.py" || exit /b 1
 echo All DELUGE V3 CUDA validations passed.
 endlocal

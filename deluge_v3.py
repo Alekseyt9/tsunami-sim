@@ -55,6 +55,7 @@ from hybrid_model import (  # noqa: E402
     build_fragment_ids,
     build_fragment_support_graph,
     build_refinement_axes,
+    evaluate_fragment_fracture_energy,
     evaluate_fragment_support,
     select_conservative_fluid_merges,
     write_facade_skin,
@@ -198,6 +199,10 @@ class HybridDelugeSolver(DelugeSolver):
         activation_exposure_host = np.zeros(max(1, self.building_count), dtype=np.float32)
         self.adaptive_merged_groups_total = 0
         self.adaptive_merged_particles_total = 0
+        saved_support_graph = None
+        saved_fragment_support = None
+        saved_edge_intact = None
+        saved_edge_fracture_energy = None
         v3_resume = self._v3_checkpoint_path(self.resume_path) if self.resume_path else None
         if v3_resume is not None and v3_resume.exists():
             with np.load(v3_resume, allow_pickle=False) as state:
@@ -251,6 +256,30 @@ class HybridDelugeSolver(DelugeSolver):
                     self.adaptive_merged_groups_total = int(state["adaptive_merged_groups_total"])
                 if "adaptive_merged_particles_total" in state:
                     self.adaptive_merged_particles_total = int(state["adaptive_merged_particles_total"])
+                support_keys = (
+                    "support_edge_fragments", "support_sample_offsets", "support_sample_pairs",
+                    "support_sample_rest_length", "support_anchored_fragments",
+                )
+                if all(name in state for name in support_keys):
+                    saved_support_graph = FragmentSupportGraph(
+                        state["support_edge_fragments"].astype(np.int32, copy=True),
+                        state["support_sample_offsets"].astype(np.int32, copy=True),
+                        state["support_sample_pairs"].astype(np.int32, copy=True),
+                        state["support_sample_rest_length"].astype(np.float32, copy=True),
+                        state["support_anchored_fragments"].astype(bool, copy=True),
+                    )
+                    if "fragment_support_state" in state:
+                        saved_fragment_support = state["fragment_support_state"].astype(
+                            np.float32, copy=True
+                        )
+                    if "support_edge_intact_state" in state:
+                        saved_edge_intact = state["support_edge_intact_state"].astype(
+                            bool, copy=True
+                        )
+                    if "support_edge_fracture_energy" in state:
+                        saved_edge_fracture_energy = state[
+                            "support_edge_fracture_energy"
+                        ].astype(np.float32, copy=True)
             print(f"V3 state restored from {v3_resume.name}")
         else:
             for bid in self.v3_cfg.get("initially_active_buildings", []):
@@ -268,17 +297,58 @@ class HybridDelugeSolver(DelugeSolver):
         )
         support_policy = self.v3_cfg.get("support_graph", {})
         radius_host = self.arrays["radius"][:self.count].numpy()
-        self.fragment_support_graph = build_fragment_support_graph(
-            rest_host, radius_host, kind_host, building_host, base_host[:self.count],
-            self.fragment_host,
-            int(support_policy.get("maximum_samples_per_edge", 12)),
-        )
-        self.fragment_support_host = np.ones(self.fragment_count, dtype=np.float32)
-        self.fragment_edge_intact_host = np.ones(
-            len(self.fragment_support_graph.edge_fragments), dtype=bool
-        )
+        if saved_support_graph is not None:
+            self.fragment_support_graph = saved_support_graph
+            self.fragment_support_host = (
+                saved_fragment_support
+                if saved_fragment_support is not None
+                else np.ones(self.fragment_count, dtype=np.float32)
+            )
+            self.fragment_edge_intact_host = (
+                saved_edge_intact
+                if saved_edge_intact is not None
+                else np.ones(len(saved_support_graph.edge_fragments), dtype=bool)
+            )
+            self.fragment_edge_fracture_energy_host = (
+                saved_edge_fracture_energy
+                if saved_edge_fracture_energy is not None
+                and len(saved_edge_fracture_energy) == len(saved_support_graph.edge_fragments)
+                else np.zeros(len(saved_support_graph.edge_fragments), dtype=np.float32)
+            )
+            print(
+                f"V3 support graph restored: {len(saved_support_graph.edge_fragments):,} edges / "
+                f"{len(saved_support_graph.sample_pairs):,} boundary samples"
+            )
+        else:
+            self.fragment_support_graph = build_fragment_support_graph(
+                rest_host, radius_host, kind_host, building_host, base_host[:self.count],
+                self.fragment_host,
+                int(support_policy.get("maximum_samples_per_edge", 12)),
+            )
+            self.fragment_support_host = np.ones(self.fragment_count, dtype=np.float32)
+            self.fragment_edge_intact_host = np.ones(
+                len(self.fragment_support_graph.edge_fragments), dtype=bool
+            )
+            self.fragment_edge_fracture_energy_host = np.zeros(
+                len(self.fragment_support_graph.edge_fragments), dtype=np.float32
+            )
+        self.fragment_fracture_energy_host = np.zeros(self.fragment_count, dtype=np.float32)
+        if len(self.fragment_support_graph.edge_fragments):
+            np.maximum.at(
+                self.fragment_fracture_energy_host,
+                self.fragment_support_graph.edge_fragments[:, 0],
+                self.fragment_edge_fracture_energy_host,
+            )
+            np.maximum.at(
+                self.fragment_fracture_energy_host,
+                self.fragment_support_graph.edge_fragments[:, 1],
+                self.fragment_edge_fracture_energy_host,
+            )
         self.fragment_support = wp.array(
             self.fragment_support_host, dtype=float, device=self.device
+        )
+        self.fragment_fracture_energy = wp.array(
+            self.fragment_fracture_energy_host, dtype=float, device=self.device
         )
         self.fragment_building_host = np.full(self.fragment_count, -1, dtype=np.int32)
         valid_fragment_particles = np.flatnonzero(self.fragment_host >= 0)
@@ -326,6 +396,8 @@ class HybridDelugeSolver(DelugeSolver):
         self._update_fragment_support_graph(
             self.arrays["x"][:self.count].numpy(),
             self.arrays["damage"][:self.count].numpy(),
+            self.arrays["material"][:self.count].numpy(),
+            structural_class_host,
             force=True,
         )
 
@@ -352,10 +424,15 @@ class HybridDelugeSolver(DelugeSolver):
                 float(render.get("maximum_panel_stretch", 1.8)),
                 float(self.v3_cfg.get("water_surface", {}).get("tangent_scale", 2.8)),
                 float(self.v3_cfg.get("water_surface", {}).get("normal_scale", 2.45)),
+                float(self.v3_cfg.get("crack_rendering", {}).get("strength", 1.0))
+                if bool(self.v3_cfg.get("crack_rendering", {}).get("enabled", True)) else 0.0,
             )
             for name, camera in configured_views.items()
         }
         self.renderer = next(iter(self.renderers.values()))
+        for renderer in self.renderers.values():
+            renderer.fragment_support = self.fragment_support
+            renderer.fragment_fracture_energy = self.fragment_fracture_energy
         dormant_count = self.building_count - int(np.count_nonzero(active_host))
         smallest = int(fragment_counts.min()) if len(fragment_counts) else 0
         largest = int(fragment_counts.max()) if len(fragment_counts) else 0
@@ -366,7 +443,12 @@ class HybridDelugeSolver(DelugeSolver):
         )
 
     def _update_fragment_support_graph(
-        self, position_host: np.ndarray, damage_host: np.ndarray, force: bool = False
+        self,
+        position_host: np.ndarray,
+        damage_host: np.ndarray,
+        material_host: np.ndarray | None = None,
+        structural_class_host: np.ndarray | None = None,
+        force: bool = False,
     ) -> None:
         policy = self.v3_cfg.get("support_graph", {})
         if not bool(policy.get("enabled", True)) or self.fragment_count == 0:
@@ -385,8 +467,35 @@ class HybridDelugeSolver(DelugeSolver):
         )
         self.fragment_support_host = support.astype(np.float32, copy=False)
         self.fragment_edge_intact_host = intact_edges
+        if material_host is None:
+            material_host = self.arrays["material"][:self.count].numpy()
+        if structural_class_host is None:
+            structural_class_host = self.arrays["structural_class"][:self.count].numpy()
+        edge_energy, fragment_energy = evaluate_fragment_fracture_energy(
+            self.fragment_support_graph,
+            position_host,
+            damage_host,
+            material_host,
+            structural_class_host,
+            self.fragment_edge_fracture_energy_host,
+            float(self.v3_cfg.get("crack_rendering", {}).get("fracture_energy_onset", 0.35)),
+        )
+        edge_energy[~intact_edges] = 1.0
+        if len(edge_energy):
+            fragment_energy.fill(0.0)
+            np.maximum.at(
+                fragment_energy, self.fragment_support_graph.edge_fragments[:, 0], edge_energy
+            )
+            np.maximum.at(
+                fragment_energy, self.fragment_support_graph.edge_fragments[:, 1], edge_energy
+            )
+        self.fragment_edge_fracture_energy_host = edge_energy
+        self.fragment_fracture_energy_host = fragment_energy
         self.fragment_support = wp.array(
             self.fragment_support_host, dtype=float, device=self.device
+        )
+        self.fragment_fracture_energy = wp.array(
+            self.fragment_fracture_energy_host, dtype=float, device=self.device
         )
         unsupported = int(np.count_nonzero(~support))
         if unsupported != self.last_unsupported_fragment_count:
@@ -801,6 +910,15 @@ class HybridDelugeSolver(DelugeSolver):
             local_impact_active=self.arrays["local_impact_active"][:self.count].numpy(),
             adaptive_merged_groups_total=np.int64(self.adaptive_merged_groups_total),
             adaptive_merged_particles_total=np.int64(self.adaptive_merged_particles_total),
+            support_edge_fragments=self.fragment_support_graph.edge_fragments,
+            support_sample_offsets=self.fragment_support_graph.sample_offsets,
+            support_sample_pairs=self.fragment_support_graph.sample_pairs,
+            support_sample_rest_length=self.fragment_support_graph.sample_rest_length,
+            support_anchored_fragments=self.fragment_support_graph.anchored_fragments,
+            fragment_support_state=self.fragment_support_host,
+            support_edge_intact_state=self.fragment_edge_intact_host,
+            support_edge_fracture_energy=self.fragment_edge_fracture_energy_host,
+            fragment_fracture_energy_state=self.fragment_fracture_energy_host,
             fragment_id=self.fragment_id[:self.count].numpy(),
             normal_axis=self.normal_axis[:self.count].numpy(),
             rigid_state=self.rigid_state.numpy(),
@@ -1341,9 +1459,13 @@ class HybridDelugeSolver(DelugeSolver):
         result["material_impact_impulse_max_m_s"] = float(
             np.max(impact_values[kind_host != 0]) if np.any(kind_host != 0) else 0.0
         )
-        self._update_fragment_support_graph(position_host, damage_values)
+        material_host = self.arrays["material"][:self.count].numpy()
+        self._update_fragment_support_graph(
+            position_host, damage_values, material_host, structural_role
+        )
         for renderer in self.renderers.values():
             renderer.fragment_support = self.fragment_support
+            renderer.fragment_fracture_energy = self.fragment_fracture_energy
         damaged_mask = damage_values > 0.05
         for role, role_name in (
             (1, "slab"), (2, "wall"), (3, "beam"), (4, "column"), (5, "core"), (6, "glass")
@@ -1392,6 +1514,13 @@ class HybridDelugeSolver(DelugeSolver):
         result["support_graph_edges"] = int(len(self.fragment_edge_intact_host))
         result["support_graph_intact_edges"] = int(
             np.count_nonzero(self.fragment_edge_intact_host)
+        )
+        result["fracture_energy_edges_visible"] = int(
+            np.count_nonzero(self.fragment_edge_fracture_energy_host > 0.01)
+        )
+        result["fracture_energy_edge_max"] = float(
+            np.max(self.fragment_edge_fracture_energy_host)
+            if len(self.fragment_edge_fracture_energy_host) else 0.0
         )
         result["cohesive_fragments"] = self.fragment_count
         damage_host = self.arrays["damage"][:len(self.fragment_host)].numpy()

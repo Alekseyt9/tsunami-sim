@@ -72,6 +72,11 @@
       "enabled": true,
       "cache": true
     },
+    "crack_rendering": {
+      "enabled": true,
+      "strength": 1.0,
+      "fracture_energy_onset": 0.35
+    },
     "activation_force_per_mass": 5.0,
     "minimum_contact_particles": 12,
     "maximum_activation_elevation": 8.0,

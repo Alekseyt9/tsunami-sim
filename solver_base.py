@@ -321,6 +321,7 @@ class DelugeSolver:
             for optional_stat in ("active_buildings", "released_fragments", "rigid_clusters", "rigid_particles",
                                   "rigid_reactivated_fragments",
                                   "unsupported_fragments", "support_graph_edges", "support_graph_intact_edges",
+                                  "fracture_energy_edges_visible",
                                   "invalid_zero_volume_particles",
                                   "local_impact_glass_particles",
                                   "fine_fluid_particles", "coarse_fluid_particles",
@@ -371,7 +372,7 @@ class DelugeSolver:
                 "damage_integral_slab_m3", "damage_integral_wall_m3",
                 "damage_integral_beam_m3", "damage_integral_column_m3",
                 "damage_integral_core_m3", "damage_integral_glass_m3",
-                "structural_collapse_gravity_max",
+                "structural_collapse_gravity_max", "fracture_energy_edge_max",
             ):
                 if optional_stat in stats:
                     row[optional_stat] = float(stats[optional_stat])
@@ -433,6 +434,7 @@ class DelugeSolver:
             for optional_stat in ("active_buildings", "released_fragments", "rigid_clusters", "rigid_particles",
                                   "rigid_reactivated_fragments",
                                   "unsupported_fragments", "support_graph_edges", "support_graph_intact_edges",
+                                  "fracture_energy_edges_visible",
                                   "invalid_zero_volume_particles",
                                   "local_impact_glass_particles",
                                   "fine_fluid_particles", "coarse_fluid_particles",

@@ -143,6 +143,7 @@ It covers:
 - rigid fitting, motion, contact force/torque balance, friction, and reactivation;
 - multirate momentum and city-state agreement;
 - architectural fragment scale and the glass-to-core fracture hierarchy;
+- deterministic damage-driven facade cracks, including earlier brittle-glass cracking;
 - shallow-water volume and conservative overlap impulse;
 - conservative shallow-to-SPH emission and SPH-to-shallow return-flow compaction;
 - free-surface classification and reconstructed top-layer closure;
@@ -202,10 +203,34 @@ V3.17 adds six-face render hulls for all 3,060 apartment-scale cohesive fragment
 
 The V3.17 100-frame four-view run completed in 269.75 seconds on an RTX 5070. It peaked at 409,831 particles, 1,963.6 MiB VRAM, 251 released fragments, 36 unsupported fragments, and 19 rigid clusters. The connected water mesh stayed at 0.65 m and reached 56,868 vertices; combined shallow/SPH water-volume drift was -0.813%.
 
+## V3.18 convex debris and fast checkpoint resume
+
+The axis-aligned debris boxes are replaced by cached convex render hulls built from each fragment's actual structural support points. SciPy/Qhull generated 61,936 watertight triangles for all 3,060 coarse fragments; a minimal installation without SciPy keeps the previous safe box fallback. Hidden hull vertices are no longer deformed until their fragment loses foundation support, so intact buildings do not pay the full extra render cost.
+
+Facade/debris geometry is compressed into an NPZ cache keyed by the physical city layout, fragmentation topology, and source particle state. Repeated fresh-scene startup fell from 31.6 to 9.1 seconds in the validation environment. Anchor binding uses compiled KD-tree queries and fragment-grouped particle indices instead of repeated Python-wide scans.
+
+New V3 checkpoints also store the sparse support graph: 21,508 fragment edges, 133,377 representative boundary samples, rest lengths, anchored fragments, and current support/intact state. In the round-trip test, initialization of the same scene fell from 19.88 seconds to 0.735 seconds. Older checkpoints remain readable and rebuild the graph once through the legacy fallback.
+
+## V3.19 visible progressive cracking
+
+Facade panels now expose deterministic procedural cracks before their cohesive fragment separates. Glass starts showing hairline damage at a lower threshold than concrete; floor and roof plates remain visually intact longer. The renderer uses the maximum damage at the four panel anchors for crack initiation and the average damage for broad material darkening, so a local impact can create a local crack without recolouring the entire building.
+
+Cracks begin as two thin rays. Further rays, branches, and a small high-damage chip appear progressively and vary by panel, avoiding a synchronized four-point pattern. The effect is generated during GPU rasterization from rest-space panel coordinates and does not add texture files, facade geometry, physics particles, or checkpoint data. Convex debris skins retain their building palette and do not receive the architectural decal.
+
+`validation\validate_crack_rendering.py` checks the material thresholds, deterministic output, and bounded coverage. At 0.28 concrete damage, the test pattern covers 354 of 9,216 samples (3.8%); intact concrete has zero crack pixels while brittle glass already shows hairlines at 0.04 damage.
+
+## V3.20 fracture-energy-driven crack opening
+
+Visible cracks are now coupled to the sparse physical boundaries between cohesive architectural fragments. For every representative inter-fragment bond, the solver compares current and rest length and evaluates the tensile spring-energy fraction against the same material and structural-role failure envelope used by the force kernel. Hairlines begin at 35% of the failure energy, before complete separation. Boundary energy is blended from its peak and mean samples, so a real local crack front remains visible without letting one noisy bond paint the complete interface.
+
+This state is irreversible: removing the load cannot visually heal a crack. A failed support edge is forced to full crack energy. Each facade panel receives the maximum energy of boundaries incident to its owning fragment, while anchor damage still permits more local brittle-glass impact cracks. The evaluation is vectorized over the 133,377 representative samples and does not traverse the full particle neighbour graph a second time.
+
+Both edge and fragment crack states are stored in compressed V3 checkpoints. The end-to-end regression preserved all 21,508 production edge values exactly across save and resume while the V3 checkpoint remained about 0.6 MiB. New metrics report visible-energy edge count and maximum normalized fracture energy. A calm smoke scene reports zero visible edges, zero maximum energy, and zero damaged particles.
+
 ## Next stages
 
-1. Add explicit crack-surface energy and visible crack decals before a complete fragment boundary separates.
-2. Replace axis-aligned debris hulls with cached fragment convex hulls or low-resolution tetrahedral boundary skins.
-3. Separate connected water, thin sheets, entrained foam, and ballistic droplets; give droplets a lifetime and merge them back into the connected surface on contact.
-4. Move conservative sibling-group selection fully onto CUDA. The current CPU audit runs only every eight output frames and is already small, but a sorted GPU group table will scale better beyond one million active SPH samples.
-5. Run the complete eight-second V3.17 sequence and audit late debris contacts, water balance, surface LOD, and progressive-video recovery.
+1. Add collision-proxy convex hulls only for settled rigid debris, while deformable fracture and water coupling continue to use the underlying particles.
+2. Separate connected water, thin sheets, entrained foam, and ballistic droplets; give droplets a lifetime and merge them back into the connected surface on contact.
+3. Move conservative sibling-group selection fully onto CUDA. The current CPU audit runs only every eight output frames and is already small, but a sorted GPU group table will scale better beyond one million active SPH samples.
+4. Run a focused impact sequence and calibrate the 35% crack-energy onset against visible panel opening before starting the longer production run.
+5. Run the complete eight-second V3.20 sequence and audit crack timing, late debris contacts, water balance, surface LOD, checkpoint resume, and progressive-video recovery.

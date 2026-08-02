@@ -15,10 +15,11 @@ import shutil
 import numpy as np
 
 try:
-    from scipy.spatial import ConvexHull, QhullError
+    from scipy.spatial import ConvexHull, QhullError, cKDTree
 except ImportError:  # The renderer retains its box fallback in minimal environments.
     ConvexHull = None
     QhullError = RuntimeError
+    cKDTree = None
 
 from scene import (
     STRUCT_BEAM,
@@ -175,6 +176,76 @@ def evaluate_fragment_support(
         if int(np.count_nonzero(supported)) == before:
             break
     return supported, edge_intact
+
+
+def evaluate_fragment_fracture_energy(
+    graph: FragmentSupportGraph,
+    position: np.ndarray,
+    damage: np.ndarray,
+    material: np.ndarray,
+    structural_class: np.ndarray,
+    previous_edge_energy: np.ndarray | None = None,
+    hairline_energy_fraction: float = 0.35,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return irreversible normalized crack energy for edges and fragments.
+
+    The particle solver already applies the physical joint law.  This reduced
+    graph samples that same boundary and converts tensile spring energy plus
+    accumulated material damage into a stable 0..1 visualization state.  A
+    value of one means the representative boundary samples have reached their
+    role/material failure envelope; unloading cannot visually heal the crack.
+    """
+    edge_count = len(graph.edge_fragments)
+    fragment_count = len(graph.anchored_fragments)
+    if edge_count == 0:
+        return np.empty(0, dtype=np.float32), np.zeros(fragment_count, dtype=np.float32)
+
+    pair = graph.sample_pairs
+    left, right = pair[:, 0], pair[:, 1]
+    current_length = np.linalg.norm(position[right] - position[left], axis=1)
+    tensile_strain = np.maximum(
+        current_length / np.maximum(graph.sample_rest_length, 1.0e-6) - 1.0,
+        0.0,
+    )
+
+    # Match the failure envelope used by compute_clustered_solid_forces.
+    material_failure_table = np.asarray((0.032, 0.032, 0.012, 0.11), dtype=np.float32)
+    left_material = np.clip(material[left], 0, len(material_failure_table) - 1)
+    right_material = np.clip(material[right], 0, len(material_failure_table) - 1)
+    material_limit = np.minimum(
+        material_failure_table[left_material], material_failure_table[right_material]
+    )
+    role_multiplier_table = np.asarray((1.0, 1.25, 1.0, 1.60, 1.90, 2.20, 0.65), dtype=np.float32)
+    left_role = np.clip(structural_class[left], 0, len(role_multiplier_table) - 1)
+    right_role = np.clip(structural_class[right], 0, len(role_multiplier_table) - 1)
+    failure_strain = material_limit * np.minimum(
+        role_multiplier_table[left_role], role_multiplier_table[right_role]
+    )
+
+    # Elastic energy is quadratic in strain.  Start exposing a hairline at
+    # 35% of the failure energy, before the joint actually separates.
+    energy_ratio = np.square(tensile_strain / np.maximum(failure_strain, 1.0e-5))
+    onset = float(np.clip(hairline_energy_fraction, 0.0, 0.95))
+    elastic_crack = np.clip((energy_ratio - onset) / (1.0 - onset), 0.0, 1.0)
+    material_crack = np.maximum(damage[left], damage[right])
+    sample_energy = np.maximum(elastic_crack, material_crack)
+
+    # A crack front is local. Blend the strongest representative sample with
+    # the boundary mean so one real opening is visible without letting a lone
+    # noisy sample immediately paint the whole interface. reduceat keeps this
+    # O(samples) for the 20k+ edge production graph.
+    starts = graph.sample_offsets[:-1]
+    sample_count = np.maximum(np.diff(graph.sample_offsets), 1)
+    edge_peak = np.maximum.reduceat(sample_energy, starts)
+    edge_mean = np.add.reduceat(sample_energy, starts) / sample_count
+    edge_energy = np.asarray(0.72 * edge_peak + 0.28 * edge_mean, dtype=np.float32)
+    if previous_edge_energy is not None and len(previous_edge_energy) == edge_count:
+        edge_energy = np.maximum(edge_energy, previous_edge_energy).astype(np.float32, copy=False)
+
+    fragment_energy = np.zeros(fragment_count, dtype=np.float32)
+    np.maximum.at(fragment_energy, graph.edge_fragments[:, 0], edge_energy)
+    np.maximum.at(fragment_energy, graph.edge_fragments[:, 1], edge_energy)
+    return edge_energy, fragment_energy
 
 
 def build_facade_skin(cfg: dict) -> dict[str, np.ndarray]:
@@ -383,12 +454,14 @@ def build_fragment_debris_skin(
         a, b, c = (tuple(float(value) for value in point) for point in triangle)
         vertices.append((a, b, c, c))
 
-    valid_fragments = np.unique(fragment_id[(fragment_id >= 0) & (kind != 0)])
-    for fid_value in valid_fragments:
+    valid_particles = np.flatnonzero((fragment_id >= 0) & (kind != 0))
+    order = np.argsort(fragment_id[valid_particles], kind="stable")
+    sorted_particles = valid_particles[order]
+    sorted_fragments = fragment_id[sorted_particles]
+    valid_fragments, starts = np.unique(sorted_fragments, return_index=True)
+    grouped_particles = np.split(sorted_particles, starts[1:])
+    for fid_value, indices in zip(valid_fragments, grouped_particles):
         fid = int(fid_value)
-        indices = np.flatnonzero((fragment_id == fid) & (kind != 0))
-        if len(indices) == 0:
-            continue
         bid = int(building_id[indices[0]])
         palette = int(palettes[bid]) % 6 if 0 <= bid < len(palettes) else max(bid, 0) % 6
         roles, role_counts = np.unique(structural_class[indices], return_counts=True)
@@ -442,6 +515,47 @@ def bind_facade_anchors(
         dtype=np.int32,
     )
     owner_fragment = np.full(len(skin["vertex"]), -1, dtype=np.int32)
+    if fragment_id is not None and cKDTree is not None:
+        owner_fragment[:] = preferred_owner
+        # Assign ordinary facade/floor panels to the fragment nearest their
+        # center using one compiled KD-tree query per building.
+        for bid in np.unique(skin["building_id"]):
+            panel_indices = np.flatnonzero(
+                (skin["building_id"] == bid) & (owner_fragment < 0)
+            )
+            particle_indices = np.flatnonzero((kind != 0) & (building_id == bid))
+            if len(panel_indices) == 0 or len(particle_indices) == 0:
+                continue
+            nearest_local = cKDTree(rest_x[particle_indices]).query(
+                skin["center"][panel_indices], workers=-1
+            )[1]
+            owner_fragment[panel_indices] = fragment_id[particle_indices[nearest_local]]
+
+        valid_particles = np.flatnonzero((kind != 0) & (fragment_id >= 0))
+        order = np.argsort(fragment_id[valid_particles], kind="stable")
+        sorted_particles = valid_particles[order]
+        sorted_fragments = fragment_id[sorted_particles]
+        unique_fragments, starts = np.unique(sorted_fragments, return_index=True)
+        fragment_particles = {
+            int(owner): indices
+            for owner, indices in zip(unique_fragments, np.split(sorted_particles, starts[1:]))
+        }
+        # Bind every panel corner to a physical sample of the same cohesive
+        # fragment. Qhull triangles and architectural quads share this path.
+        for owner in np.unique(owner_fragment[owner_fragment >= 0]):
+            panel_indices = np.flatnonzero(owner_fragment == owner)
+            particle_indices = fragment_particles.get(int(owner), np.empty(0, dtype=np.int32))
+            if len(panel_indices) == 0 or len(particle_indices) == 0:
+                continue
+            panel_vertices = skin["vertex"][panel_indices].reshape(-1, 3)
+            nearest_local = cKDTree(rest_x[particle_indices]).query(
+                panel_vertices
+            )[1]
+            anchors[panel_indices] = particle_indices[nearest_local].reshape(-1, 4)
+        if np.any(anchors < 0):
+            raise RuntimeError("Some facade vertices could not be bound to structural particles")
+        return anchors, owner_fragment
+
     # Debris hulls already know their cohesive owner. Bind all of one hull's
     # vertices in vectorized chunks instead of repeating a bucket query for
     # every triangle corner. This is especially important when a resumed,
@@ -540,7 +654,7 @@ def write_facade_skin(
     cache_path: Path | None = None
     if complete_geometry and bool(debris_policy.get("cache", True)):
         geometry_cfg = {
-            "schema": "convex-fragment-skin-v2-vectorized-binding",
+            "schema": "convex-fragment-skin-v4-grouped-particles",
             "solid_spacing": cfg.get("solid_spacing"),
             "buildings": cfg.get("buildings"),
             "building_styles": cfg.get("building_styles"),

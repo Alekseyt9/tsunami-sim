@@ -23,12 +23,14 @@ from surface_kernels import raster_anisotropic_water_depth, raster_water_mesh_de
 class HybridRenderer(ParticleRenderer):
     def __init__(self, width: int, height: int, camera: dict, device: str, skin_path: Path,
                  view_name: str = "main", maximum_panel_stretch: float = 1.8,
-                 water_tangent_scale: float = 2.8, water_normal_scale: float = 2.45):
+                 water_tangent_scale: float = 2.8, water_normal_scale: float = 2.45,
+                 crack_strength: float = 1.0):
         super().__init__(width, height, camera, device)
         self.view_name = view_name
         self.maximum_panel_stretch = float(maximum_panel_stretch)
         self.water_tangent_scale = float(water_tangent_scale)
         self.water_normal_scale = float(water_normal_scale)
+        self.crack_strength = max(0.0, float(crack_strength))
         with np.load(skin_path, allow_pickle=False) as skin:
             rest_vertex = skin["vertex"].reshape(-1, 3).copy()
             anchor = skin["anchor"].reshape(-1).copy()
@@ -44,6 +46,7 @@ class HybridRenderer(ParticleRenderer):
         self.owner_fragment = wp.array(owner_fragment, dtype=wp.int32, device=device)
         fragment_count = int(owner_fragment[owner_fragment >= 0].max()) + 1 if np.any(owner_fragment >= 0) else 1
         self.fragment_support = wp.ones(fragment_count, dtype=float, device=device)
+        self.fragment_fracture_energy = wp.zeros(fragment_count, dtype=float, device=device)
 
     def render(self, arrays: dict, count: int, output_path: Path | None, frame: int, time_s: float, stats: dict):
         pixel_count = self.width * self.height
@@ -118,7 +121,9 @@ class HybridRenderer(ParticleRenderer):
             raster_facade_color, dim=self.panel_count * 2,
             inputs=[self.current_vertex, self.rest_vertex, self.anchor, self.panel_material,
                     self.panel_mode, self.owner_fragment, self.fragment_support, arrays["damage"],
-                    self.depth, self.color, *common, self.maximum_panel_stretch], device=self.device,
+                    self.fragment_fracture_energy,
+                    self.depth, self.color, *common, self.maximum_panel_stretch,
+                    self.crack_strength], device=self.device,
         )
         wp.launch(
             shade_water_surface, dim=pixel_count,

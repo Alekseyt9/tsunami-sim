@@ -72,6 +72,11 @@
       "enabled": true,
       "cache": true
     },
+    "crack_rendering": {
+      "enabled": true,
+      "strength": 1.0,
+      "fracture_energy_onset": 0.35
+    },
     "shallow_water": {
       "enabled": true,
       "replace_far_sph": true,
