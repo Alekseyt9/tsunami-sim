@@ -29,6 +29,7 @@ from kernels import (  # noqa: E402
 from hybrid_kernels import (  # noqa: E402
     accumulate_rigid_body_loads,
     accumulate_rigid_contacts,
+    accumulate_building_damage,
     activate_buildings_from_hits,
     apply_building_activity,
     clear_body_accumulators,
@@ -224,6 +225,19 @@ class HybridDelugeSolver(DelugeSolver):
                 print("WARNING: matching V3 checkpoint is absent; using configured building activity")
 
         self.base_fixed = wp.array(base_host, dtype=wp.int32, device=self.device)
+        volume_host = self.arrays["volume"][:self.count].numpy()
+        solid_building_mask = (kind_host != 0) & (building_host >= 0)
+        building_volume_host = np.bincount(
+            building_host[solid_building_mask],
+            weights=volume_host[solid_building_mask].astype(np.float64, copy=False),
+            minlength=max(1, self.building_count),
+        ).astype(np.float32)
+        self.building_structural_volume = wp.array(
+            building_volume_host, dtype=float, device=self.device
+        )
+        self.building_damage_integral = wp.zeros(
+            max(1, self.building_count), dtype=float, device=self.device
+        )
         self.fragment_role_host = self._build_fragment_roles()
         self.building_active = wp.array(active_host, dtype=wp.int32, device=self.device)
         self.building_activation_exposure = wp.array(
@@ -921,11 +935,19 @@ class HybridDelugeSolver(DelugeSolver):
             )
         clustering = self.v3_cfg["fragment_clustering"]
         self.shallow_water.couple(a, self.count, dt)
+        self.building_damage_integral.zero_()
+        wp.launch(
+            accumulate_building_damage, dim=self.count,
+            inputs=[a["kind"][:self.count], a["building_id"][:self.count],
+                    a["volume"][:self.count], a["damage"][:self.count],
+                    self.building_damage_integral], device=self.device,
+        )
         wp.launch(
             compute_clustered_solid_forces, dim=self.count,
             inputs=[self.grid.id, view, a["rest_x"][:self.count], a["v"][:self.count], a["radius"][:self.count],
                     a["mass"][:self.count], a["kind"][:self.count], a["material"][:self.count],
                     a["structural_class"][:self.count], a["building_id"][:self.count],
+                    self.building_damage_integral, self.building_structural_volume,
                     self.fragment_id[:self.count], self.rigid_state,
                     a["fixed"][:self.count],
                     a["damage"][:self.count], a["solid_force"][:self.count], a["acceleration"][:self.count],
@@ -933,7 +955,12 @@ class HybridDelugeSolver(DelugeSolver):
                     float(clustering.get("damage_rate", 1.5)),
                     float(clustering.get("propagation_threshold", 0.65)),
                     float(clustering.get("max_damage_per_substep", 0.0004)),
-                    float(clustering.get("fracture_reference_spacing", 0.65)) * 0.48 * 1.25],
+                    float(clustering.get("fracture_reference_spacing", 0.65)) * 0.48 * 1.25,
+                    float(clustering.get("collapse_gravity_damage_onset", 0.015)),
+                    float(clustering.get("collapse_gravity_damage_full", 0.10)),
+                    float(clustering.get("facade_support_loss_minimum_elevation", 4.0)),
+                    float(clustering.get("facade_support_loss_collapse_threshold", 0.75)),
+                    float(clustering.get("facade_support_loss_damage_rate", 2.5))],
             device=self.device,
         )
         rigid_policy = self.v3_cfg.get("rigid_clusters", {})
@@ -1161,6 +1188,27 @@ class HybridDelugeSolver(DelugeSolver):
             print(f"  V3 building activation: {self.last_active_count} -> {active_count}")
             self.last_active_count = active_count
         result["active_buildings"] = active_count
+        building_volume = self.building_structural_volume.numpy()
+        building_damage_integral = self.building_damage_integral.numpy()
+        collapse_onset = float(
+            self.v3_cfg["fragment_clustering"].get("collapse_gravity_damage_onset", 0.015)
+        )
+        collapse_full = float(
+            self.v3_cfg["fragment_clustering"].get("collapse_gravity_damage_full", 0.10)
+        )
+        building_damage_fraction = np.divide(
+            building_damage_integral,
+            np.maximum(building_volume, 1.0e-6),
+        )
+        building_gravity_fraction = np.clip(
+            (building_damage_fraction - collapse_onset) / max(collapse_full - collapse_onset, 1.0e-6),
+            0.0,
+            1.0,
+        )
+        result["collapse_gravity_buildings"] = int(np.count_nonzero(building_gravity_fraction > 0.0))
+        result["structural_collapse_gravity_max"] = float(
+            np.max(building_gravity_fraction) if len(building_gravity_fraction) else 0.0
+        )
         result["cohesive_fragments"] = self.fragment_count
         damage_host = self.arrays["damage"][:len(self.fragment_host)].numpy()
         solid_mask = self.fragment_host >= 0

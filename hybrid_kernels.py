@@ -47,6 +47,57 @@ def structural_damage_rate_multiplier(role: int) -> float:
     return 1.0
 
 
+@wp.func
+def collapse_gravity_fraction(
+    damage_integral: float,
+    structural_volume: float,
+    onset_fraction: float,
+    full_fraction: float,
+) -> float:
+    """Ramp building-wide gravity only after causal structural damage."""
+    fraction = damage_integral / wp.max(structural_volume, 1.0e-6)
+    return wp.clamp(
+        (fraction - onset_fraction) / wp.max(full_fraction - onset_fraction, 1.0e-6),
+        0.0,
+        1.0,
+    )
+
+
+@wp.func
+def facade_support_loss_rate(
+    role: int,
+    rest_elevation: float,
+    collapse_fraction: float,
+    minimum_elevation: float,
+    collapse_threshold: float,
+    maximum_rate: float,
+) -> float:
+    """Loss of diaphragm support for upper facade chunks after global failure."""
+    facade = role == STRUCT_WALL or role == STRUCT_GLASS
+    if not facade or rest_elevation <= minimum_elevation:
+        return 0.0
+    activation = wp.clamp(
+        (collapse_fraction - collapse_threshold) / wp.max(1.0 - collapse_threshold, 1.0e-6),
+        0.0,
+        1.0,
+    )
+    return maximum_rate * activation
+
+
+@wp.kernel
+def accumulate_building_damage(
+    kind: wp.array(dtype=wp.int32),
+    building_id: wp.array(dtype=wp.int32),
+    volume: wp.array(dtype=float),
+    damage: wp.array(dtype=float),
+    damage_integral: wp.array(dtype=float),
+):
+    i = wp.tid()
+    bid = building_id[i]
+    if kind[i] != 0 and bid >= 0:
+        wp.atomic_add(damage_integral, bid, volume[i] * damage[i])
+
+
 @wp.kernel
 def count_loaded_building_particles(
     rest_x: wp.array(dtype=wp.vec3),
@@ -120,6 +171,8 @@ def compute_clustered_solid_forces(
     material: wp.array(dtype=wp.int32),
     structural_class: wp.array(dtype=wp.int32),
     building_id: wp.array(dtype=wp.int32),
+    building_damage_integral: wp.array(dtype=float),
+    building_structural_volume: wp.array(dtype=float),
     fragment_id: wp.array(dtype=wp.int32),
     rigid_state: wp.array(dtype=wp.int32),
     fixed: wp.array(dtype=wp.int32),
@@ -133,6 +186,11 @@ def compute_clustered_solid_forces(
     propagation_threshold: float,
     max_damage_per_substep: float,
     fracture_reference_radius: float,
+    collapse_gravity_damage_onset: float,
+    collapse_gravity_damage_full: float,
+    facade_support_loss_minimum_elevation: float,
+    facade_support_loss_collapse_threshold: float,
+    facade_support_loss_damage_rate: float,
 ):
     """Break joints between architectural chunks, never atomize a chunk."""
     tid = wp.tid()
@@ -147,8 +205,23 @@ def compute_clustered_solid_forces(
     ri = rest_x[i]
     fid = fragment_id[i]
     body_rigid = fid >= 0 and rigid_state[fid] != 0
+    bid = building_id[i]
+    building_collapse = float(0.0)
+    if bid >= 0:
+        building_collapse = collapse_gravity_fraction(
+            building_damage_integral[bid],
+            building_structural_volume[bid],
+            collapse_gravity_damage_onset,
+            collapse_gravity_damage_full,
+        )
     local_damage = damage[i]
-    gravity_fraction = local_damage * local_damage
+    local_damage += dt * facade_support_loss_rate(
+        structural_class[i], ri[1], building_collapse,
+        facade_support_loss_minimum_elevation,
+        facade_support_loss_collapse_threshold,
+        facade_support_loss_damage_rate,
+    )
+    gravity_fraction = wp.max(local_damage * local_damage, building_collapse)
     if body_rigid:
         gravity_fraction = 1.0
     force = solid_force[i] + wp.vec3(0.0, -9.81 * mass[i] * gravity_fraction, 0.0)

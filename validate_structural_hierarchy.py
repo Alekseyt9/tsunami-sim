@@ -10,6 +10,9 @@ import warp as wp
 HERE = Path(__file__).resolve().parent
 
 from hybrid_kernels import (  # noqa: E402
+    accumulate_building_damage,
+    collapse_gravity_fraction,
+    facade_support_loss_rate,
     structural_damage_rate_multiplier,
     structural_failure_strain_multiplier,
 )
@@ -24,6 +27,31 @@ def sample_hierarchy(
     i = wp.tid()
     failure[i] = structural_failure_strain_multiplier(roles[i])
     damage_rate[i] = structural_damage_rate_multiplier(roles[i])
+
+
+@wp.kernel
+def sample_collapse_gravity(
+    damage_integral: wp.array(dtype=float),
+    structural_volume: wp.array(dtype=float),
+    result: wp.array(dtype=float),
+):
+    i = wp.tid()
+    result[i] = collapse_gravity_fraction(
+        damage_integral[i], structural_volume[i], 0.015, 0.10
+    )
+
+
+@wp.kernel
+def sample_facade_support_loss(
+    roles: wp.array(dtype=wp.int32),
+    elevations: wp.array(dtype=float),
+    collapse: wp.array(dtype=float),
+    result: wp.array(dtype=float),
+):
+    i = wp.tid()
+    result[i] = facade_support_loss_rate(
+        roles[i], elevations[i], collapse[i], 4.0, 0.75, 2.5
+    )
 
 
 def main() -> None:
@@ -43,7 +71,47 @@ def main() -> None:
         raise AssertionError(f"failure hierarchy is not monotonic: {failure_host}")
     if not np.all(np.diff(damage_rate_host) < 0.0):
         raise AssertionError(f"damage-rate hierarchy is not monotonic: {damage_rate_host}")
-    print("PASS: glass < wall < slab < beam < column < core fracture resistance on CUDA")
+
+    kind = wp.ones(3, dtype=wp.int32, device=device)
+    building = wp.array(np.asarray([0, 0, 1], dtype=np.int32), dtype=wp.int32, device=device)
+    volume = wp.array(np.asarray([2.0, 3.0, 4.0], dtype=np.float32), dtype=float, device=device)
+    damage = wp.array(np.asarray([0.25, 0.5, 1.0], dtype=np.float32), dtype=float, device=device)
+    integral = wp.zeros(2, dtype=float, device=device)
+    wp.launch(
+        accumulate_building_damage, dim=3,
+        inputs=[kind, building, volume, damage, integral], device=device,
+    )
+    np.testing.assert_allclose(integral.numpy(), [2.0, 4.0], atol=1.0e-6)
+
+    collapse_damage = wp.array(
+        np.asarray([0.0, 0.0575, 0.10], dtype=np.float32), dtype=float, device=device
+    )
+    collapse_volume = wp.ones(3, dtype=float, device=device)
+    collapse_result = wp.zeros(3, dtype=float, device=device)
+    wp.launch(
+        sample_collapse_gravity, dim=3,
+        inputs=[collapse_damage, collapse_volume, collapse_result], device=device,
+    )
+    np.testing.assert_allclose(collapse_result.numpy(), [0.0, 0.5, 1.0], atol=1.0e-6)
+    support_roles = wp.array(
+        np.asarray([2, 5, 2, 2, 6], dtype=np.int32), dtype=wp.int32, device=device
+    )
+    support_elevation = wp.array(
+        np.asarray([3.0, 20.0, 20.0, 20.0, 20.0], dtype=np.float32), dtype=float, device=device
+    )
+    support_collapse = wp.array(
+        np.asarray([1.0, 1.0, 0.75, 1.0, 1.0], dtype=np.float32), dtype=float, device=device
+    )
+    support_result = wp.zeros(5, dtype=float, device=device)
+    wp.launch(
+        sample_facade_support_loss, dim=5,
+        inputs=[support_roles, support_elevation, support_collapse, support_result], device=device,
+    )
+    np.testing.assert_allclose(support_result.numpy(), [0.0, 0.0, 0.0, 2.5, 2.5], atol=1.0e-6)
+    print(
+        "PASS: glass < wall < slab < beam < column < core; "
+        "gravity/support loss begin only after causal building damage"
+    )
 
 
 if __name__ == "__main__":

@@ -316,7 +316,8 @@ class DelugeSolver:
                                   "damaged_core_particles", "damaged_glass_particles",
                                   "released_slab_fragments", "released_wall_fragments",
                                   "released_beam_fragments", "released_column_fragments",
-                                  "released_core_fragments", "released_glass_fragments"):
+                                  "released_core_fragments", "released_glass_fragments",
+                                  "collapse_gravity_buildings"):
                 if optional_stat in stats:
                     row[optional_stat] = int(stats[optional_stat])
             for optional_stat in (
@@ -342,6 +343,7 @@ class DelugeSolver:
                 "damage_integral_slab_m3", "damage_integral_wall_m3",
                 "damage_integral_beam_m3", "damage_integral_column_m3",
                 "damage_integral_core_m3", "damage_integral_glass_m3",
+                "structural_collapse_gravity_max",
             ):
                 if optional_stat in stats:
                     row[optional_stat] = float(stats[optional_stat])
