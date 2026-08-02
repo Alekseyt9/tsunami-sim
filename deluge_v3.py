@@ -31,6 +31,7 @@ from hybrid_kernels import (  # noqa: E402
     accumulate_rigid_contacts,
     accumulate_building_damage,
     accumulate_material_impact,
+    apply_conservative_fluid_merges,
     activate_buildings_from_hits,
     apply_building_activity,
     clear_body_accumulators,
@@ -55,6 +56,7 @@ from hybrid_model import (  # noqa: E402
     build_fragment_support_graph,
     build_refinement_axes,
     evaluate_fragment_support,
+    select_conservative_fluid_merges,
     write_facade_skin,
 )
 from hybrid_renderer import HybridRenderer  # noqa: E402
@@ -312,6 +314,9 @@ class HybridDelugeSolver(DelugeSolver):
         self.return_keep = wp.zeros(self.capacity, dtype=wp.int32, device=self.device)
         self.return_offsets = wp.zeros(self.capacity, dtype=wp.int32, device=self.device)
         self.particle_compaction_scratch = None
+        self.adaptive_merged_groups_total = 0
+        self.adaptive_merged_particles_total = 0
+        self.last_adaptive_merge_frame = -1
         self._initialize_water_surface(v3_resume)
 
         self._update_fragment_support_graph(
@@ -1263,6 +1268,7 @@ class HybridDelugeSolver(DelugeSolver):
             )
 
     def stats(self):
+        self._merge_adaptive_fluid_groups()
         self._merge_sph_interface_particles()
         self._emit_shallow_interface_particles()
         self.update_rigid_clusters()
@@ -1286,6 +1292,8 @@ class HybridDelugeSolver(DelugeSolver):
             100.0 * np.sum(volume_host[fine_fluid_mask], dtype=np.float64)
             / max(np.sum(volume_host[fluid_mask], dtype=np.float64), 1.0e-9)
         )
+        result["adaptive_merged_groups"] = self.adaptive_merged_groups_total
+        result["adaptive_merged_particles"] = self.adaptive_merged_particles_total
         velocity_host = self.arrays["v"][:self.count].numpy()
         position_host = self.arrays["x"][:self.count].numpy()
         fixed_host = self.arrays["fixed"][:self.count].numpy()
@@ -1497,6 +1505,7 @@ class HybridDelugeSolver(DelugeSolver):
                     self.arrays["solid_force"], self.base_fixed, self.fragment_id, self.normal_axis,
                     self.time_level, self.time_active, self.arrays["water_surface_mask"],
                     self.arrays["water_surface_normal"], self.arrays["water_foam_strength"],
+                    self.arrays["fluid_group_id"],
                     self.shallow_water.state, self.shallow_water.exchange_volume,
                     self.shallow_water.exchange_x, self.shallow_water.exchange_z,
                     counter, old_count, self.capacity, emitter_nx, emitter_ny,
@@ -1525,6 +1534,7 @@ class HybridDelugeSolver(DelugeSolver):
             "x", "rest_x", "v", "radius", "mass", "volume", "kind", "material",
             "building_id", "structural_class", "fixed", "damage", "rho_reference", "rho",
             "material_impact_impulse", "local_impact_active",
+            "fluid_group_id",
             "acceleration", "solid_force", "water_surface_mask", "water_surface_normal",
             "water_foam_strength",
         )
@@ -1553,7 +1563,7 @@ class HybridDelugeSolver(DelugeSolver):
         )
         int_names = (
             "kind", "material", "building_id", "structural_class", "fixed", "water_surface_mask",
-            "local_impact_active",
+            "local_impact_active", "fluid_group_id",
         )
         vec3_names = ("x", "rest_x", "v", "acceleration", "solid_force", "water_surface_normal")
         for name in float_names:
@@ -1561,6 +1571,8 @@ class HybridDelugeSolver(DelugeSolver):
                       inputs=[self.arrays[name], scratch["arrays"][name], self.return_keep,
                               self.return_offsets], device=self.device)
         for name in int_names:
+            if name == "fluid_group_id":
+                scratch["arrays"][name].fill_(-1)
             wp.launch(compact_int_particles, dim=old_count,
                       inputs=[self.arrays[name], scratch["arrays"][name], self.return_keep,
                               self.return_offsets], device=self.device)
@@ -1619,6 +1631,82 @@ class HybridDelugeSolver(DelugeSolver):
                 graph.sample_rest_length,
                 graph.anchored_fragments,
             )
+
+    def _merge_adaptive_fluid_groups(self):
+        policy = self.v3_cfg.get("adaptive_water_merge", {})
+        if not bool(policy.get("enabled", False)) or self.count <= 0:
+            return
+        completed_frame = max(0, int(round(self.time * float(self.cfg["output_fps"]))) - 1)
+        every_frames = max(1, int(policy.get("every_frames", 8)))
+        if completed_frame == self.last_adaptive_merge_frame or completed_frame % every_frames != 0:
+            return
+        self.last_adaptive_merge_frame = completed_frame
+        old_count = self.count
+        group_host = self.arrays["fluid_group_id"][:old_count].numpy()
+        if not np.any(group_host >= 0):
+            return
+        merge = select_conservative_fluid_merges(
+            group_host,
+            self.arrays["kind"][:old_count].numpy(),
+            self.arrays["x"][:old_count].numpy(),
+            self.arrays["v"][:old_count].numpy(),
+            self.arrays["mass"][:old_count].numpy(),
+            self.arrays["volume"][:old_count].numpy(),
+            self.arrays["radius"][:old_count].numpy(),
+            maximum_y=(
+                float(self.cfg["water_depth"])
+                - float(self.cfg.get("fine_surface_band", 0.0))
+                - float(policy.get("surface_margin", 0.75))
+            ),
+            maximum_vertical_speed=float(policy.get("maximum_vertical_speed", 0.8)),
+            maximum_velocity_rms=float(policy.get("maximum_velocity_rms", 0.6)),
+            maximum_span=float(policy.get("maximum_span", 0.9)),
+            maximum_fine_radius=float(self.cfg["fine_spacing"]) * 0.5 * 1.25,
+        )
+        group_count = len(merge["representatives"])
+        if group_count == 0:
+            return
+        keep_host = np.ones(old_count, dtype=np.int32)
+        keep_host[merge["removed"]] = 0
+        wp.copy(
+            self.return_keep,
+            wp.array(keep_host, dtype=wp.int32, device=self.device),
+            count=old_count,
+        )
+        wp.launch(
+            apply_conservative_fluid_merges, dim=group_count,
+            inputs=[
+                wp.array(merge["representatives"], dtype=wp.int32, device=self.device),
+                wp.array(merge["position"], dtype=wp.vec3, device=self.device),
+                wp.array(merge["velocity"], dtype=wp.vec3, device=self.device),
+                wp.array(merge["mass"], dtype=float, device=self.device),
+                wp.array(merge["volume"], dtype=float, device=self.device),
+                wp.array(merge["radius"], dtype=float, device=self.device),
+                self.arrays["x"], self.arrays["rest_x"], self.arrays["v"],
+                self.arrays["mass"], self.arrays["volume"], self.arrays["radius"],
+                self.arrays["rho_reference"], self.arrays["rho"],
+                self.arrays["acceleration"], self.arrays["solid_force"],
+                self.arrays["fluid_group_id"], self.arrays["water_surface_mask"],
+                self.arrays["water_surface_normal"], self.arrays["water_foam_strength"],
+            ],
+            device=self.device,
+        )
+        wp.utils.array_scan(
+            self.return_keep[:old_count], self.return_offsets[:old_count], inclusive=False
+        )
+        self._compact_particle_arrays(old_count)
+        wp.synchronize_device(self.device)
+        removed_count = group_count * 7
+        self.count = old_count - removed_count
+        self.fragment_host = self.fragment_id[:self.count].numpy()
+        self.rigid_local_host.fill(0.0)
+        self.rigid_local_host[:self.count] = self.rigid_local_position[:self.count].numpy()
+        self.adaptive_merged_groups_total += group_count
+        self.adaptive_merged_particles_total += removed_count
+        print(
+            f"  V3 adaptive SPH merge: {group_count:,} sibling octets -> coarse "
+            f"(-{removed_count:,} particles; {self.adaptive_merged_groups_total:,} groups total)"
+        )
 
     def _merge_sph_interface_particles(self):
         policy = self.v3_cfg.get("shallow_water", {})

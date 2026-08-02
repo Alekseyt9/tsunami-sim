@@ -380,6 +380,8 @@ def refine_entering_fluid(
     damage: wp.array(dtype=float),
     rho_reference: wp.array(dtype=float),
     count: wp.array(dtype=wp.int32),
+    fluid_group_id: wp.array(dtype=wp.int32),
+    fluid_group_counter: wp.array(dtype=wp.int32),
     old_count: int,
     capacity: int,
     fine_radius: float,
@@ -400,6 +402,7 @@ def refine_entering_fluid(
     base = wp.atomic_add(count, 0, 7)
     if base + 6 >= capacity:
         return
+    group_id = wp.atomic_add(fluid_group_counter, 0, 1)
 
     parent_x = x[i]
     parent_v = v[i]
@@ -410,8 +413,10 @@ def refine_entering_fluid(
     # multiplier overlapped children and produced a non-physical pressure burst.
     offsets = wp.vec3(-1.0, -1.0, -1.0) * child_r
     x[i] = parent_x + offsets
+    rest_x[i] = x[i]
     radius[i] = child_r; mass[i] = child_m; volume[i] = child_vol
     rho_reference[i] = 0.0
+    fluid_group_id[i] = group_id
 
     for c in range(7):
         idx = base + c
@@ -425,6 +430,7 @@ def refine_entering_fluid(
         radius[idx] = child_r; mass[idx] = child_m; volume[idx] = child_vol
         kind[idx] = 0; material[idx] = 0; building_id[idx] = -1; fixed[idx] = 0; damage[idx] = 0.0
         rho_reference[idx] = 0.0
+        fluid_group_id[idx] = group_id
 
 
 @wp.kernel

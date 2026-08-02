@@ -178,6 +178,7 @@ def emit_sph_interface_particles(
     surface_mask: wp.array(dtype=wp.int32),
     surface_normal: wp.array(dtype=wp.vec3),
     foam_strength: wp.array(dtype=float),
+    fluid_group_id: wp.array(dtype=wp.int32),
     shallow: wp.array2d(dtype=wp.vec3),
     exchange_volume: wp.array2d(dtype=float),
     exchange_x: wp.array2d(dtype=float),
@@ -254,6 +255,7 @@ def emit_sph_interface_particles(
     surface_mask[target] = 0
     surface_normal[target] = wp.vec3(0.0)
     foam_strength[target] = 0.0
+    fluid_group_id[target] = -1
     wp.atomic_add(exchange_volume, sx, sz, -particle_volume)
     wp.atomic_add(exchange_x, sx, sz, -particle_mass * velocity_x)
     wp.atomic_add(exchange_z, sx, sz, -particle_mass * velocity_z)

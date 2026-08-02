@@ -460,3 +460,83 @@ def build_refinement_axes(
             else:
                 axes[particle_index] = int(np.argmin(connectivity))
     return axes
+
+
+def select_conservative_fluid_merges(
+    group_id: np.ndarray,
+    kind: np.ndarray,
+    position: np.ndarray,
+    velocity: np.ndarray,
+    mass: np.ndarray,
+    volume: np.ndarray,
+    radius: np.ndarray,
+    *,
+    maximum_y: float,
+    maximum_vertical_speed: float,
+    maximum_velocity_rms: float,
+    maximum_span: float,
+    maximum_fine_radius: float,
+) -> dict[str, np.ndarray]:
+    """Select intact calm sibling octets that can safely return to coarse SPH.
+
+    A group is mergeable only while all eight original 1->8 children still
+    exist.  The replacement state uses mass-weighted center and velocity, so
+    total mass, volume and linear momentum are conserved exactly apart from
+    float32 upload rounding.
+    """
+    group_id = np.asarray(group_id, dtype=np.int32)
+    kind = np.asarray(kind, dtype=np.int32)
+    position = np.asarray(position, dtype=np.float64)
+    velocity = np.asarray(velocity, dtype=np.float64)
+    mass = np.asarray(mass, dtype=np.float64)
+    volume = np.asarray(volume, dtype=np.float64)
+    radius = np.asarray(radius, dtype=np.float64)
+    candidate_ids = np.unique(group_id[(group_id >= 0) & (kind == 0)])
+    representatives: list[int] = []
+    removed: list[int] = []
+    merged_position: list[np.ndarray] = []
+    merged_velocity: list[np.ndarray] = []
+    merged_mass: list[float] = []
+    merged_volume: list[float] = []
+    merged_radius: list[float] = []
+    for sibling_id in candidate_ids:
+        indices = np.flatnonzero(group_id == sibling_id)
+        if len(indices) != 8 or np.any(kind[indices] != 0):
+            continue
+        if np.any(radius[indices] > maximum_fine_radius):
+            continue
+        if np.any(position[indices, 1] > maximum_y):
+            continue
+        if np.any(np.abs(velocity[indices, 1]) > maximum_vertical_speed):
+            continue
+        total_mass = float(np.sum(mass[indices], dtype=np.float64))
+        total_volume = float(np.sum(volume[indices], dtype=np.float64))
+        if total_mass <= 0.0 or total_volume <= 0.0:
+            continue
+        center = np.sum(position[indices] * mass[indices, None], axis=0) / total_mass
+        mean_velocity = np.sum(velocity[indices] * mass[indices, None], axis=0) / total_mass
+        velocity_delta = velocity[indices] - mean_velocity
+        velocity_rms = float(np.sqrt(
+            np.sum(mass[indices] * np.sum(velocity_delta * velocity_delta, axis=1)) / total_mass
+        ))
+        span = float(np.max(np.linalg.norm(position[indices] - center, axis=1)))
+        if velocity_rms > maximum_velocity_rms or span > maximum_span:
+            continue
+        representative = int(indices[0])
+        representatives.append(representative)
+        removed.extend(int(index) for index in indices[1:])
+        merged_position.append(center)
+        merged_velocity.append(mean_velocity)
+        merged_mass.append(total_mass)
+        merged_volume.append(total_volume)
+        merged_radius.append(float(np.max(radius[indices]) * 2.0))
+    count = len(representatives)
+    return {
+        "representatives": np.asarray(representatives, dtype=np.int32),
+        "removed": np.asarray(removed, dtype=np.int32),
+        "position": np.asarray(merged_position, dtype=np.float32).reshape(count, 3),
+        "velocity": np.asarray(merged_velocity, dtype=np.float32).reshape(count, 3),
+        "mass": np.asarray(merged_mass, dtype=np.float32),
+        "volume": np.asarray(merged_volume, dtype=np.float32),
+        "radius": np.asarray(merged_radius, dtype=np.float32),
+    }

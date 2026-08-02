@@ -31,10 +31,13 @@ def main() -> None:
     integer = lambda: wp.zeros(capacity, dtype=wp.int32, device=device)
     scalar = lambda: wp.zeros(capacity, dtype=float, device=device)
     count = wp.array(np.asarray([old_count], dtype=np.int32), dtype=wp.int32, device=device)
+    group_id = wp.array(np.full(capacity, -1, dtype=np.int32), dtype=wp.int32, device=device)
+    group_counter = wp.zeros(1, dtype=wp.int32, device=device)
     wp.launch(
         refine_entering_fluid, dim=old_count,
         inputs=[x, rest, velocity, radius, mass, volume, integer(), integer(), integer(),
-                integer(), scalar(), scalar(), count, old_count, capacity, 0.25, 1.0,
+                integer(), scalar(), scalar(), count, group_id, group_counter,
+                old_count, capacity, 0.25, 1.0,
                 1, 11.5, 2.5], device=device,
     )
     wp.synchronize_device(device)
@@ -45,6 +48,10 @@ def main() -> None:
         raise AssertionError("calm interior particle was incorrectly refined")
     if abs(float(mass.numpy()[:final_count].sum()) - 3000.0) > 1.0e-3:
         raise AssertionError("adaptive surface refinement did not conserve mass")
+    groups = group_id.numpy()[:final_count]
+    valid_groups, group_sizes = np.unique(groups[groups >= 0], return_counts=True)
+    if len(valid_groups) != 2 or not np.all(group_sizes == 8):
+        raise AssertionError(f"refined particles did not retain two complete sibling octets: {group_sizes}")
     print("PASS: calm interior remains coarse; surface and turbulent particles refine 1->8 with conserved mass")
 
 

@@ -71,6 +71,11 @@ class DelugeSolver:
         if self.count > self.capacity:
             raise RuntimeError(f"Initial particle count {self.count:,} exceeds max_particles={self.capacity:,}")
         self.arrays = self.allocate(initial)
+        group_ids = np.asarray(initial.get("fluid_group_id", ()), dtype=np.int32)
+        next_group_id = int(group_ids[group_ids >= 0].max()) + 1 if np.any(group_ids >= 0) else 0
+        self.fluid_group_counter = wp.array(
+            np.asarray([next_group_id], dtype=np.int32), dtype=wp.int32, device=self.device
+        )
 
         fluid_support = float(cfg.get("uniform_water_spacing", cfg["coarse_spacing"])) * 2.0
         # The widest structural bond is 3.2 * particle radius, while scene
@@ -103,9 +108,12 @@ class DelugeSolver:
             "fixed": (wp.int32, np.int32, (self.capacity,)),
             "damage": (float, np.float32, (self.capacity,)),
             "rho_reference": (float, np.float32, (self.capacity,)),
+            "fluid_group_id": (wp.int32, np.int32, (self.capacity,)),
         }
         for name, (dtype, np_dtype, shape) in specs.items():
             host = np.zeros(shape, dtype=np_dtype)
+            if name == "fluid_group_id":
+                host.fill(-1)
             if name in initial:
                 host[:self.count] = initial[name]
             arrays[name] = wp.array(host, dtype=dtype, device=self.device)
@@ -170,6 +178,7 @@ class DelugeSolver:
             refine_entering_fluid, dim=old_count,
             inputs=[a["x"], a["rest_x"], a["v"], a["radius"], a["mass"], a["volume"], a["kind"],
                     a["material"], a["building_id"], a["fixed"], a["damage"], a["rho_reference"], count_device,
+                    a["fluid_group_id"], self.fluid_group_counter,
                     old_count, self.capacity, float(self.cfg["fine_spacing"]) * 0.5, float(self.cfg["refine_z"]),
                     int(bool(self.cfg.get("adaptive_surface_only", False))),
                     float(self.cfg["water_depth"]) - float(self.cfg.get("fine_surface_band", 0.0)),
@@ -212,6 +221,11 @@ class DelugeSolver:
                 else np.zeros(len(result["x"]), dtype=np.int32)
             )
             result["rho_reference"] = data["rho_reference"].copy() if "rho_reference" in data else np.zeros(len(result["x"]), dtype=np.float32)
+            result["fluid_group_id"] = (
+                data["fluid_group_id"].copy()
+                if "fluid_group_id" in data
+                else np.full(len(result["x"]), -1, dtype=np.int32)
+            )
             return result
 
     def run(self, smoke: bool = False, no_video: bool = False):

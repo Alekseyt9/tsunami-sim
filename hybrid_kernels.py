@@ -6,6 +6,47 @@ expensive bond traversal until enough facade particles receive water load.
 
 import warp as wp
 
+
+@wp.kernel
+def apply_conservative_fluid_merges(
+    representatives: wp.array(dtype=wp.int32),
+    merged_position: wp.array(dtype=wp.vec3),
+    merged_velocity: wp.array(dtype=wp.vec3),
+    merged_mass: wp.array(dtype=float),
+    merged_volume: wp.array(dtype=float),
+    merged_radius: wp.array(dtype=float),
+    x: wp.array(dtype=wp.vec3),
+    rest_x: wp.array(dtype=wp.vec3),
+    v: wp.array(dtype=wp.vec3),
+    mass: wp.array(dtype=float),
+    volume: wp.array(dtype=float),
+    radius: wp.array(dtype=float),
+    rho_reference: wp.array(dtype=float),
+    rho: wp.array(dtype=float),
+    acceleration: wp.array(dtype=wp.vec3),
+    solid_force: wp.array(dtype=wp.vec3),
+    fluid_group_id: wp.array(dtype=wp.int32),
+    surface_mask: wp.array(dtype=wp.int32),
+    surface_normal: wp.array(dtype=wp.vec3),
+    foam_strength: wp.array(dtype=float),
+):
+    merge_index = wp.tid()
+    particle = representatives[merge_index]
+    x[particle] = merged_position[merge_index]
+    rest_x[particle] = merged_position[merge_index]
+    v[particle] = merged_velocity[merge_index]
+    mass[particle] = merged_mass[merge_index]
+    volume[particle] = merged_volume[merge_index]
+    radius[particle] = merged_radius[merge_index]
+    rho_reference[particle] = 0.0
+    rho[particle] = 0.0
+    acceleration[particle] = wp.vec3(0.0)
+    solid_force[particle] = wp.vec3(0.0)
+    fluid_group_id[particle] = -1
+    surface_mask[particle] = 0
+    surface_normal[particle] = wp.vec3(0.0)
+    foam_strength[particle] = 0.0
+
 from kernels import (
     material_failure_strain,
     material_stiffness,
