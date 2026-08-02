@@ -29,6 +29,8 @@ from kernels import (  # noqa: E402
 from hybrid_kernels import (  # noqa: E402
     accumulate_rigid_body_loads,
     accumulate_rigid_contacts,
+    accumulate_rigid_proxy_boundaries,
+    accumulate_rigid_proxy_contacts,
     accumulate_building_damage,
     accumulate_material_impact,
     apply_conservative_fluid_merges,
@@ -61,7 +63,7 @@ from hybrid_model import (  # noqa: E402
     write_facade_skin,
 )
 from hybrid_renderer import HybridRenderer  # noqa: E402
-from rigid_clusters import fit_rigid_cluster  # noqa: E402
+from rigid_clusters import fit_rigid_cluster, fit_rigid_collision_proxy  # noqa: E402
 from shallow_water import (  # noqa: E402
     ShallowWaterFarField,
     compact_float_particles,
@@ -930,6 +932,10 @@ class HybridDelugeSolver(DelugeSolver):
             body_angular_velocity=self.body_angular_velocity.numpy(),
             body_mass=self.body_mass.numpy(),
             body_inverse_inertia=self.body_inverse_inertia.numpy(),
+            rigid_proxy_enabled=self.rigid_proxy_enabled_host,
+            rigid_proxy_local_center=self.rigid_proxy_local_center_host,
+            rigid_proxy_half_extent=self.rigid_proxy_half_extent_host,
+            rigid_proxy_material=self.rigid_proxy_material_host,
             rigid_reactivated_total=self.rigid_reactivated_counter.numpy(),
             water_mesh_domain_lower=(
                 self.water_mesh_domain_lower if self.water_mesh_domain_lower is not None
@@ -963,6 +969,11 @@ class HybridDelugeSolver(DelugeSolver):
         angular_velocity = np.zeros((body_capacity, 3), dtype=np.float32)
         body_mass = np.zeros(body_capacity, dtype=np.float32)
         inverse_inertia = np.zeros((body_capacity, 3, 3), dtype=np.float32)
+        proxy_enabled = np.zeros(body_capacity, dtype=np.int32)
+        proxy_local_center = np.zeros((body_capacity, 3), dtype=np.float32)
+        proxy_half_extent = np.zeros((body_capacity, 3), dtype=np.float32)
+        proxy_material = np.ones(body_capacity, dtype=np.int32)
+        restored_proxy_state = False
         if checkpoint is not None and checkpoint.exists():
             with np.load(checkpoint, allow_pickle=False) as saved:
                 def restore(name: str, target: np.ndarray):
@@ -980,6 +991,31 @@ class HybridDelugeSolver(DelugeSolver):
                 restore("body_angular_velocity", angular_velocity)
                 restore("body_mass", body_mass)
                 restore("body_inverse_inertia", inverse_inertia)
+                restore("rigid_proxy_enabled", proxy_enabled)
+                restore("rigid_proxy_local_center", proxy_local_center)
+                restore("rigid_proxy_half_extent", proxy_half_extent)
+                restore("rigid_proxy_material", proxy_material)
+                restored_proxy_state = "rigid_proxy_enabled" in saved
+
+        proxy_policy = self.v3_cfg.get("rigid_clusters", {}).get("collision_proxy", {})
+        if bool(proxy_policy.get("enabled", True)) and not restored_proxy_state:
+            fragment = self.fragment_host
+            radius = self.arrays["radius"][:self.count].numpy()
+            material = self.arrays["material"][:self.count].numpy()
+            particle_mass = self.arrays["mass"][:self.count].numpy()
+            minimum_particles = int(proxy_policy.get("minimum_particles", 12))
+            for fid in np.flatnonzero(state != 0):
+                indices = np.flatnonzero(fragment == fid)
+                if len(indices) < minimum_particles:
+                    continue
+                proxy = fit_rigid_collision_proxy(
+                    local[indices], radius[indices], material[indices], particle_mass[indices],
+                    float(proxy_policy.get("padding_scale", 0.70)),
+                )
+                proxy_enabled[fid] = 1
+                proxy_local_center[fid] = proxy.local_center
+                proxy_half_extent[fid] = proxy.half_extent
+                proxy_material[fid] = proxy.material
 
         self.rigid_state_host = state
         self.rigid_quiet_scans_host = quiet
@@ -992,6 +1028,19 @@ class HybridDelugeSolver(DelugeSolver):
         self.body_angular_velocity = wp.array(angular_velocity, dtype=wp.vec3, device=self.device)
         self.body_mass = wp.array(body_mass, dtype=float, device=self.device)
         self.body_inverse_inertia = wp.array(inverse_inertia, dtype=wp.mat33, device=self.device)
+        self.rigid_proxy_enabled_host = proxy_enabled
+        self.rigid_proxy_local_center_host = proxy_local_center
+        self.rigid_proxy_half_extent_host = proxy_half_extent
+        self.rigid_proxy_material_host = proxy_material
+        self.rigid_proxy_enabled = wp.array(proxy_enabled, dtype=wp.int32, device=self.device)
+        self.rigid_proxy_local_center = wp.array(
+            proxy_local_center, dtype=wp.vec3, device=self.device
+        )
+        self.rigid_proxy_half_extent = wp.array(
+            proxy_half_extent, dtype=wp.vec3, device=self.device
+        )
+        self.rigid_proxy_material = wp.array(proxy_material, dtype=wp.int32, device=self.device)
+        self._refresh_collision_proxy_pairs()
         self.body_force = wp.zeros((body_capacity, 3), dtype=float, device=self.device)
         self.body_torque = wp.zeros((body_capacity, 3), dtype=float, device=self.device)
         self.rigid_stats_calls = 0
@@ -1007,6 +1056,22 @@ class HybridDelugeSolver(DelugeSolver):
                     self.rigid_reactivated_counter = wp.array(restored, dtype=wp.int32, device=self.device)
                     self.last_rigid_reactivated_count = int(restored[0])
 
+    def _refresh_collision_proxy_pairs(self):
+        proxy_ids = np.flatnonzero(self.rigid_proxy_enabled_host != 0).astype(np.int32)
+        if len(proxy_ids) >= 2:
+            left_index, right_index = np.triu_indices(len(proxy_ids), 1)
+            pair_left = proxy_ids[left_index]
+            pair_right = proxy_ids[right_index]
+        else:
+            pair_left = np.zeros(1, dtype=np.int32)
+            pair_right = np.zeros(1, dtype=np.int32)
+        self.rigid_proxy_pair_count = len(proxy_ids) * (len(proxy_ids) - 1) // 2
+        self.rigid_proxy_pair_left = wp.array(pair_left, dtype=wp.int32, device=self.device)
+        self.rigid_proxy_pair_right = wp.array(pair_right, dtype=wp.int32, device=self.device)
+        self.rigid_proxy_active_count = int(np.count_nonzero(
+            (self.rigid_proxy_enabled_host != 0) & (self.rigid_state_host != 0)
+        ))
+
     def update_rigid_clusters(self):
         policy = self.v3_cfg.get("rigid_clusters", {})
         if not bool(policy.get("enabled", True)) or self.fragment_count == 0:
@@ -1016,6 +1081,9 @@ class HybridDelugeSolver(DelugeSolver):
         # host-side quiet-fragment scanner uploads new rigid conversions.
         self.rigid_state_host[:] = self.rigid_state.numpy()
         self.rigid_active_count = int(np.count_nonzero(self.rigid_state_host))
+        self.rigid_proxy_active_count = int(np.count_nonzero(
+            (self.rigid_proxy_enabled_host != 0) & (self.rigid_state_host != 0)
+        ))
         self.rigid_stats_calls += 1
         if self.rigid_stats_calls % max(1, int(policy.get("scan_every_frames", 8))) != 0:
             return
@@ -1027,11 +1095,14 @@ class HybridDelugeSolver(DelugeSolver):
         position = self.arrays["x"][:self.count].numpy()
         velocity = self.arrays["v"][:self.count].numpy()
         mass = self.arrays["mass"][:self.count].numpy()
+        radius = self.arrays["radius"][:self.count].numpy()
+        material = self.arrays["material"][:self.count].numpy()
         fully_damaged_threshold = float(policy.get("fully_damaged_threshold", 0.95))
         release_fraction = float(policy.get("release_damage_fraction", 0.12))
         minimum_particles = int(policy.get("minimum_particles", 6))
         maximum_residual = float(policy.get("maximum_internal_velocity_rms", 2.5))
         required_quiet = int(policy.get("required_quiet_scans", 2))
+        proxy_policy = policy.get("collision_proxy", {})
         converted: list[tuple[int, np.ndarray, object]] = []
 
         for fid in range(self.fragment_count):
@@ -1072,6 +1143,21 @@ class HybridDelugeSolver(DelugeSolver):
             angular_velocity[fid] = fit.angular_velocity
             body_mass[fid] = fit.mass
             inverse_inertia[fid] = fit.inverse_inertia
+            if (
+                bool(proxy_policy.get("enabled", True))
+                and len(indices) >= int(proxy_policy.get("minimum_particles", 12))
+            ):
+                proxy = fit_rigid_collision_proxy(
+                    fit.local_positions,
+                    radius[indices],
+                    material[indices],
+                    mass[indices],
+                    float(proxy_policy.get("padding_scale", 0.70)),
+                )
+                self.rigid_proxy_enabled_host[fid] = 1
+                self.rigid_proxy_local_center_host[fid] = proxy.local_center
+                self.rigid_proxy_half_extent_host[fid] = proxy.half_extent
+                self.rigid_proxy_material_host[fid] = proxy.material
 
         self.rigid_state = wp.array(self.rigid_state_host, dtype=wp.int32, device=self.device)
         self.rigid_local_position = wp.array(self.rigid_local_host, dtype=wp.vec3, device=self.device)
@@ -1081,6 +1167,19 @@ class HybridDelugeSolver(DelugeSolver):
         self.body_angular_velocity = wp.array(angular_velocity, dtype=wp.vec3, device=self.device)
         self.body_mass = wp.array(body_mass, dtype=float, device=self.device)
         self.body_inverse_inertia = wp.array(inverse_inertia, dtype=wp.mat33, device=self.device)
+        self.rigid_proxy_enabled = wp.array(
+            self.rigid_proxy_enabled_host, dtype=wp.int32, device=self.device
+        )
+        self.rigid_proxy_local_center = wp.array(
+            self.rigid_proxy_local_center_host, dtype=wp.vec3, device=self.device
+        )
+        self.rigid_proxy_half_extent = wp.array(
+            self.rigid_proxy_half_extent_host, dtype=wp.vec3, device=self.device
+        )
+        self.rigid_proxy_material = wp.array(
+            self.rigid_proxy_material_host, dtype=wp.int32, device=self.device
+        )
+        self._refresh_collision_proxy_pairs()
         self.rigid_active_count = int(np.count_nonzero(self.rigid_state_host))
         print(
             f"  V3 rigid conversion: +{len(converted)} clusters / "
@@ -1216,6 +1315,7 @@ class HybridDelugeSolver(DelugeSolver):
                 accumulate_rigid_body_loads, dim=self.count,
                 inputs=[view, a["v"][:self.count], a["radius"][:self.count], a["mass"][:self.count],
                         a["kind"][:self.count], self.fragment_id[:self.count], self.rigid_state,
+                        self.rigid_proxy_enabled,
                         a["acceleration"][:self.count], self.body_center, self.body_force, self.body_torque,
                         float(self.cfg["domain_width"]) * 0.5, float(self.cfg["reservoir_z_min"]),
                         float(self.cfg["domain_z_max"]), float(self.cfg["domain_y_max"]),
@@ -1223,17 +1323,54 @@ class HybridDelugeSolver(DelugeSolver):
                         float(rigid_policy.get("boundary_damping", 1.8e4))],
                 device=self.device,
             )
+            if self.rigid_proxy_active_count > 0:
+                wp.launch(
+                    accumulate_rigid_proxy_boundaries, dim=max(1, self.fragment_count),
+                    inputs=[self.rigid_state, self.rigid_proxy_enabled,
+                            self.rigid_proxy_local_center, self.rigid_proxy_half_extent,
+                            self.rigid_proxy_material, self.body_center, self.body_orientation,
+                            self.body_linear_velocity, self.body_angular_velocity,
+                            self.body_force, self.body_torque,
+                            float(self.cfg["domain_width"]) * 0.5,
+                            float(self.cfg["reservoir_z_min"]),
+                            float(self.cfg["domain_z_max"]), float(self.cfg["domain_y_max"]),
+                            float(rigid_policy.get("boundary_stiffness", 4.0e6)),
+                            float(rigid_policy.get("boundary_damping", 1.8e4)),
+                            float(rigid_policy.get("contact_tangential_damping", 1800.0)),
+                            float(rigid_policy.get("collision_proxy", {}).get(
+                                "maximum_penetration", 0.35
+                            ))],
+                    device=self.device,
+                )
             self.rigid_contact_acceleration_peak.zero_()
             wp.launch(
                 accumulate_rigid_contacts, dim=self.count,
                 inputs=[self.grid.id, view, a["v"][:self.count], a["radius"][:self.count],
                         a["kind"][:self.count], a["material"][:self.count], self.fragment_id[:self.count],
-                        self.rigid_state, self.body_center, self.body_mass, self.body_force,
+                        self.rigid_state, self.rigid_proxy_enabled,
+                        self.body_center, self.body_mass, self.body_force,
                         self.body_torque, self.rigid_contact_acceleration_peak, self.max_support,
                         float(rigid_policy.get("contact_normal_damping", 3200.0)),
                         float(rigid_policy.get("contact_tangential_damping", 1800.0))],
                 device=self.device,
             )
+            if self.rigid_proxy_pair_count > 0:
+                wp.launch(
+                    accumulate_rigid_proxy_contacts, dim=self.rigid_proxy_pair_count,
+                    inputs=[self.rigid_proxy_pair_left, self.rigid_proxy_pair_right,
+                            self.rigid_state, self.rigid_proxy_enabled,
+                            self.rigid_proxy_local_center, self.rigid_proxy_half_extent,
+                            self.rigid_proxy_material, self.body_center, self.body_orientation,
+                            self.body_linear_velocity, self.body_angular_velocity, self.body_mass,
+                            self.body_force, self.body_torque,
+                            self.rigid_contact_acceleration_peak,
+                            float(rigid_policy.get("contact_normal_damping", 3200.0)),
+                            float(rigid_policy.get("contact_tangential_damping", 1800.0)),
+                            float(rigid_policy.get("collision_proxy", {}).get(
+                                "maximum_penetration", 0.35
+                            ))],
+                    device=self.device,
+                )
             wp.launch(
                 reactivate_rigid_after_impact, dim=max(1, self.fragment_count),
                 inputs=[self.rigid_state, self.rigid_contact_acceleration_peak,
@@ -1553,6 +1690,10 @@ class HybridDelugeSolver(DelugeSolver):
             self.last_rigid_count = rigid_count
         result["rigid_clusters"] = rigid_count
         result["rigid_particles"] = rigid_particles
+        result["rigid_collision_proxies"] = int(np.count_nonzero(
+            (self.rigid_proxy_enabled_host != 0) & (self.rigid_state_host != 0)
+        ))
+        result["rigid_proxy_pairs"] = self.rigid_proxy_pair_count
         reactivated_total = int(self.rigid_reactivated_counter.numpy()[0])
         if reactivated_total != self.last_rigid_reactivated_count:
             print(

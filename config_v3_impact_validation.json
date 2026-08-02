@@ -136,7 +136,13 @@
       "angular_damping": 0.03,
       "maximum_angular_speed": 18.0,
       "boundary_stiffness": 4000000.0,
-      "boundary_damping": 18000.0
+      "boundary_damping": 18000.0,
+      "collision_proxy": {
+        "enabled": true,
+        "minimum_particles": 12,
+        "padding_scale": 0.7,
+        "maximum_penetration": 0.35
+      }
     },
     "multirate": {
       "enabled": true,

@@ -319,7 +319,7 @@ class DelugeSolver:
                 "gpu_memory_used_mib": gpu_used_mib,
             }
             for optional_stat in ("active_buildings", "released_fragments", "rigid_clusters", "rigid_particles",
-                                  "rigid_reactivated_fragments",
+                                  "rigid_reactivated_fragments", "rigid_collision_proxies", "rigid_proxy_pairs",
                                   "unsupported_fragments", "support_graph_edges", "support_graph_intact_edges",
                                   "fracture_energy_edges_visible",
                                   "invalid_zero_volume_particles",
@@ -432,7 +432,7 @@ class DelugeSolver:
                 "peak_gpu_memory_used_mib": max(row["gpu_memory_used_mib"] for row in benchmark_rows),
             }
             for optional_stat in ("active_buildings", "released_fragments", "rigid_clusters", "rigid_particles",
-                                  "rigid_reactivated_fragments",
+                                  "rigid_reactivated_fragments", "rigid_collision_proxies", "rigid_proxy_pairs",
                                   "unsupported_fragments", "support_graph_edges", "support_graph_intact_edges",
                                   "fracture_energy_edges_visible",
                                   "invalid_zero_volume_particles",

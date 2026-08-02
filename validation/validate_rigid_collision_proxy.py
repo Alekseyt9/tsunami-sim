@@ -1,0 +1,96 @@
+"""CUDA regression for convex OBB rigid-debris collision proxies."""
+
+from __future__ import annotations
+
+from _bootstrap import ROOT  # noqa: F401
+
+import numpy as np
+import warp as wp
+
+from hybrid_kernels import (
+    accumulate_rigid_proxy_boundaries,
+    accumulate_rigid_proxy_contacts,
+    clear_body_accumulators,
+    reactivate_rigid_after_impact,
+)
+from rigid_clusters import fit_rigid_collision_proxy
+
+
+def main() -> None:
+    wp.init()
+    device = "cuda:0"
+    local_samples = np.asarray(
+        [[-0.8, -0.3, -0.4], [0.9, 0.35, 0.45], [0.2, -0.1, 0.0]], dtype=np.float32
+    )
+    fitted = fit_rigid_collision_proxy(
+        local_samples, np.full(3, 0.1, dtype=np.float32),
+        np.asarray([1, 1, 3], dtype=np.int32), np.asarray([5.0, 5.0, 1.0]), 0.7,
+    )
+    lower = fitted.local_center - fitted.half_extent
+    upper = fitted.local_center + fitted.half_extent
+    if np.any(local_samples < lower) or np.any(local_samples > upper) or fitted.material != 1:
+        raise AssertionError("fitted proxy does not enclose its weighted structural samples")
+
+    rigid = wp.ones(2, dtype=wp.int32, device=device)
+    enabled = wp.ones(2, dtype=wp.int32, device=device)
+    local_center = wp.zeros(2, dtype=wp.vec3, device=device)
+    extent = wp.array([[1.0, 0.5, 0.5], [1.0, 0.5, 0.5]], dtype=wp.vec3, device=device)
+    material = wp.ones(2, dtype=wp.int32, device=device)
+    center = wp.array([[0.0, 1.0, 0.0], [1.6, 1.0, 0.0]], dtype=wp.vec3, device=device)
+    orientation = wp.array(
+        [[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]], dtype=wp.quat, device=device
+    )
+    linear = wp.array([[0.0, 0.0, 0.0], [-1.0, 0.0, 2.0]], dtype=wp.vec3, device=device)
+    angular = wp.zeros(2, dtype=wp.vec3, device=device)
+    mass = wp.array([1000.0, 1000.0], dtype=float, device=device)
+    force = wp.zeros((2, 3), dtype=float, device=device)
+    torque = wp.zeros((2, 3), dtype=float, device=device)
+    peak = wp.zeros(2, dtype=float, device=device)
+    pair_left = wp.array([0], dtype=wp.int32, device=device)
+    pair_right = wp.array([1], dtype=wp.int32, device=device)
+    wp.launch(clear_body_accumulators, dim=2, inputs=[force, torque], device=device)
+    wp.launch(
+        accumulate_rigid_proxy_contacts, dim=1,
+        inputs=[pair_left, pair_right, rigid, enabled, local_center, extent, material,
+                center, orientation, linear, angular, mass, force, torque, peak,
+                3200.0, 1800.0, 0.10], device=device,
+    )
+    wp.synchronize_device(device)
+    force_host = force.numpy()
+    np.testing.assert_allclose(force_host[0] + force_host[1], 0.0, atol=1.0e-4)
+    if force_host[0, 0] >= 0.0 or force_host[0, 2] <= 0.0:
+        raise AssertionError(f"proxy normal/friction direction is wrong: {force_host[0]}")
+    if not np.all(peak.numpy() > 120.0):
+        raise AssertionError("proxy impact did not reach the deformable-reactivation threshold")
+
+    # A separate body crosses the ground only through its proxy. The body-level
+    # contact must push it upward without requiring any particle boundary splats.
+    ground_center = wp.array([[0.0, 0.35, 0.0]], dtype=wp.vec3, device=device)
+    ground_force = wp.zeros((1, 3), dtype=float, device=device)
+    ground_torque = wp.zeros((1, 3), dtype=float, device=device)
+    wp.launch(
+        accumulate_rigid_proxy_boundaries, dim=1,
+        inputs=[rigid, enabled, local_center, extent, material, ground_center, orientation,
+                linear, angular, ground_force, ground_torque, 100.0, -100.0, 100.0, 100.0,
+                4.0e6, 1.8e4, 1800.0, 0.10], device=device,
+    )
+    wp.synchronize_device(device)
+    if ground_force.numpy()[0, 1] <= 0.0:
+        raise AssertionError("ground proxy did not generate an upward support force")
+
+    reactivated = wp.zeros(1, dtype=wp.int32, device=device)
+    wp.launch(
+        reactivate_rigid_after_impact, dim=2,
+        inputs=[rigid, peak, reactivated, 120.0], device=device,
+    )
+    wp.synchronize_device(device)
+    if np.any(rigid.numpy() != 0) or int(reactivated.numpy()[0]) != 2:
+        raise AssertionError("strong proxy contact did not restore deformable fragments")
+    print(
+        "PASS: fitted convex OBB encloses its samples; SAT contact conserves force, "
+        "applies friction/ground support, and reactivates both fragments"
+    )
+
+
+if __name__ == "__main__":
+    main()

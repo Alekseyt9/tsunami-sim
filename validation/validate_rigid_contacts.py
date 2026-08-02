@@ -25,6 +25,7 @@ def main():
     material = wp.array([1, 1], dtype=wp.int32, device=device)
     fragment = wp.array([0, 1], dtype=wp.int32, device=device)
     rigid = wp.ones(2, dtype=wp.int32, device=device)
+    proxy_enabled = wp.zeros(2, dtype=wp.int32, device=device)
     centers = wp.array([[0.0, 0.5, 0.0], [1.0, 0.5, 0.0]], dtype=wp.vec3, device=device)
     body_mass = wp.array([1000.0, 1000.0], dtype=float, device=device)
     force = wp.zeros((2, 3), dtype=float, device=device)
@@ -36,7 +37,7 @@ def main():
     wp.launch(clear_body_accumulators, dim=2, inputs=[force, torque], device=device)
     wp.launch(
         accumulate_rigid_contacts, dim=2,
-        inputs=[grid.id, position, velocity, radius, kind, material, fragment, rigid,
+        inputs=[grid.id, position, velocity, radius, kind, material, fragment, rigid, proxy_enabled,
                 centers, body_mass, force, torque, peak, 1.5, 3200.0, 1800.0],
         device=device,
     )

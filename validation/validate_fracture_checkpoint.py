@@ -38,6 +38,10 @@ def main() -> None:
         solver.fragment_fracture_energy = wp.array(
             solver.fragment_fracture_energy_host, dtype=float, device=solver.device
         )
+        solver.rigid_proxy_enabled_host[5:7] = 1
+        solver.rigid_proxy_local_center_host[5] = (0.2, -0.1, 0.4)
+        solver.rigid_proxy_half_extent_host[5] = (1.5, 0.7, 2.0)
+        solver.rigid_proxy_material_host[5] = 3
         solver.save_checkpoint(7)
 
         base_checkpoint = output / "checkpoints" / "state_00007.npz"
@@ -46,6 +50,14 @@ def main() -> None:
         if not np.array_equal(restored, expected):
             error = float(np.max(np.abs(restored - expected)))
             raise AssertionError(f"fracture energy changed across checkpoint restore: {error:.3e}")
+        if (
+            resumed.rigid_proxy_enabled_host[5:7].tolist() != [1, 1]
+            or not np.array_equal(
+                resumed.rigid_proxy_half_extent_host[5], np.asarray((1.5, 0.7, 2.0), dtype=np.float32)
+            )
+            or resumed.rigid_proxy_material_host[5] != 3
+        ):
+            raise AssertionError("rigid collision proxy changed across checkpoint restore")
         print(
             f"PASS: checkpoint preserved {len(restored):,} irreversible edge-energy values; "
             f"seed={restored[:3].tolist()}"

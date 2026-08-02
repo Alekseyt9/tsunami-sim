@@ -14,6 +14,7 @@ if not exist "%PYTHON_EXE%" (
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_rigid_clusters.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_rigid_transition.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_rigid_contacts.py" || exit /b 1
+"%PYTHON_EXE%" "%VALIDATION_DIR%validate_rigid_collision_proxy.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_multirate.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_multirate_city.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_impact_gates.py" || exit /b 1

@@ -48,6 +48,14 @@ def main() -> None:
     solver.update_rigid_clusters()
     if solver.rigid_state_host[chosen] != 1:
         raise AssertionError("eligible fragment was not converted to a rigid cluster")
+    if solver.rigid_proxy_enabled_host[chosen] != 1:
+        raise AssertionError("eligible rigid fragment did not receive a collision proxy")
+    proxy_extent = solver.rigid_proxy_half_extent_host[chosen]
+    if np.any(proxy_extent <= 0.0) or solver.rigid_proxy_pair_count != 0:
+        raise AssertionError(
+            f"invalid single-body proxy extent/pair table: {proxy_extent}, "
+            f"pairs={solver.rigid_proxy_pair_count}"
+        )
     expected_mass = float(solver.arrays["mass"][:solver.count].numpy()[chosen_indices].sum(dtype=np.float64))
     actual_mass = float(solver.body_mass.numpy()[chosen])
     if abs(expected_mass - actual_mass) > max(1.0e-4, expected_mass * 2.0e-6):
@@ -61,7 +69,8 @@ def main() -> None:
         raise AssertionError(f"shape changed after full solver substep: {shape_error}")
     print(
         f"PASS: fragment {chosen} converted end-to-end ({len(chosen_indices)} particles, "
-        f"mass={actual_mass:.3f} kg, shape error={shape_error:.3e} m)"
+        f"mass={actual_mass:.3f} kg, proxy half-extent={proxy_extent.tolist()}, "
+        f"shape error={shape_error:.3e} m)"
     )
 
 
