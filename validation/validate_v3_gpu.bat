@@ -25,6 +25,8 @@ if not exist "%PYTHON_EXE%" (
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_fracture_checkpoint.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_shallow_water.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_shallow_return.py" || exit /b 1
+"%PYTHON_EXE%" "%VALIDATION_DIR%validate_wave_train.py" || exit /b 1
+"%PYTHON_EXE%" "%VALIDATION_DIR%validate_wave_train_reach.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_surface_reconstruction.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_water_phase_separation.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_water_mesh.py" || exit /b 1

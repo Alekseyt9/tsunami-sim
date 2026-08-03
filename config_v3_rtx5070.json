@@ -95,8 +95,8 @@
       "divergence_relaxation": 0.25,
       "selective_compression": {
         "enabled": true,
-        "density_threshold": 0.002,
-        "divergence_threshold_per_s": 2.0,
+        "density_threshold": 0.02,
+        "divergence_threshold_per_s": 5.0,
         "expand_neighbor_rings": 1
       },
       "bootstrap_ratio_minimum": 0.80,

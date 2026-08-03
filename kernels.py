@@ -709,10 +709,10 @@ def apply_directional_screen_shadows(
     camera_x = (float(x) + 0.5 - float(width) * 0.5) * z / focal
     camera_y = -(float(y) + 0.5 - float(height) * 0.5) * z / focal
     shadow = float(0.0)
-    # Fourteen 5 m samples cover a 70 m light ray, sufficient for the tallest
-    # tower's shadow while keeping the four-view render bounded.
-    for step in range(1, 15):
-        distance = float(step) * 5.0
+    # A 3.5 m step is fine enough not to jump across facade depth while the
+    # 84 m ray still covers the tallest tower's ground shadow.
+    for step in range(1, 25):
+        distance = float(step) * 3.5
         ray_z = z + sun_z * distance
         if ray_z > 0.2 and shadow < 0.5:
             ray_x = camera_x + sun_x * distance
@@ -724,17 +724,17 @@ def apply_directional_screen_shadows(
                 depth_gap = ray_z - blocker
                 # A finite depth thickness reduces false shadows from an
                 # unrelated foreground silhouette in screen space.
-                if blocker < 1.0e8 and depth_gap > 0.35 and depth_gap < 36.0:
-                    shadow = 1.0 - float(step - 1) / 18.0
+                if blocker < 1.0e8 and depth_gap > 0.25 and depth_gap < 100.0:
+                    shadow = 1.0 - float(step - 1) / 30.0
     if shadow > 0.0:
-        warm_ambient = wp.vec3(0.67, 0.71, 0.73)
+        warm_ambient = wp.vec3(0.50, 0.56, 0.60)
         current = color[i]
         shaded = wp.vec3(
             current[0] * warm_ambient[0],
             current[1] * warm_ambient[1],
             current[2] * warm_ambient[2],
         )
-        color[i] = wp.lerp(current, shaded, 0.70 * shadow)
+        color[i] = wp.lerp(current, shaded, 0.82 * shadow)
 
 
 @wp.kernel

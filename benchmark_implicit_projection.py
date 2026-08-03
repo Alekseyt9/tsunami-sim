@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import gc
 import json
 from pathlib import Path
 import statistics
@@ -26,6 +27,8 @@ def run_variant(
     steps: int,
     implicit: bool,
     pressure_iterations: int,
+    divergence_projection: bool,
+    selective_compression: bool,
 ) -> tuple[dict, dict[str, np.ndarray]]:
     variant = copy.deepcopy(cfg)
     policy = variant["v3"]["implicit_fluid"]
@@ -34,13 +37,21 @@ def run_variant(
     if implicit:
         policy["minimum_pressure_iterations"] = pressure_iterations
         policy["maximum_pressure_iterations"] = pressure_iterations
+        policy["divergence_projection"] = divergence_projection
+        policy.setdefault("selective_compression", {})["enabled"] = (
+            selective_compression
+        )
     variant["v3"]["narrow_band_volume"]["enabled"] = False
     variant["v3"]["rigid_clusters"]["early_rigidification"]["enabled"] = False
+    warmup = HybridDelugeSolver(variant, output / "_warmup", checkpoint)
+    # Compile and build transient neighbour state on a disposable instance.
+    # The measured solver must start from exactly the checkpoint; advancing
+    # each variant by a different warm-up dt invalidated older A/B deltas.
+    warmup.substep(dt)
+    wp.synchronize_device(warmup.device)
+    del warmup
+    gc.collect()
     solver = HybridDelugeSolver(variant, output, checkpoint)
-
-    # Compile, build transient neighbour state, and exclude one-time setup.
-    solver.substep(dt)
-    wp.synchronize_device(solver.device)
     wall_ms: list[float] = []
     for _ in range(steps):
         started = time.perf_counter()
@@ -60,6 +71,8 @@ def run_variant(
     median_ms = float(statistics.median(wall_ms))
     report = {
         "implicit": implicit,
+        "divergence_projection": bool(implicit and divergence_projection),
+        "selective_compression": bool(implicit and selective_compression),
         "dt_s": dt,
         "steps": steps,
         "simulated_duration_s": dt * steps,
@@ -95,6 +108,14 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--implicit-dt", type=float, default=0.0006)
     parser.add_argument("--pressure-iterations", type=int, default=4)
+    parser.add_argument(
+        "--disable-divergence", action="store_true",
+        help="Benchmark the density projection without divergence correction.",
+    )
+    parser.add_argument(
+        "--disable-selective", action="store_true",
+        help="Run the projection over every fluid particle.",
+    )
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     cfg = json.loads(args.config.read_text(encoding="utf-8"))
@@ -115,6 +136,8 @@ def main() -> None:
                 cfg, checkpoint, args.output / label / name,
                 dt, variant_steps, enabled,
                 max(1, args.pressure_iterations),
+                not args.disable_divergence,
+                not args.disable_selective,
             )
         baseline = variants["baseline"]
         projected = variants["unequal_mass_dfsph"]

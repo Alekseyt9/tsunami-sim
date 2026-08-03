@@ -230,15 +230,16 @@ before they may replace production physics:
    volume drift and visually unchanged surface/wake behaviour before removing
    any interior SPH samples.
 
-## Gate status (2026-08-03)
+## Gate status (2026-08-04)
 
-- **Implicit fluid:** unequal-mass density projection is executable behind the
-  disabled flag. Four iterations at 5x `dt` pass a 200-step finite-state stress
-  test and give 1.57--1.62x late-stage speedup. It is not ready to enable: an
-  equal-horizon test still observed a 30.9% worst local residual and meaningful
-  trajectory/damage differences. Next: add divergence projection, compact the
-  high-compression solve, and validate water volume plus solid reaction over at
-  least one full rendered second.
+- **Implicit fluid:** unequal-mass density plus divergence projection and GPU
+  high-compression compaction are implemented behind the disabled flag. A full
+  one-second `5x dt` core/halo audit achieved 1.87x
+  physics and 1.77x complete no-render-frame speedup with `1.17e-8` combined
+  water-volume drift, but failed the physical gate: water p99 height was
+  12.40 m versus 7.32 m, longitudinal momentum diverged, and 58 fewer fragments
+  were released. Keep it disabled; next compare 2x/3x dt and require momentum,
+  water-height, and structural deltas to converge before any production trial.
 - **Early rigidification:** transition, checkpoint, sleep and wake mechanics
   are implemented, but converting 343 more clusters did not improve the late
   substep. Do not enable it as a performance feature until rigid sample clouds

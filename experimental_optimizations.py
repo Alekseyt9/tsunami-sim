@@ -693,6 +693,7 @@ def dfsph_initialize_kappa_selected(
     fluid_particle: wp.array(dtype=wp.int32),
     selected_slot: wp.array(dtype=wp.int32),
     selected_count: wp.array(dtype=wp.int32),
+    constraint_selection: wp.array(dtype=wp.int32),
     water_phase: wp.array(dtype=wp.int32),
     density_advected: wp.array(dtype=float),
     factor: wp.array(dtype=float),
@@ -706,7 +707,7 @@ def dfsph_initialize_kappa_selected(
         return
     slot = selected_slot[selected_index]
     i = fluid_particle[slot]
-    if water_phase[i] == 2:
+    if water_phase[i] == 2 or constraint_selection[slot] == 0:
         return
     initial = (
         wp.max(density_advected[i] - 1.0, 0.0)
@@ -724,6 +725,7 @@ def dfsph_initialize_divergence_kappa_selected(
     fluid_particle: wp.array(dtype=wp.int32),
     selected_slot: wp.array(dtype=wp.int32),
     selected_count: wp.array(dtype=wp.int32),
+    constraint_selection: wp.array(dtype=wp.int32),
     water_phase: wp.array(dtype=wp.int32),
     divergence_advected: wp.array(dtype=float),
     factor: wp.array(dtype=float),
@@ -734,7 +736,7 @@ def dfsph_initialize_divergence_kappa_selected(
         return
     slot = selected_slot[selected_index]
     i = fluid_particle[slot]
-    if water_phase[i] != 2:
+    if water_phase[i] != 2 and constraint_selection[slot] != 0:
         kappa[i] = wp.max(divergence_advected[i], 0.0) * factor[i]
 
 
@@ -809,6 +811,7 @@ def dfsph_density_jacobi_update_selected_verlet(
     fluid_particle: wp.array(dtype=wp.int32),
     selected_slot: wp.array(dtype=wp.int32),
     selected_count: wp.array(dtype=wp.int32),
+    constraint_selection: wp.array(dtype=wp.int32),
     radius: wp.array(dtype=float),
     mass: wp.array(dtype=float),
     volume: wp.array(dtype=float),
@@ -836,7 +839,7 @@ def dfsph_density_jacobi_update_selected_verlet(
         return
     slot = selected_slot[selected_index]
     i = fluid_particle[slot]
-    if water_phase[i] == 2:
+    if water_phase[i] == 2 or constraint_selection[slot] == 0:
         return
     xi = x[i]
     ai = pressure_acceleration[i]
@@ -886,6 +889,7 @@ def dfsph_divergence_jacobi_update_selected_verlet(
     fluid_particle: wp.array(dtype=wp.int32),
     selected_slot: wp.array(dtype=wp.int32),
     selected_count: wp.array(dtype=wp.int32),
+    constraint_selection: wp.array(dtype=wp.int32),
     radius: wp.array(dtype=float),
     mass: wp.array(dtype=float),
     volume: wp.array(dtype=float),
@@ -912,7 +916,7 @@ def dfsph_divergence_jacobi_update_selected_verlet(
         return
     slot = selected_slot[selected_index]
     i = fluid_particle[slot]
-    if water_phase[i] == 2:
+    if water_phase[i] == 2 or constraint_selection[slot] == 0:
         return
     xi = x[i]
     correction_i = velocity_correction[i]
@@ -1322,9 +1326,8 @@ class ImplicitFluidPreparation:
             ], device=device,
         )
         inverse_dt_squared = 1.0 / max(dt * dt, 1.0e-12)
-        density_selection = self.compression_selection
         if self.selective_compression_enabled:
-            density_selection = self._select_compressed_particles(
+            self._select_compressed_particles(
                 arrays, fluid_particle, fluid_particle_count,
                 neighbour_count, neighbour_offset, neighbour_index,
                 neighbour_capacity, self.kappa_density,
@@ -1335,6 +1338,7 @@ class ImplicitFluidPreparation:
                 inputs=[
                     fluid_particle, self.selected_slot,
                     self.density_selected_count,
+                    self.compression_selection,
                     arrays["water_phase"][:count], self.density_advected,
                     self.factor, self.kappa_density,
                     self.kappa_density_warmstart, inverse_dt_squared,
@@ -1393,6 +1397,7 @@ class ImplicitFluidPreparation:
                     inputs=[
                         arrays["x"][:count], fluid_particle,
                         self.selected_slot, self.density_selected_count,
+                        self.compression_selection,
                         arrays["radius"][:count], arrays["mass"][:count],
                         arrays["volume"][:count], arrays["kind"][:count],
                         arrays["water_phase"][:count], self.density_advected,
@@ -1450,7 +1455,7 @@ class ImplicitFluidPreparation:
                 dfsph_store_warmstart_selected, dim=fluid_particle_count,
                 inputs=[
                     fluid_particle, arrays["water_phase"][:count],
-                    density_selection, self.kappa_density,
+                    self.compression_selection, self.kappa_density,
                     self.kappa_density_warmstart, dt * dt,
                 ], device=device,
             )
@@ -1511,6 +1516,7 @@ class ImplicitFluidPreparation:
                     inputs=[
                         fluid_particle, self.selected_slot,
                         self.divergence_selected_count,
+                        self.compression_selection,
                         arrays["water_phase"][:count],
                         self.divergence_advected, self.factor,
                         self.kappa_divergence,
@@ -1571,6 +1577,7 @@ class ImplicitFluidPreparation:
                         inputs=[
                             arrays["x"][:count], fluid_particle,
                             self.selected_slot, self.divergence_selected_count,
+                            self.compression_selection,
                             arrays["radius"][:count], arrays["mass"][:count],
                             arrays["volume"][:count], arrays["kind"][:count],
                             arrays["water_phase"][:count],

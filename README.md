@@ -26,6 +26,11 @@ The project targets an NVIDIA RTX 5070 with 12 GB of VRAM. It prioritizes physic
 - Target-side rubble impacts: dormant buildings receive local glazing/wall damage and wake only after a spatially coherent high-energy hit.
 - A finite conservative second long-wave pulse, with injected volume and momentum recorded in checkpoints and metrics.
 - Water-coupled cars, breakable trees, destructible low-rise shops, roads, sidewalks, and distinct environment materials.
+- Foreground low-rise streetscape, directional building/object shadows, and
+  deterministic sun glints on facade glass and vehicle paint.
+- A short 10 m secondary bore with a validated open-field arrival at all three
+  building-row depths; it replaces the former long pulse that read as a slow
+  water-level rise.
 - Cinematic lighting, water Fresnel/specular response, foam, screen-space contact shading, wetness, atmospheric haze, and vignette.
 - Original, front, side, and top cameras combined into one 1920×1080 video.
 - Direct NVENC output without intermediate PNG sequences.
@@ -154,6 +159,11 @@ physics.
   the adaptive 1:8 mass ratio is not treated as equal-volume SPH. Execution is
   selected explicitly with `mode: density_projection`; the checked-in
   `mode: diagnostic` never changes the WCSPH integrator.
+  The experimental path also contains a divergence projection and a fully
+  device-side high-compression work list. The GPU expands selected particles
+  by one neighbour ring before compacting their fluid slots, so a pressure
+  correction cannot stop abruptly at the threshold boundary. Both stages stay
+  subordinate to the disabled top-level flag.
 - `v3.rigid_clusters.early_rigidification` is a complete switchable transition
   path. It scans detached fragments more frequently, requires independent
   detached and quiet histories, keeps foundation-supported fragments
@@ -186,6 +196,21 @@ finite. The early checkpoint is approximately performance-neutral (1.02x).
 The solver remains disabled because one late local projection residual reached
 30.9%, trajectories differ materially from WCSPH, and solid-reaction/damage
 equivalence has not passed a production-length run.
+
+`benchmark_divergence_one_second.py` is the promotion gate for the combined
+density/divergence solve. It recompiles on a disposable solver, reloads the
+checkpoint for measurement, advances both methods across identical output-frame
+boundaries without rendering, and records full-frame time, structural response,
+and combined SPH plus shallow-water volume. This avoids the unequal warm-up
+offset present in older microbenchmarks.
+
+The 2026-08-04 one-second late-checkpoint gate at `dt=0.000595238` remains a
+rejection, not a production result. The core/halo selective solve is 1.87x
+faster in physics and 1.77x faster per complete no-render frame, stays finite,
+and preserves combined water volume to `1.17e-8`. It nevertheless raises final
+fluid height p99 from 7.32 m to 12.40 m, changes longitudinal fluid momentum,
+and releases 58 fewer cohesive fragments. The checked-in top-level implicit
+flag therefore remains disabled while 2x/3x timestep gates are evaluated.
 
 `benchmark_early_rigidification.py` converts 343 additional detached clusters
 (159,684 particles) in the late checkpoint, but does not reduce total substep
