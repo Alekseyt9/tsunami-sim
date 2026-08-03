@@ -23,6 +23,10 @@ The project targets an NVIDIA RTX 5070 with 12 GB of VRAM. It prioritizes physic
 - Rigid-cluster conversion for detached, settled debris.
 - Frictional rigid-debris contacts with equal-and-opposite forces and torques.
 - Rigid-to-deformable reactivation after a new strong collision.
+- Target-side rubble impacts: dormant buildings receive local glazing/wall damage and wake only after a spatially coherent high-energy hit.
+- A finite conservative second long-wave pulse, with injected volume and momentum recorded in checkpoints and metrics.
+- Water-coupled cars, breakable trees, destructible low-rise shops, roads, sidewalks, and distinct environment materials.
+- Cinematic lighting, water Fresnel/specular response, foam, screen-space contact shading, wetness, atmospheric haze, and vignette.
 - Original, front, side, and top cameras combined into one 1920×1080 video.
 - Direct NVENC output without intermediate PNG sequences.
 - A playable MP4 is atomically updated after every completed simulated second.

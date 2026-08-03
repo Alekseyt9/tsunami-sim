@@ -32,9 +32,12 @@ from hybrid_kernels import (  # noqa: E402
     accumulate_rigid_proxy_boundaries,
     accumulate_rigid_proxy_contacts,
     accumulate_building_damage,
+    accumulate_dormant_debris_contacts,
     accumulate_material_impact,
     apply_conservative_fluid_merges,
-    activate_buildings_from_hits,
+    activate_buildings_from_load,
+    activate_buildings_from_debris_impact,
+    apply_dormant_impact_damage,
     apply_building_activity,
     clear_body_accumulators,
     clear_rigid_sample_bottom,
@@ -43,7 +46,7 @@ from hybrid_kernels import (  # noqa: E402
     compute_density_multirate,
     compute_fluid_forces_multirate,
     consume_deferred_fluid_impulse,
-    count_loaded_building_particles,
+    accumulate_loaded_building_volume,
     integrate_rigid_bodies,
     integrate_multirate,
     mask_rigid_particles_as_fixed,
@@ -207,6 +210,7 @@ class HybridDelugeSolver(DelugeSolver):
         local_impact_host = np.zeros(self.capacity, dtype=np.int32)
         active_host = np.zeros(max(1, self.building_count), dtype=np.int32)
         activation_exposure_host = np.zeros(max(1, self.building_count), dtype=np.float32)
+        debris_activation_exposure_host = np.zeros(max(1, self.building_count), dtype=np.float32)
         self.adaptive_merged_groups_total = 0
         self.adaptive_merged_particles_total = 0
         saved_support_graph = None
@@ -238,6 +242,11 @@ class HybridDelugeSolver(DelugeSolver):
                     activation_exposure_host[:min(len(saved_exposure), len(activation_exposure_host))] = (
                         saved_exposure[:len(activation_exposure_host)]
                     )
+                if "building_debris_activation_exposure_seconds" in state:
+                    saved_exposure = state["building_debris_activation_exposure_seconds"]
+                    debris_activation_exposure_host[
+                        :min(len(saved_exposure), len(debris_activation_exposure_host))
+                    ] = saved_exposure[:len(debris_activation_exposure_host)]
                 if "fragment_id" in state:
                     fragment_host = state["fragment_id"].astype(np.int32, copy=True)
                     fragment_capacity.fill(-1)
@@ -410,7 +419,36 @@ class HybridDelugeSolver(DelugeSolver):
         self.building_activation_exposure = wp.array(
             activation_exposure_host, dtype=float, device=self.device
         )
-        self.activation_hits = wp.zeros(max(1, self.building_count), dtype=wp.int32, device=self.device)
+        self.building_debris_activation_exposure = wp.array(
+            debris_activation_exposure_host, dtype=float, device=self.device
+        )
+        self.dormant_debris_contact_force = wp.zeros(
+            self.capacity, dtype=wp.vec3, device=self.device
+        )
+        self.building_debris_impacted_volume = wp.zeros(
+            max(1, self.building_count), dtype=float, device=self.device
+        )
+        self.building_debris_peak_acceleration = wp.zeros(
+            max(1, self.building_count), dtype=float, device=self.device
+        )
+        maximum_activation_elevation = float(
+            self.v3_cfg.get("maximum_activation_elevation", 8.0)
+        )
+        activation_base_mask = (
+            solid_building_mask
+            & (rest_host[:, 1] <= maximum_activation_elevation)
+        )
+        activation_base_volume_host = np.bincount(
+            building_host[activation_base_mask],
+            weights=volume_host[activation_base_mask].astype(np.float64, copy=False),
+            minlength=max(1, self.building_count),
+        ).astype(np.float32)
+        self.building_activation_base_volume = wp.array(
+            activation_base_volume_host, dtype=float, device=self.device
+        )
+        self.activation_loaded_volume = wp.zeros(
+            max(1, self.building_count), dtype=float, device=self.device
+        )
         self.last_active_count = int(np.count_nonzero(active_host))
         self.last_released_fragment_count = 0
         self.last_preimpact_building_count = 0
@@ -452,7 +490,9 @@ class HybridDelugeSolver(DelugeSolver):
         view_height = int(render.get("view_height", render["height"]))
         self.renderers = {
             str(name): HybridRenderer(
-                view_width, view_height, camera, self.device, skin_path, str(name),
+                int(camera.get("render_width", view_width)),
+                int(camera.get("render_height", view_height)),
+                camera, self.device, skin_path, str(name),
                 float(render.get("maximum_panel_stretch", 1.8)),
                 float(self.v3_cfg.get("water_surface", {}).get("tangent_scale", 2.8)),
                 float(self.v3_cfg.get("water_surface", {}).get("normal_scale", 2.45)),
@@ -1059,6 +1099,9 @@ class HybridDelugeSolver(DelugeSolver):
             ),
             building_active=self.building_active.numpy(),
             building_activation_exposure_seconds=self.building_activation_exposure.numpy(),
+            building_debris_activation_exposure_seconds=(
+                self.building_debris_activation_exposure.numpy()
+            ),
             base_fixed=self.base_fixed[:self.count].numpy(),
             material_impact_impulse=self.arrays["material_impact_impulse"][:self.count].numpy(),
             local_impact_active=self.arrays["local_impact_active"][:self.count].numpy(),
@@ -1107,6 +1150,12 @@ class HybridDelugeSolver(DelugeSolver):
             water_phase_transition_totals=self.water_phase_transition_totals,
             shallow_water_state=self.shallow_water.state.numpy(),
             shallow_water_accumulated_dt=np.float32(self.shallow_water.accumulated_dt),
+            wave_train_injected_volume=np.float64(
+                self.shallow_water.wave_train_injected_volume
+            ),
+            wave_train_injected_momentum_z=np.float64(
+                self.shallow_water.wave_train_injected_momentum_z
+            ),
             shallow_emitted_particles_total=np.int64(self.shallow_water.emitted_particles_total),
             shallow_emitted_volume_total=np.float64(self.shallow_water.emitted_volume_total),
             shallow_merged_particles_total=np.int64(self.shallow_water.merged_particles_total),
@@ -1442,14 +1491,45 @@ class HybridDelugeSolver(DelugeSolver):
             )
         clustering = self.v3_cfg["fragment_clustering"]
         self.shallow_water.couple(a, self.count, dt)
+        debris_policy = self.v3_cfg.get("debris_impact_activation", {})
+        self.dormant_debris_contact_force.zero_()
+        self.building_debris_impacted_volume.zero_()
+        self.building_debris_peak_acceleration.zero_()
+        if bool(debris_policy.get("enabled", True)) and self.building_count:
+            wp.launch(
+                accumulate_dormant_debris_contacts, dim=self.count,
+                inputs=[
+                    self.grid.id, view, a["v"][:self.count], a["radius"][:self.count],
+                    a["mass"][:self.count], a["volume"][:self.count],
+                    a["kind"][:self.count], a["building_id"][:self.count],
+                    self.fragment_id[:self.count], self.rigid_state,
+                    a["fixed"][:self.count], self.building_active,
+                    self.dormant_debris_contact_force[:self.count],
+                    self.building_debris_impacted_volume,
+                    self.building_debris_peak_acceleration, self.max_support,
+                    float(debris_policy.get("minimum_peak_acceleration", 25.0)),
+                ], device=self.device,
+            )
         wp.launch(
             accumulate_material_impact, dim=self.count,
             inputs=[a["kind"][:self.count], a["structural_class"][:self.count],
                     a["mass"][:self.count], a["solid_force"][:self.count],
+                    self.dormant_debris_contact_force[:self.count],
                     a["material_impact_impulse"][:self.count],
                     a["local_impact_active"][:self.count], dt],
             device=self.device,
         )
+        if bool(debris_policy.get("enabled", True)) and self.building_count:
+            wp.launch(
+                apply_dormant_impact_damage, dim=self.count,
+                inputs=[
+                    a["kind"][:self.count], a["building_id"][:self.count],
+                    a["structural_class"][:self.count], self.building_active,
+                    a["material_impact_impulse"][:self.count], a["damage"][:self.count],
+                    dt, float(debris_policy.get("glass_damage_rate", 8.0)),
+                    float(debris_policy.get("wall_damage_rate", 0.8)),
+                ], device=self.device,
+            )
         self.building_damage_integral.zero_()
         wp.launch(
             accumulate_building_damage, dim=self.count,
@@ -1462,14 +1542,12 @@ class HybridDelugeSolver(DelugeSolver):
             inputs=[self.grid.id, view, a["rest_x"][:self.count], a["v"][:self.count], a["radius"][:self.count],
                     a["mass"][:self.count], a["kind"][:self.count], a["material"][:self.count],
                     a["structural_class"][:self.count], a["building_id"][:self.count],
-                    self.building_activation_exposure,
                     self.building_damage_integral, self.building_structural_volume,
                     self.fragment_id[:self.count], self.rigid_state, self.fragment_support,
                     a["material_impact_impulse"][:self.count],
                     a["fixed"][:self.count],
                     a["damage"][:self.count], a["solid_force"][:self.count], a["acceleration"][:self.count],
                     self.max_support, dt,
-                    float(self.v3_cfg.get("activation_required_seconds", 0.02)),
                     float(clustering.get("internal_stiffness_multiplier", 2.0)),
                     float(clustering.get("damage_rate", 1.5)),
                     float(clustering.get("propagation_threshold", 0.65)),
@@ -1481,7 +1559,7 @@ class HybridDelugeSolver(DelugeSolver):
                     float(clustering.get("facade_support_loss_collapse_threshold", 0.75)),
                     float(clustering.get("facade_support_loss_damage_rate", 1.0)),
                     float(clustering.get("facade_unsupported_damage_rate", 0.75)),
-                    float(clustering.get("structural_unsupported_damage_rate", 1.5)),
+                    float(clustering.get("structural_unsupported_damage_rate", 0.0)),
                     float(clustering.get("elastic_force_cap_multiplier", 1.25)),
                     float(clustering.get("compression_force_cap_multiplier", 2.0))],
             device=self.device,
@@ -1632,28 +1710,44 @@ class HybridDelugeSolver(DelugeSolver):
                 device=self.device,
             )
         self.time += dt
-        self.shallow_water.advance(dt, float(self.cfg["rest_density"]))
+        self.shallow_water.advance(dt, float(self.cfg["rest_density"]), self.time)
         if self.building_count == 0:
             return
-        wp.launch(clear_int, dim=self.building_count, inputs=[self.activation_hits], device=self.device)
+        self.activation_loaded_volume.zero_()
         wp.launch(
-            count_loaded_building_particles, dim=self.count,
+            accumulate_loaded_building_volume, dim=self.count,
             inputs=[self.arrays["rest_x"][:self.count], self.arrays["kind"][:self.count],
                     self.arrays["building_id"][:self.count],
-                    self.arrays["mass"][:self.count], self.arrays["solid_force"][:self.count],
-                    float(self.v3_cfg.get("activation_force_per_mass", 5.0)),
+                    self.arrays["mass"][:self.count], self.arrays["volume"][:self.count],
+                    self.arrays["solid_force"][:self.count],
+                    float(self.v3_cfg.get("activation_force_per_mass", 8.0)),
                     float(self.v3_cfg.get("maximum_activation_elevation", 8.0)),
-                    self.activation_hits],
+                    self.activation_loaded_volume],
             device=self.device,
         )
         wp.launch(
-            activate_buildings_from_hits, dim=self.building_count,
-            inputs=[self.activation_hits, self.building_active, self.building_activation_exposure,
-                    int(self.v3_cfg.get("minimum_contact_particles", 12)), dt,
-                    float(self.v3_cfg.get("activation_required_seconds", 0.02)),
-                    float(self.v3_cfg.get("activation_exposure_decay_multiplier", 4.0))],
+            activate_buildings_from_load, dim=self.building_count,
+            inputs=[self.activation_loaded_volume, self.building_activation_base_volume,
+                    self.building_active, self.building_activation_exposure,
+                    float(self.v3_cfg.get("minimum_loaded_base_fraction", 0.08)), dt,
+                    float(self.v3_cfg.get("activation_required_seconds", 0.25)),
+                    float(self.v3_cfg.get("activation_exposure_decay_multiplier", 2.0))],
             device=self.device,
         )
+        debris_policy = self.v3_cfg.get("debris_impact_activation", {})
+        if bool(debris_policy.get("enabled", True)):
+            wp.launch(
+                activate_buildings_from_debris_impact, dim=self.building_count,
+                inputs=[
+                    self.building_debris_impacted_volume, self.building_structural_volume,
+                    self.building_debris_peak_acceleration, self.building_active,
+                    self.building_debris_activation_exposure,
+                    float(debris_policy.get("minimum_impacted_volume_fraction", 0.002)),
+                    float(debris_policy.get("minimum_peak_acceleration", 25.0)),
+                    float(debris_policy.get("required_exposure_seconds", 0.03)),
+                    float(debris_policy.get("exposure_decay_multiplier", 0.2)), dt,
+                ], device=self.device,
+            )
         wp.launch(
             apply_building_activity, dim=self.count,
             inputs=[self.arrays["kind"][:self.count], self.arrays["building_id"][:self.count],
@@ -1838,6 +1932,21 @@ class HybridDelugeSolver(DelugeSolver):
             self.last_active_count = active_count
         result["active_buildings"] = active_count
         building_volume = self.building_structural_volume.numpy()
+        debris_impacted_volume = self.building_debris_impacted_volume.numpy()
+        debris_impacted_fraction = np.divide(
+            debris_impacted_volume, np.maximum(building_volume, 1.0e-6)
+        )
+        result["debris_impact_peak_acceleration_m_s2"] = float(
+            np.max(self.building_debris_peak_acceleration.numpy())
+            if self.building_count else 0.0
+        )
+        result["debris_impact_max_volume_fraction"] = float(
+            np.max(debris_impacted_fraction) if len(debris_impacted_fraction) else 0.0
+        )
+        result["debris_activation_exposure_max_seconds"] = float(
+            np.max(self.building_debris_activation_exposure.numpy())
+            if self.building_count else 0.0
+        )
         particle_fragment = self.fragment_id[:self.count].numpy()
         valid_support_particle = (kind_host != 0) & (particle_fragment >= 0)
         unsupported_particle = valid_support_particle.copy()

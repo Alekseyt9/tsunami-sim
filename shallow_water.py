@@ -89,6 +89,46 @@ def advance_shallow_water(
 
 
 @wp.kernel
+def inject_wave_train_pulse(
+    state: wp.array2d(dtype=wp.vec3),
+    injected_volume: wp.array(dtype=float),
+    injected_momentum_z: wp.array(dtype=float),
+    nx: int,
+    nz: int,
+    cell_size: float,
+    dt: float,
+    simulation_time: float,
+    start_time: float,
+    duration: float,
+    pulse_height: float,
+    pulse_speed: float,
+    background_current: float,
+    pulse_length: float,
+):
+    """Inject a finite, conservative long-wave slug at the offshore boundary."""
+    ix, iz = wp.tid()
+    if simulation_time < start_time or simulation_time >= start_time + duration:
+        return
+    z_from_boundary = (float(iz) + 0.5) * cell_size
+    if z_from_boundary >= pulse_length:
+        return
+    phase = (simulation_time - start_time) / wp.max(duration, 1.0e-5)
+    temporal = wp.sin(3.14159265 * phase)
+    temporal_rate = (2.0 / wp.max(duration, 1.0e-5)) * temporal * temporal
+    spatial = 0.5 + 0.5 * wp.cos(3.14159265 * z_from_boundary / pulse_length)
+    dh = pulse_height * temporal_rate * spatial * dt
+    if dh <= 0.0:
+        return
+    previous = state[ix, iz]
+    velocity = background_current + pulse_speed * dh / wp.max(previous[0] + dh, 1.0e-5)
+    added_momentum = dh * velocity
+    state[ix, iz] = wp.vec3(previous[0] + dh, previous[1], previous[2] + added_momentum)
+    area = cell_size * cell_size
+    wp.atomic_add(injected_volume, 0, dh * area)
+    wp.atomic_add(injected_momentum_z, 0, added_momentum * area)
+
+
+@wp.kernel
 def couple_sph_interface(
     x: wp.array(dtype=wp.vec3),
     v: wp.array(dtype=wp.vec3),
@@ -387,6 +427,8 @@ class ShallowWaterFarField:
         self.interface_z = float(policy.get("sph_z_min", cfg["reservoir_z_min"]))
         self.update_interval = float(policy.get("update_interval", 0.008))
         self.accumulated_dt = 0.0
+        self.wave_train_injected_volume = 0.0
+        self.wave_train_injected_momentum_z = 0.0
         host = np.zeros((self.nx, self.nz, 3), dtype=np.float32)
         depth = float(cfg["water_depth"])
         crest = float(cfg["wave_height"])
@@ -427,6 +469,12 @@ class ShallowWaterFarField:
                     self.merged_particles_total = int(saved["shallow_merged_particles_total"])
                 if "shallow_merged_volume_total" in saved:
                     self.merged_volume_total = float(saved["shallow_merged_volume_total"])
+                if "wave_train_injected_volume" in saved:
+                    self.wave_train_injected_volume = float(saved["wave_train_injected_volume"])
+                if "wave_train_injected_momentum_z" in saved:
+                    self.wave_train_injected_momentum_z = float(saved["wave_train_injected_momentum_z"])
+        self._wave_train_volume_step = wp.zeros(1, dtype=float, device=device)
+        self._wave_train_momentum_step = wp.zeros(1, dtype=float, device=device)
 
     def couple(self, arrays: dict, count: int, dt: float):
         if not self.enabled:
@@ -442,7 +490,7 @@ class ShallowWaterFarField:
             device=self.device,
         )
 
-    def advance(self, dt: float, rest_density: float):
+    def advance(self, dt: float, rest_density: float, simulation_time: float = 0.0):
         if not self.enabled:
             return
         self.accumulated_dt += dt
@@ -454,7 +502,8 @@ class ShallowWaterFarField:
         maximum_dt = float(self.cfg.get("maximum_step", 0.02))
         substeps = max(1, int(math.ceil(step_dt / maximum_dt)))
         local_dt = step_dt / substeps
-        for _ in range(substeps):
+        wave_train = self.cfg.get("wave_train", {})
+        for substep in range(substeps):
             wp.launch(
                 advance_shallow_water, dim=(self.nx, self.nz),
                 inputs=[self.state, self.updated, self.nx, self.nz, self.cell_size, local_dt,
@@ -462,6 +511,30 @@ class ShallowWaterFarField:
                         float(self.cfg.get("dry_depth", 0.02))], device=self.device,
             )
             self.state, self.updated = self.updated, self.state
+            if bool(wave_train.get("enabled", False)):
+                self._wave_train_volume_step.zero_()
+                self._wave_train_momentum_step.zero_()
+                local_time = simulation_time - step_dt + (substep + 1) * local_dt
+                wp.launch(
+                    inject_wave_train_pulse, dim=(self.nx, self.nz),
+                    inputs=[
+                        self.state, self._wave_train_volume_step,
+                        self._wave_train_momentum_step, self.nx, self.nz,
+                        self.cell_size, local_dt, local_time,
+                        float(wave_train.get("start_seconds", 7.0)),
+                        float(wave_train.get("duration_seconds", 3.0)),
+                        float(wave_train.get("height", 4.5)),
+                        float(wave_train.get("speed", 14.0)),
+                        float(wave_train.get("background_current", 5.0)),
+                        float(wave_train.get("length_m", 30.0)),
+                    ], device=self.device,
+                )
+                self.wave_train_injected_volume += float(
+                    self._wave_train_volume_step.numpy()[0]
+                )
+                self.wave_train_injected_momentum_z += float(
+                    self._wave_train_momentum_step.numpy()[0]
+                )
 
     def commit_exchange(self, rest_density: float):
         """Apply pending SPH exchange without advancing the shallow grid.
@@ -598,4 +671,6 @@ class ShallowWaterFarField:
             "shallow_merged_particles": self.merged_particles_total,
             "shallow_merged_volume_m3": self.merged_volume_total,
             "shallow_net_transfer_volume_m3": self.emitted_volume_total - self.merged_volume_total,
+            "wave_train_injected_volume_m3": self.wave_train_injected_volume,
+            "wave_train_injected_momentum_z": self.wave_train_injected_momentum_z,
         }

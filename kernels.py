@@ -439,7 +439,13 @@ def clear_render(depth: wp.array(dtype=float), color: wp.array(dtype=wp.vec3), w
     y = i // width
     t = float(y) / float(height)
     depth[i] = 1.0e9
-    color[i] = wp.vec3(0.08 + 0.16 * (1.0 - t), 0.14 + 0.18 * (1.0 - t), 0.18 + 0.20 * (1.0 - t))
+    upper = wp.vec3(0.075, 0.16, 0.23)
+    horizon = wp.vec3(0.46, 0.56, 0.60)
+    lower = wp.vec3(0.23, 0.28, 0.29)
+    if t < 0.62:
+        color[i] = wp.lerp(upper, horizon, wp.smoothstep(0.0, 0.62, t))
+    else:
+        color[i] = wp.lerp(horizon, lower, wp.smoothstep(0.62, 1.0, t))
 
 
 @wp.kernel
@@ -643,12 +649,71 @@ def shade_water_surface(
     if y + 1 < height and water_depth[i + width] < 1.0e8: zd = water_depth[i + width]
     dx = zr - zl; dy = zd - zu
     normal = wp.normalize(wp.vec3(-dx * 7.0, dy * 7.0, 1.0))
-    fresnel = wp.pow(1.0 - wp.clamp(normal[2], 0.0, 1.0), 3.0)
-    light = wp.clamp(wp.dot(normal, wp.normalize(wp.vec3(-0.35, 0.55, 0.76))), 0.0, 1.0)
+    facing = wp.clamp(normal[2], 0.0, 1.0)
+    fresnel = 0.10 + 0.90 * wp.pow(1.0 - facing, 3.0)
+    sun = wp.normalize(wp.vec3(-0.32, 0.58, 0.75))
+    light = wp.clamp(wp.dot(normal, sun), 0.0, 1.0)
+    sparkle = wp.pow(light, 10.0)
     foam = wp.clamp(foam_field[i], 0.0, 1.0)
-    water = wp.lerp(wp.vec3(0.018, 0.15, 0.21), wp.vec3(0.18, 0.39, 0.45), fresnel)
-    water += wp.vec3(0.18, 0.24, 0.25) * light * 0.28
-    water = wp.lerp(water, wp.vec3(0.78, 0.86, 0.84), foam * 0.78)
+    sky_reflection = wp.vec3(0.30, 0.43, 0.49)
+    reflected_scene = sky_reflection
+    reflection_found = float(0.0)
+    # Cheap screen-space reflection for the calm water behind the front. Scan
+    # towards the upper image for the nearest dry opaque silhouette and use it
+    # as a softened reflection instead of pretending Fresnel is only a tint.
+    for step in range(1, 17):
+        py = y - step * 4
+        if py >= 0 and reflection_found < 0.5:
+            sample_index = py * width + x
+            if scene_depth[sample_index] < 1.0e8 and water_depth[sample_index] > 1.0e8:
+                reflected_scene = color[sample_index]
+                reflection_found = 1.0
+    reflection = wp.lerp(sky_reflection, reflected_scene, reflection_found * 0.62)
+    water = wp.lerp(wp.vec3(0.008, 0.085, 0.125), reflection, fresnel * 0.72)
+    water += wp.vec3(0.13, 0.19, 0.20) * light * 0.30
+    water += wp.vec3(0.94, 0.83, 0.61) * sparkle * 0.75
+    water = wp.lerp(water, wp.vec3(0.82, 0.89, 0.86), wp.sqrt(foam) * 0.84)
     behind = color[i]
     alpha = 0.76 + foam * 0.18
     color[i] = wp.lerp(behind, water, alpha)
+
+
+@wp.kernel
+def apply_cinematic_postprocess(
+    scene_depth: wp.array(dtype=float),
+    water_depth: wp.array(dtype=float),
+    color: wp.array(dtype=wp.vec3),
+    width: int,
+    height: int,
+):
+    """Small screen-space AO, wet-contact darkening, distance haze and vignette."""
+    i = wp.tid()
+    x = i % width; y = i // width
+    z = wp.min(scene_depth[i], water_depth[i])
+    value = color[i]
+    if z < 1.0e8:
+        occlusion = float(0.0)
+        samples = int(0)
+        for oy in range(-4, 5, 4):
+            for ox in range(-4, 5, 4):
+                if ox == 0 and oy == 0:
+                    continue
+                px = x + ox; py = y + oy
+                if px >= 0 and px < width and py >= 0 and py < height:
+                    neighbour = wp.min(scene_depth[py * width + px], water_depth[py * width + px])
+                    if neighbour < z - 0.35:
+                        occlusion += wp.clamp((z - neighbour) / 4.0, 0.0, 1.0)
+                    samples += 1
+        ao = 1.0 - 0.42 * occlusion / float(wp.max(samples, 1))
+        value *= ao
+        if scene_depth[i] < 1.0e8 and water_depth[i] < 1.0e8:
+            separation = water_depth[i] - scene_depth[i]
+            wet = 1.0 - wp.smoothstep(0.0, 4.0, wp.abs(separation))
+            wet_value = wp.vec3(value[0] * 0.58, value[1] * 0.66, value[2] * 0.68)
+            value = wp.lerp(value, wet_value, wet * 0.32)
+        fog = wp.smoothstep(220.0, 480.0, z)
+        value = wp.lerp(value, wp.vec3(0.36, 0.46, 0.50), fog * 0.20)
+    nx = (float(x) + 0.5) / float(width) * 2.0 - 1.0
+    ny = (float(y) + 0.5) / float(height) * 2.0 - 1.0
+    vignette = 1.0 - 0.13 * wp.clamp(nx * nx + ny * ny - 0.35, 0.0, 1.0)
+    color[i] = value * vignette

@@ -9,6 +9,7 @@ import warp as wp
 
 from kernels import (
     bilateral_depth_axis,
+    apply_cinematic_postprocess,
     clear_depth,
     clear_render,
     clear_scalar,
@@ -157,6 +158,10 @@ class HybridRenderer(ParticleRenderer):
         wp.launch(
             shade_water_surface, dim=pixel_count,
             inputs=[smooth_source, self.water_foam, self.depth, self.color, self.width, self.height], device=self.device,
+        )
+        wp.launch(
+            apply_cinematic_postprocess, dim=pixel_count,
+            inputs=[self.depth, smooth_source, self.color, self.width, self.height], device=self.device,
         )
         wp.synchronize_device(self.device)
 

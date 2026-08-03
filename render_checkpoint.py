@@ -11,7 +11,7 @@ import warp as wp
 
 HERE = Path(__file__).resolve().parent
 
-from solver_base import compose_quad_view  # noqa: E402
+from solver_base import compose_hero_insets, compose_quad_view  # noqa: E402
 from hybrid_renderer import HybridRenderer  # noqa: E402
 
 
@@ -52,11 +52,18 @@ def main():
     frames = {}
     for name, camera in render["views"].items():
         renderer = HybridRenderer(
-            view_width, view_height, camera, device, args.skin, name,
+            int(camera.get("render_width", view_width)),
+            int(camera.get("render_height", view_height)),
+            camera, device, args.skin, name,
             float(render.get("maximum_panel_stretch", 1.8)),
         )
         frames[name] = renderer.render(arrays, len(host["kind"]), None, frame, time_s, stats)
-    quad = compose_quad_view(
+    compose = (
+        compose_hero_insets
+        if render.get("view_layout") == "hero_insets"
+        else compose_quad_view
+    )
+    quad = compose(
         frames, list(render["quad_order"]), int(render["width"]), int(render["height"])
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)

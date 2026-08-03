@@ -58,6 +58,13 @@
     {"shape": "offset", "split_ratio": 0.40, "upper_scale": [0.76, 0.76], "upper_offset": [-0.08, 0.07]}
   ],
   "building_palettes": [4, 0, 5, 2, 3, 1, 4, 0, 2, 5, 3, 1, 4, 0, 2],
+  "environment": {
+    "enabled": true,
+    "seed": 7319,
+    "cars": {"count": 30},
+    "trees": {"count": 24},
+    "small_buildings": {"count": 6}
+  },
   "v3": {
     "initially_active_buildings": [],
     "adaptive_water_merge": {
@@ -100,13 +107,31 @@
       "merge_sph": true,
       "merge_buffer_depth": 3.0,
       "minimum_return_speed": 0.25,
-      "forced_capture_depth": 0.75
+      "forced_capture_depth": 0.75,
+      "wave_train": {
+        "enabled": true,
+        "start_seconds": 7.0,
+        "duration_seconds": 3.0,
+        "height": 4.5,
+        "speed": 14.0,
+        "background_current": 5.0,
+        "length_m": 30.0
+      }
     },
-    "activation_force_per_mass": 5.0,
-    "minimum_contact_particles": 12,
+    "activation_force_per_mass": 8.0,
+    "minimum_loaded_base_fraction": 0.08,
     "maximum_activation_elevation": 8.0,
-    "activation_required_seconds": 0.02,
-    "activation_exposure_decay_multiplier": 4.0,
+    "activation_required_seconds": 0.15,
+    "activation_exposure_decay_multiplier": 0.1,
+    "debris_impact_activation": {
+      "enabled": true,
+      "minimum_peak_acceleration": 25.0,
+      "minimum_impacted_volume_fraction": 0.002,
+      "required_exposure_seconds": 0.03,
+      "exposure_decay_multiplier": 0.2,
+      "glass_damage_rate": 8.0,
+      "wall_damage_rate": 0.8
+    },
     "support_graph": {
       "enabled": true,
       "update_every_frames": 1,
@@ -140,18 +165,18 @@
       "minimum_cluster_particles": 36,
       "cell_size": [6.0, 3.0, 6.0],
       "internal_stiffness_multiplier": 3.5,
-      "damage_rate": 1.0,
-        "propagation_threshold": 0.75,
+        "damage_rate": 0.7,
+        "propagation_threshold": 0.85,
         "max_damage_per_substep": 0.00025,
         "fracture_reference_spacing": 0.65,
-        "release_damage_fraction": 0.20,
+        "release_damage_fraction": 0.50,
         "collapse_gravity_damage_onset": 0.015,
         "collapse_gravity_damage_full": 0.10,
         "facade_support_loss_minimum_elevation": 4.0,
         "facade_support_loss_collapse_threshold": 0.75,
-        "facade_support_loss_damage_rate": 1.0,
-        "facade_unsupported_damage_rate": 0.75,
-        "structural_unsupported_damage_rate": 1.5,
+        "facade_support_loss_damage_rate": 0.35,
+        "facade_unsupported_damage_rate": 0.35,
+        "structural_unsupported_damage_rate": 0.0,
         "elastic_force_cap_multiplier": 1.25,
         "compression_force_cap_multiplier": 2.0
     },
@@ -161,7 +186,7 @@
       "required_quiet_scans": 2,
       "minimum_particles": 12,
       "fully_damaged_threshold": 0.95,
-      "release_damage_fraction": 0.20,
+      "release_damage_fraction": 0.50,
       "maximum_internal_velocity_rms": 2.5,
       "linear_damping": 0.12,
       "angular_damping": 0.20,
@@ -238,17 +263,17 @@
     "progressive_fragment_seconds": 1.0,
     "width": 1920,
     "height": 1080,
-    "view_width": 960,
-    "view_height": 540,
-    "view_layout": "quad",
+    "view_width": 640,
+    "view_height": 360,
+    "view_layout": "hero_insets",
     "quad_order": ["original", "front", "side", "top"],
     "maximum_panel_stretch": 1.8,
-    "camera": {"position": [158, 88, -118], "target": [0, 24, 42], "fov_degrees": 48},
+    "camera": {"position": [145, 72, -105], "target": [0, 20, 48], "fov_degrees": 43},
     "views": {
-      "original": {"position": [158, 88, -118], "target": [0, 24, 42], "fov_degrees": 48},
-      "front": {"position": [0, 58, -138], "target": [0, 25, 43], "fov_degrees": 48},
-      "side": {"position": [175, 62, 42], "target": [0, 25, 42], "fov_degrees": 48},
-      "top": {"position": [0, 225, -8], "target": [0, 0, 45], "fov_degrees": 48}
+      "original": {"position": [145, 72, -105], "target": [0, 20, 48], "fov_degrees": 43, "render_width": 1440, "render_height": 810},
+      "front": {"position": [0, 50, -125], "target": [0, 21, 49], "fov_degrees": 45},
+      "side": {"position": [168, 57, 48], "target": [0, 22, 50], "fov_degrees": 45},
+      "top": {"position": [0, 218, 2], "target": [0, 0, 52], "fov_degrees": 46}
     }
   }
 }

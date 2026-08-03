@@ -44,6 +44,32 @@ def compose_quad_view(frames: dict[str, np.ndarray], order: list[str], width: in
     return canvas
 
 
+def compose_hero_insets(frames: dict[str, np.ndarray], order: list[str], width: int, height: int) -> np.ndarray:
+    """Keep a cinematic main view while retaining three synchronized cameras."""
+    if len(order) != 4 or any(name not in frames for name in order):
+        raise ValueError("Hero-insets layout requires exactly four named views")
+    canvas = np.asarray(
+        Image.fromarray(frames[order[0]]).resize((width, height), Image.Resampling.LANCZOS)
+    ).copy()
+    inset_width = max(240, int(width * 0.285))
+    inset_height = max(135, int(height * 0.245))
+    margin = max(10, int(width * 0.009))
+    gap = max(8, int(height * 0.012))
+    x0 = width - inset_width - margin
+    for index, name in enumerate(order[1:]):
+        y0 = margin + index * (inset_height + gap)
+        inset = np.asarray(
+            Image.fromarray(frames[name]).resize(
+                (inset_width, inset_height), Image.Resampling.LANCZOS
+            )
+        )
+        border = 4
+        canvas[y0 - border:y0 + inset_height + border,
+               x0 - border:x0 + inset_width + border] = 10
+        canvas[y0:y0 + inset_height, x0:x0 + inset_width] = inset
+    return canvas
+
+
 class DelugeSolver:
     def __init__(self, cfg: dict, output: Path, resume: Path | None = None):
         self.cfg = cfg
@@ -63,8 +89,12 @@ class DelugeSolver:
             scene = ParticleScene(rest_density=float(cfg["rest_density"]))
             scene.add_water(cfg)
             building_counts = scene.add_city(cfg)
+            environment_counts = scene.add_environment(cfg)
             initial = scene.as_numpy()
-            print(f"Water + solids: {len(initial['x']):,} particles; building lattices: {building_counts}")
+            print(
+                f"Water + solids: {len(initial['x']):,} particles; "
+                f"building lattices: {building_counts}; environment: {environment_counts}"
+            )
 
         self.count = len(initial["x"])
         self.solid_count = int(np.count_nonzero(initial["kind"] != 0))
@@ -253,7 +283,8 @@ class DelugeSolver:
         output_mode = "png" if smoke or no_video else render_cfg.get("output_mode", "png")
         view_renderers = getattr(self, "renderers", {"main": self.renderer})
         multiple_views = len(view_renderers) > 1
-        quad_layout = multiple_views and render_cfg.get("view_layout", "separate") == "quad"
+        view_layout = str(render_cfg.get("view_layout", "separate"))
+        quad_layout = multiple_views and view_layout in ("quad", "hero_insets")
         quad_order = list(render_cfg.get("quad_order", view_renderers.keys()))
         stream_writers = {}
         if output_mode == "video":
@@ -297,7 +328,8 @@ class DelugeSolver:
                 if not quad_layout and view_name in stream_writers:
                     stream_writers[view_name].write(rgb)
             if quad_layout:
-                quad_rgb = compose_quad_view(
+                compose = compose_hero_insets if view_layout == "hero_insets" else compose_quad_view
+                quad_rgb = compose(
                     rendered_views, quad_order, int(render_cfg["width"]), int(render_cfg["height"])
                 )
                 if "quad" in stream_writers:
@@ -423,7 +455,7 @@ class DelugeSolver:
                 "resolution": [int(self.cfg["render"]["width"]), int(self.cfg["render"]["height"])],
                 "views": list(view_renderers.keys()),
                 "view_count": len(view_renderers),
-                "view_layout": "quad" if quad_layout else "separate",
+                "view_layout": view_layout if quad_layout else "separate",
                 "output_fps": fps,
                 "output_frames": len(benchmark_rows),
                 "simulated_seconds": self.time,
@@ -463,7 +495,11 @@ class DelugeSolver:
                                   "water_field_nodes", "water_mesh_lod_changes", "water_splash_bricks",
                                   "water_splash_mesh_vertices", "water_stitch_surface_samples",
                                   "shallow_water_cells", "shallow_water_wet_cells",
-                                  "shallow_emitted_particles", "shallow_merged_particles"):
+                                  "shallow_emitted_particles", "shallow_merged_particles",
+                                  "debris_impact_peak_acceleration_m_s2",
+                                  "debris_impact_max_volume_fraction",
+                                  "debris_activation_exposure_max_seconds",
+                                  "wave_train_injected_volume_m3"):
                 if optional_stat in benchmark_rows[0]:
                     summary[f"peak_{optional_stat}"] = max(row.get(optional_stat, 0) for row in benchmark_rows)
             if all(
@@ -480,8 +516,17 @@ class DelugeSolver:
                 )
                 summary["initial_combined_water_volume_m3"] = initial_water_volume
                 summary["final_combined_water_volume_m3"] = final_water_volume
-                summary["combined_water_volume_drift_fraction"] = (
+                injected_water_volume = (
+                    benchmark_rows[-1].get("wave_train_injected_volume_m3", 0.0)
+                    - benchmark_rows[0].get("wave_train_injected_volume_m3", 0.0)
+                )
+                summary["wave_train_injected_volume_m3"] = injected_water_volume
+                summary["combined_water_volume_raw_change_fraction"] = (
                     final_water_volume / initial_water_volume - 1.0
+                    if initial_water_volume > 0.0 else 0.0
+                )
+                summary["combined_water_volume_drift_fraction"] = (
+                    (final_water_volume - injected_water_volume) / initial_water_volume - 1.0
                     if initial_water_volume > 0.0 else 0.0
                 )
                 summary["shallow_emitted_volume_m3"] = benchmark_rows[-1].get(

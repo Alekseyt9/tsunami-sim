@@ -29,6 +29,7 @@ from scene import (
     STRUCT_SLAB,
     STRUCT_WALL,
     building_profile,
+    environment_layout,
 )
 
 
@@ -838,6 +839,17 @@ def bind_facade_anchors(
                 panel_vertices
             )[1]
             anchors[panel_indices] = particle_indices[nearest_local].reshape(-1, 4)
+        # Environment panels use negative object IDs and intentionally have no
+        # structural fragment. Bind their vertices directly to the matching
+        # low-cost prop particles so cars and trees translate with physics.
+        for bid in np.unique(skin["building_id"][skin["building_id"] < 0]):
+            panel_indices = np.flatnonzero(skin["building_id"] == bid)
+            particle_indices = np.flatnonzero((kind != 0) & (building_id == bid))
+            if len(panel_indices) == 0 or len(particle_indices) == 0:
+                continue
+            panel_vertices = skin["vertex"][panel_indices].reshape(-1, 3)
+            nearest_local = cKDTree(rest_x[particle_indices]).query(panel_vertices)[1]
+            anchors[panel_indices] = particle_indices[nearest_local].reshape(-1, 4)
         if np.any(anchors < 0):
             raise RuntimeError("Some facade vertices could not be bound to structural particles")
         return anchors, owner_fragment
@@ -922,6 +934,90 @@ def bind_facade_anchors(
     return anchors, owner_fragment
 
 
+def build_environment_skin(cfg: dict) -> dict[str, np.ndarray]:
+    """Create panel geometry for roads, moving cars, trees and small shops."""
+    layout = environment_layout(cfg)
+    centers: list[tuple[float, float, float]] = []
+    sizes: list[tuple[float, float, float]] = []
+    normals: list[tuple[float, float, float]] = []
+    materials: list[int] = []
+    building_ids: list[int] = []
+    vertices: list[tuple[tuple[float, float, float], ...]] = []
+
+    def add_panel(bid: int, center, size, normal, material: int):
+        centers.append(tuple(map(float, center)))
+        sizes.append(tuple(map(float, size)))
+        normals.append(tuple(map(float, normal)))
+        materials.append(int(material)); building_ids.append(int(bid))
+        cx, cy, cz = map(float, center)
+        sx, sy, sz = map(float, size)
+        nx, ny, nz = map(float, normal)
+        if abs(nx) > 0.5:
+            vertices.append(((cx, cy - sy * 0.5, cz - sz * 0.5),
+                             (cx, cy + sy * 0.5, cz - sz * 0.5),
+                             (cx, cy + sy * 0.5, cz + sz * 0.5),
+                             (cx, cy - sy * 0.5, cz + sz * 0.5)))
+        elif abs(ny) > 0.5:
+            vertices.append(((cx - sx * 0.5, cy, cz - sz * 0.5),
+                             (cx - sx * 0.5, cy, cz + sz * 0.5),
+                             (cx + sx * 0.5, cy, cz + sz * 0.5),
+                             (cx + sx * 0.5, cy, cz - sz * 0.5)))
+        else:
+            vertices.append(((cx - sx * 0.5, cy - sy * 0.5, cz),
+                             (cx - sx * 0.5, cy + sy * 0.5, cz),
+                             (cx + sx * 0.5, cy + sy * 0.5, cz),
+                             (cx + sx * 0.5, cy - sy * 0.5, cz)))
+
+    def add_box(bid: int, center, size, material: int):
+        cx, cy, cz = map(float, center); sx, sy, sz = map(float, size)
+        add_panel(bid, (cx - sx * 0.5, cy, cz), (0.10, sy, sz), (-1, 0, 0), material)
+        add_panel(bid, (cx + sx * 0.5, cy, cz), (0.10, sy, sz), (1, 0, 0), material)
+        add_panel(bid, (cx, cy, cz - sz * 0.5), (sx, sy, 0.10), (0, 0, -1), material)
+        add_panel(bid, (cx, cy, cz + sz * 0.5), (sx, sy, 0.10), (0, 0, 1), material)
+        add_panel(bid, (cx, cy + sy * 0.5, cz), (sx, 0.10, sz), (0, 1, 0), material)
+
+    if any(layout.values()):
+        # Terrain and roads are render-only panels bound to four fixed anchors.
+        add_panel(-9000, (0.0, -0.04, 55.0), (140.0, 0.08, 150.0), (0, 1, 0), 90)
+        for z in (34.0, 72.0):
+            add_panel(-9000, (0.0, 0.015, z), (140.0, 0.08, 13.0), (0, 1, 0), 91)
+            for edge in (-7.4, 7.4):
+                add_panel(-9000, (0.0, 0.035, z + edge), (140.0, 0.08, 1.4), (0, 1, 0), 92)
+
+    for car in layout["cars"]:
+        cx, cz = car["center"]; bid = int(car["id"]); palette = int(car["palette"])
+        add_box(bid, (cx, 0.72, cz), (4.3, 0.85, 1.85), 50 + palette)
+        add_box(bid, (cx + 0.15, 1.32, cz), (2.25, 0.58, 1.58), 20 + palette)
+        for dx in (-1.45, 1.45):
+            for dz in (-0.92, 0.92):
+                add_box(bid, (cx + dx, 0.43, cz + dz), (0.62, 0.62, 0.22), 58)
+
+    for tree in layout["trees"]:
+        cx, cz = tree["center"]; height = float(tree["height"]); bid = int(tree["id"])
+        add_box(bid, (cx, height * 0.43, cz), (0.62, height * 0.86, 0.62), 60)
+        add_box(bid, (cx, height - 0.15, cz), (3.1, 2.4, 2.5), 70 + (abs(bid) % 3))
+
+    for shop in layout["small_buildings"]:
+        cx, cz = shop["center"]; width, depth, height = map(float, shop["size"])
+        bid = int(shop["id"]); palette = int(shop["palette"])
+        add_box(bid, (cx, height * 0.5, cz), (width, height, depth), 10 + palette)
+        add_panel(bid, (cx, height + 0.08, cz), (width + 0.4, 0.16, depth + 0.4), (0, 1, 0), 30 + palette)
+        add_panel(bid, (cx, 2.0, cz - depth * 0.5 - 0.06),
+                  (width * 0.62, 2.2, 0.10), (0, 0, -1), 20 + palette)
+
+    panel_count = len(materials)
+    return {
+        "center": np.asarray(centers, dtype=np.float32).reshape((-1, 3)),
+        "size": np.asarray(sizes, dtype=np.float32).reshape((-1, 3)),
+        "normal": np.asarray(normals, dtype=np.float32).reshape((-1, 3)),
+        "material": np.asarray(materials, dtype=np.int32),
+        "building_id": np.asarray(building_ids, dtype=np.int32),
+        "vertex": np.asarray(vertices, dtype=np.float32).reshape((-1, 4, 3)),
+        "panel_mode": np.zeros(panel_count, dtype=np.int32),
+        "owner_fragment": np.full(panel_count, -1, dtype=np.int32),
+    }
+
+
 def write_facade_skin(
     path: Path,
     cfg: dict,
@@ -940,13 +1036,14 @@ def write_facade_skin(
     cache_path: Path | None = None
     if complete_geometry and bool(debris_policy.get("cache", True)):
         geometry_cfg = {
-            "schema": "cell-union-fragment-skin-v5-hole-preserving",
+            "schema": "cell-union-fragment-skin-v6-environment",
             "solid_spacing": cfg.get("solid_spacing"),
             "buildings": cfg.get("buildings"),
             "building_styles": cfg.get("building_styles"),
             "building_palettes": cfg.get("building_palettes"),
             "fragment_clustering": cfg.get("v3", {}).get("fragment_clustering"),
             "debris_skin": debris_policy,
+            "environment": cfg.get("environment", {}),
         }
         digest = hashlib.sha256(
             json.dumps(geometry_cfg, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -964,6 +1061,15 @@ def write_facade_skin(
             return panel_count
 
     skin = build_facade_skin(cfg)
+    environment_skin = build_environment_skin(cfg)
+    environment_particles_present = (
+        building_id is None or np.any(np.asarray(building_id) <= -1000)
+    )
+    if len(environment_skin["building_id"]) and environment_particles_present:
+        skin = {
+            name: np.concatenate((skin[name], environment_skin[name]), axis=0)
+            for name in skin
+        }
     if (
         rest_x is not None and kind is not None and building_id is not None
         and fragment_id is not None and radius is not None and structural_class is not None

@@ -131,6 +131,23 @@ def material_impact_impulse_threshold(role: int) -> float:
 
 
 @wp.func
+def material_impact_damage_drive(role: int, impulse: float) -> float:
+    """Continuous fracture drive above the role-specific impact threshold.
+
+    Crossing the threshold merely starts a crack.  The old boolean gate gave
+    a shallow runnel the same fracture rate as the full bore once both were a
+    tiny amount above threshold.  Full-rate damage now requires roughly three
+    times the threshold impulse.
+    """
+    threshold = material_impact_impulse_threshold(role)
+    return wp.clamp(
+        (impulse - threshold) / wp.max(2.0 * threshold, 1.0e-5),
+        0.0,
+        1.0,
+    )
+
+
+@wp.func
 def material_impact_decay_time(role: int) -> float:
     if role == STRUCT_GLASS:
         return 0.06
@@ -170,6 +187,18 @@ def collapse_gravity_fraction(
 
 
 @wp.func
+def preloaded_structure_gravity_fraction(
+    building_id: int,
+    support_loss_fraction: float,
+    body_rigid: bool,
+) -> float:
+    """Dynamic gravity left after subtracting the authored static preload."""
+    if body_rigid or building_id < 0:
+        return 1.0
+    return wp.clamp(support_loss_fraction, 0.0, 1.0)
+
+
+@wp.func
 def facade_support_loss_rate(
     role: int,
     rest_elevation: float,
@@ -205,15 +234,16 @@ def accumulate_building_damage(
 
 
 @wp.kernel
-def count_loaded_building_particles(
+def accumulate_loaded_building_volume(
     rest_x: wp.array(dtype=wp.vec3),
     kind: wp.array(dtype=wp.int32),
     building_id: wp.array(dtype=wp.int32),
     mass: wp.array(dtype=float),
+    volume: wp.array(dtype=float),
     solid_force: wp.array(dtype=wp.vec3),
     load_acceleration_threshold: float,
     maximum_activation_elevation: float,
-    hits: wp.array(dtype=wp.int32),
+    loaded_volume: wp.array(dtype=float),
 ):
     i = wp.tid()
     bid = building_id[i]
@@ -222,15 +252,18 @@ def count_loaded_building_particles(
         # The tsunami travels along +Z. Requiring forward load near the base
         # prevents isolated overhead/side spray from waking the whole graph.
         if solid_force[i][2] > threshold:
-            wp.atomic_add(hits, bid, 1)
+            # Volume is invariant under adaptive particle splitting.  A fixed
+            # hit count became easier to satisfy every time a facade refined.
+            wp.atomic_add(loaded_volume, bid, volume[i])
 
 
 @wp.kernel
-def activate_buildings_from_hits(
-    hits: wp.array(dtype=wp.int32),
+def activate_buildings_from_load(
+    loaded_volume: wp.array(dtype=float),
+    eligible_base_volume: wp.array(dtype=float),
     active: wp.array(dtype=wp.int32),
     exposure_seconds: wp.array(dtype=float),
-    minimum_hits: int,
+    minimum_loaded_fraction: float,
     dt: float,
     required_exposure_seconds: float,
     exposure_decay_multiplier: float,
@@ -238,7 +271,8 @@ def activate_buildings_from_hits(
     bid = wp.tid()
     if active[bid] != 0:
         return
-    if hits[bid] >= minimum_hits:
+    loaded_fraction = loaded_volume[bid] / wp.max(eligible_base_volume[bid], 1.0e-6)
+    if loaded_fraction >= minimum_loaded_fraction:
         exposure_seconds[bid] += dt
     else:
         exposure_seconds[bid] = wp.max(
@@ -254,6 +288,7 @@ def accumulate_material_impact(
     structural_class: wp.array(dtype=wp.int32),
     mass: wp.array(dtype=float),
     solid_force: wp.array(dtype=wp.vec3),
+    debris_contact_force: wp.array(dtype=wp.vec3),
     impact_impulse: wp.array(dtype=float),
     local_impact_active: wp.array(dtype=wp.int32),
     dt: float,
@@ -265,7 +300,12 @@ def accumulate_material_impact(
         local_impact_active[i] = 0
         return
     role = structural_class[i]
-    load_acceleration = wp.length(solid_force[i]) / wp.max(mass[i], 1.0)
+    # Hydrodynamic and solid-contact reactions are kept in separate buffers so
+    # rubble cannot masquerade as a coherent tsunami-front load.  For local
+    # material damage, however, either source is physically meaningful.
+    load_acceleration = wp.max(
+        wp.length(solid_force[i]), wp.length(debris_contact_force[i])
+    ) / wp.max(mass[i], 1.0)
     excess = wp.max(load_acceleration - material_impact_min_acceleration(role), 0.0)
     decay = wp.exp(-dt / material_impact_decay_time(role))
     accumulated = wp.min(impact_impulse[i] * decay + excess * dt, 5.0)
@@ -275,6 +315,129 @@ def accumulate_material_impact(
     # coherent lower-facade building activation gate.
     if role == STRUCT_GLASS and accumulated >= material_impact_impulse_threshold(role):
         local_impact_active[i] = 1
+
+
+@wp.kernel
+def accumulate_dormant_debris_contacts(
+    grid: wp.uint64,
+    x: wp.array(dtype=wp.vec3),
+    v: wp.array(dtype=wp.vec3),
+    radius: wp.array(dtype=float),
+    mass: wp.array(dtype=float),
+    volume: wp.array(dtype=float),
+    kind: wp.array(dtype=wp.int32),
+    building_id: wp.array(dtype=wp.int32),
+    fragment_id: wp.array(dtype=wp.int32),
+    rigid_state: wp.array(dtype=wp.int32),
+    fixed: wp.array(dtype=wp.int32),
+    building_active: wp.array(dtype=wp.int32),
+    contact_force: wp.array(dtype=wp.vec3),
+    impacted_volume: wp.array(dtype=float),
+    peak_acceleration: wp.array(dtype=float),
+    maximum_query_radius: float,
+    impact_acceleration_threshold: float,
+):
+    """Receive equal-and-opposite rubble impacts on sleeping structures.
+
+    Sleeping buildings remain kinematic water boundaries, but they must not be
+    immune to a slab or vehicle striking them.  This target-side pass records
+    only contacts from dynamic solids belonging to another structure.  Water
+    activation continues to consume the independent hydrodynamic-force array.
+    """
+    tid = wp.tid()
+    i = wp.hash_grid_point_id(grid, tid)
+    bid = building_id[i]
+    if kind[i] == 0 or bid < 0 or building_active[bid] != 0:
+        return
+
+    xi = x[i]
+    force = wp.vec3(0.0)
+    query = wp.hash_grid_query(grid, xi, maximum_query_radius)
+    for j in query:
+        source_fragment = fragment_id[j]
+        source_rigid = source_fragment >= 0 and rigid_state[source_fragment] != 0
+        if (
+            j == i or kind[j] == 0 or (fixed[j] != 0 and not source_rigid)
+            or building_id[j] == bid
+        ):
+            continue
+        delta = x[j] - xi
+        distance = wp.length(delta)
+        contact_distance = radius[i] + radius[j]
+        if distance <= 1.0e-5 or distance >= contact_distance:
+            continue
+        normal = delta / distance
+        closing = wp.dot(v[j] - v[i], normal)
+        magnitude = deformable_contact_magnitude(
+            contact_distance - distance, closing, 3.0e6, 9000.0
+        )
+        force -= normal * magnitude
+
+    contact_force[i] = force
+    acceleration = wp.length(force) / wp.max(mass[i], 1.0)
+    if acceleration >= impact_acceleration_threshold:
+        wp.atomic_add(impacted_volume, bid, volume[i])
+        wp.atomic_max(peak_acceleration, bid, acceleration)
+
+
+@wp.kernel
+def apply_dormant_impact_damage(
+    kind: wp.array(dtype=wp.int32),
+    building_id: wp.array(dtype=wp.int32),
+    structural_class: wp.array(dtype=wp.int32),
+    building_active: wp.array(dtype=wp.int32),
+    impact_impulse: wp.array(dtype=float),
+    damage: wp.array(dtype=float),
+    dt: float,
+    glass_damage_rate: float,
+    wall_damage_rate: float,
+):
+    """Create local glazing/spall damage without waking an entire building."""
+    i = wp.tid()
+    bid = building_id[i]
+    if kind[i] == 0 or bid < 0 or building_active[bid] != 0:
+        return
+    role = structural_class[i]
+    drive = material_impact_damage_drive(role, impact_impulse[i])
+    if drive <= 0.0:
+        return
+    rate = float(0.0)
+    if role == STRUCT_GLASS:
+        rate = glass_damage_rate
+    elif role == STRUCT_WALL:
+        rate = wall_damage_rate
+    damage[i] = wp.min(1.0, damage[i] + dt * rate * drive)
+
+
+@wp.kernel
+def activate_buildings_from_debris_impact(
+    impacted_volume: wp.array(dtype=float),
+    structural_volume: wp.array(dtype=float),
+    peak_acceleration: wp.array(dtype=float),
+    active: wp.array(dtype=wp.int32),
+    exposure_seconds: wp.array(dtype=float),
+    minimum_impacted_fraction: float,
+    minimum_peak_acceleration: float,
+    required_exposure_seconds: float,
+    exposure_decay_multiplier: float,
+    dt: float,
+):
+    """Wake a structural graph only after a spatially coherent rubble hit."""
+    bid = wp.tid()
+    if active[bid] != 0:
+        return
+    fraction = impacted_volume[bid] / wp.max(structural_volume[bid], 1.0e-6)
+    peak = peak_acceleration[bid]
+    if fraction >= minimum_impacted_fraction and peak >= minimum_peak_acceleration:
+        spatial = wp.clamp(fraction / wp.max(minimum_impacted_fraction, 1.0e-6), 1.0, 4.0)
+        severity = wp.clamp(peak / wp.max(minimum_peak_acceleration, 1.0e-6), 1.0, 4.0)
+        exposure_seconds[bid] += dt * wp.sqrt(spatial * severity)
+    else:
+        exposure_seconds[bid] = wp.max(
+            0.0, exposure_seconds[bid] - dt * exposure_decay_multiplier
+        )
+    if exposure_seconds[bid] >= required_exposure_seconds:
+        active[bid] = 1
 
 
 @wp.kernel
@@ -311,7 +474,6 @@ def compute_clustered_solid_forces(
     material: wp.array(dtype=wp.int32),
     structural_class: wp.array(dtype=wp.int32),
     building_id: wp.array(dtype=wp.int32),
-    building_activation_exposure: wp.array(dtype=float),
     building_damage_integral: wp.array(dtype=float),
     building_structural_volume: wp.array(dtype=float),
     fragment_id: wp.array(dtype=wp.int32),
@@ -324,7 +486,6 @@ def compute_clustered_solid_forces(
     acceleration: wp.array(dtype=wp.vec3),
     max_support: float,
     dt: float,
-    activation_required_seconds: float,
     internal_stiffness_multiplier: float,
     damage_rate: float,
     propagation_threshold: float,
@@ -375,27 +536,16 @@ def compute_clustered_solid_forces(
         facade_support_loss_collapse_threshold,
         facade_support_loss_damage_rate,
     )
-    # Dormant buildings returned above through fixed[i] != 0.  Every movable
-    # structural particle therefore belongs to an activated building (or is
-    # locally released glass) and must carry its real self-weight.  The former
-    # damage^2 ramp made intact upper storeys effectively massless, so they
-    # could remain vertical above a destroyed base instead of loading the
-    # remaining columns and initiating progressive collapse.
-    # The authored rest lattice represents a statically preloaded building.
-    # Do not apply gravity a second time merely because a validation/debug
-    # configuration unlocks a dry building. A real hydrodynamic activation,
-    # local impact, or load-path loss removes that rest-state compensation.
-    gravity_fraction = float(0.0)
-    if (
-        bid < 0
-        or building_activation_exposure[bid] >= activation_required_seconds
-        or building_collapse > 0.0
-    ):
-        gravity_fraction = 1.0
+    # The rest lattice is a statically preloaded building. Waking it for fluid
+    # coupling must not suddenly apply an extra 1 g to every storey. Supported
+    # fragments keep the authored prestress compensation; only the fraction
+    # that has genuinely lost its path to the foundation receives dynamic
+    # gravity. Free non-building debris still carries its full self-weight.
+    gravity_fraction = preloaded_structure_gravity_fraction(
+        bid, building_collapse, body_rigid
+    )
     force = solid_force[i]
-    hydro_loaded = impact_impulse[i] >= material_impact_impulse_threshold(structural_class[i])
-    if hydro_loaded:
-        gravity_fraction = 1.0
+    impact_drive = material_impact_damage_drive(structural_class[i], impact_impulse[i])
     facade_particle = structural_class[i] == STRUCT_WALL or structural_class[i] == STRUCT_GLASS
     has_local_support = int(0)
     query = wp.hash_grid_query(grid, xi, max_support)
@@ -491,8 +641,19 @@ def compute_clustered_solid_forces(
             resolution_scale = wp.clamp(resolution_scale, 0.65, 2.5)
             limit *= resolution_scale
             abs_strain = wp.abs(strain)
-            crack_front = hydro_loaded or (damage[j] > propagation_threshold and abs_strain > limit * 2.5)
-            if abs_strain > limit and crack_front:
+            propagated_crack = damage[j] > propagation_threshold and abs_strain > limit * 2.5
+            crack_drive = impact_drive
+            if propagated_crack:
+                crack_drive = wp.max(
+                    crack_drive,
+                    wp.clamp(
+                        (damage[j] - propagation_threshold)
+                        / wp.max(1.0 - propagation_threshold, 1.0e-5),
+                        0.0,
+                        1.0,
+                    ),
+                )
+            if abs_strain > limit and crack_drive > 0.0:
                 normalized = (abs_strain - limit) / wp.max(limit, 1.0e-4)
                 role_rate = wp.max(
                     structural_damage_rate_multiplier(structural_class[i]),
@@ -501,7 +662,7 @@ def compute_clustered_solid_forces(
                 increment = wp.min(
                     normalized * dt * damage_rate * role_rate,
                     max_damage_per_substep * role_rate,
-                )
+                ) * crack_drive
                 local_damage += increment
             if local_damage < 1.0:
                 stiffness = wp.min(material_stiffness(material[i]), material_stiffness(material[j]))
@@ -1572,6 +1733,24 @@ def facade_material_color(code: int) -> wp.vec3:
         # Exposed structural fragment hull: darker concrete/steel aggregate,
         # while retaining a trace of the original building palette.
         base = base * 0.48 + wp.vec3(0.18, 0.19, 0.18)
+    elif family == 5:  # painted vehicle body
+        base = wp.vec3(0.12, 0.25, 0.48)
+        if palette == 1: base = wp.vec3(0.62, 0.10, 0.07)
+        elif palette == 2: base = wp.vec3(0.72, 0.70, 0.62)
+        elif palette == 3: base = wp.vec3(0.08, 0.09, 0.10)
+        elif palette == 4: base = wp.vec3(0.12, 0.45, 0.28)
+        elif palette == 5: base = wp.vec3(0.67, 0.38, 0.08)
+        elif palette == 8: base = wp.vec3(0.025, 0.028, 0.030)
+    elif family == 6:  # wet bark
+        base = wp.vec3(0.22, 0.115, 0.055)
+    elif family == 7:  # foliage
+        base = wp.vec3(0.075, 0.25, 0.10)
+        if palette == 1: base = wp.vec3(0.11, 0.31, 0.13)
+        elif palette == 2: base = wp.vec3(0.06, 0.19, 0.09)
+    elif family == 9:  # terrain / asphalt / pavement
+        base = wp.vec3(0.18, 0.20, 0.20)
+        if palette == 1: base = wp.vec3(0.075, 0.083, 0.085)
+        elif palette == 2: base = wp.vec3(0.32, 0.33, 0.31)
     return base
 
 
@@ -1688,7 +1867,19 @@ def raster_facade_color(
 
     base = facade_material_color(material[panel])
     normal = wp.normalize(wp.cross(world_b - world_a, world_c - world_a))
-    light = 0.34 + 0.66 * wp.abs(wp.dot(normal, wp.normalize(wp.vec3(-0.35, 0.72, -0.42))))
+    view_direction = wp.normalize(cam - (world_a + world_b + world_c) / 3.0)
+    # Authored panels are two-sided, but lighting must not be. Orient their
+    # normal toward the camera once, then retain a real lit and shadowed side.
+    if wp.dot(normal, view_direction) < 0.0:
+        normal = -normal
+    sun_direction = wp.normalize(wp.vec3(-0.38, 0.82, -0.35))
+    diffuse = wp.clamp(wp.dot(normal, sun_direction), 0.0, 1.0)
+    light = 0.09 + 0.91 * diffuse
+    family = material[panel] // 10
+    if family == 2 or family == 5:
+        half_vector = wp.normalize(view_direction + sun_direction)
+        specular = wp.pow(wp.clamp(wp.dot(normal, half_vector), 0.0, 1.0), 20.0)
+        base += wp.vec3(0.42, 0.46, 0.47) * specular * 0.58
     anchor_base = panel * 4
     damage_0 = particle_damage[anchor[anchor_base]]
     damage_1 = particle_damage[anchor[anchor_base + 1]]

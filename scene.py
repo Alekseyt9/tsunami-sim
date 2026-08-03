@@ -16,6 +16,45 @@ STRUCT_CORE = 5
 STRUCT_GLASS = 6
 
 
+def environment_layout(cfg: dict) -> dict[str, list[dict]]:
+    """Deterministic street furniture shared by physics and render skins."""
+    policy = cfg.get("environment", {})
+    if not bool(policy.get("enabled", False)):
+        return {"cars": [], "trees": [], "small_buildings": []}
+    seed = int(policy.get("seed", 7319))
+    rng = np.random.default_rng(seed)
+    cars = []
+    car_count = int(policy.get("cars", {}).get("count", 30))
+    car_palette = (0, 1, 2, 3, 4, 5)
+    for index in range(car_count):
+        road = index % 2
+        lane = (index // 2) % 2
+        z = (31.0 if road == 0 else 69.0) + lane * 6.0 + rng.uniform(-0.7, 0.7)
+        x = -62.0 + 124.0 * ((index // 4 + 0.5) / max(1, int(np.ceil(car_count / 4))))
+        x += rng.uniform(-2.0, 2.0)
+        cars.append({"id": -1000 - index, "center": (x, z), "palette": car_palette[index % 6]})
+
+    trees = []
+    tree_count = int(policy.get("trees", {}).get("count", 24))
+    street_x = np.asarray((-68.0, -42.0, -14.0, 14.0, 42.0, 68.0), dtype=np.float32)
+    street_z = np.asarray((27.0, 41.0, 65.0, 79.0), dtype=np.float32)
+    sites = [(float(x), float(z)) for z in street_z for x in street_x]
+    for index, (x, z) in enumerate(sites[:tree_count]):
+        trees.append({"id": -2000 - index, "center": (x, z), "height": 6.0 + 1.5 * (index % 3)})
+
+    shops = []
+    requested = int(policy.get("small_buildings", {}).get("count", 6))
+    for index in range(requested):
+        x = -55.0 + index * (110.0 / max(requested - 1, 1))
+        shops.append({
+            "id": -3000 - index,
+            "center": (x, 116.0 + (index % 2) * 7.5),
+            "size": (8.0 + (index % 2) * 2.0, 7.0, 5.5 + (index % 3)),
+            "palette": index % 6,
+        })
+    return {"cars": cars, "trees": trees, "small_buildings": shops}
+
+
 def building_profile(style: dict | None, width: float, depth: float, height: float, y: float):
     """Return local centre offset and footprint for a styled height slice."""
     style = style or {}
@@ -292,6 +331,80 @@ class ParticleScene:
         for i, spec in enumerate(buildings):
             style = styles[i] if i < len(styles) else None
             counts.append(self.add_building(i, *map(float, spec), spacing, style))
+        return counts
+
+    def add_environment(self, cfg: dict) -> dict[str, int]:
+        """Add low-cost, water-coupled cars, breakable trees and small shops."""
+        layout = environment_layout(cfg)
+        counts = {"cars": 0, "trees": 0, "small_buildings": 0, "ground_anchors": 0}
+        if not any(layout.values()):
+            return counts
+
+        # Four tiny fixed particles anchor render-only roads and terrain. They
+        # sit inside the existing y=0 collision plane and add no obstacle.
+        for x, z in ((-70.0, -20.0), (70.0, -20.0), (70.0, 130.0), (-70.0, 130.0)):
+            self.append((x, 0.0, z), (0.0, 0.0, 0.0), 0.03, 1.0, 1.0e-5,
+                        1, 1, -9000, 1, STRUCT_SLAB)
+            counts["ground_anchors"] += 1
+
+        for car in layout["cars"]:
+            cx, cz = car["center"]
+            for dx in (-1.5, 0.0, 1.5):
+                for dy in (0.45, 1.15):
+                    for dz in (-0.58, 0.58):
+                        self.append(
+                            (cx + dx, dy, cz + dz), (0.0, 0.0, 0.0), 0.48,
+                            125.0, 0.60, 1, 3, int(car["id"]), 0, STRUCT_WALL,
+                        )
+                        counts["cars"] += 1
+
+        for tree in layout["trees"]:
+            cx, cz = tree["center"]
+            height = float(tree["height"])
+            trunk_levels = np.arange(0.4, height - 0.6, 0.8)
+            for level, y in enumerate(trunk_levels):
+                self.append(
+                    (cx, float(y), cz), (0.0, 0.0, 0.0), 0.36,
+                    72.0, 0.14, 1, 1, int(tree["id"]), int(level == 0), STRUCT_COLUMN,
+                )
+                counts["trees"] += 1
+            crown_y = height - 0.2
+            for dx, dy, dz in ((0, 0, 0), (-0.8, 0, 0), (0.8, 0, 0),
+                               (0, 0.55, -0.65), (0, 0.55, 0.65)):
+                self.append(
+                    (cx + dx, crown_y + dy, cz + dz), (0.0, 0.0, 0.0), 0.82,
+                    42.0, 0.75, 1, 1, int(tree["id"]), 0, STRUCT_WALL,
+                )
+                counts["trees"] += 1
+
+        spacing = 1.2
+        for shop in layout["small_buildings"]:
+            cx, cz = shop["center"]
+            width, depth, height = map(float, shop["size"])
+            xs = np.arange(-width * 0.5, width * 0.5 + 0.1, spacing)
+            zs = np.arange(-depth * 0.5, depth * 0.5 + 0.1, spacing)
+            ys = np.arange(0.0, height + 0.1, spacing)
+            occupied: set[tuple[int, int, int]] = set()
+            for y in ys:
+                for x in xs:
+                    for z in (-depth * 0.5, depth * 0.5):
+                        occupied.add((round(x / spacing), round(y / spacing), round(z / spacing)))
+                for z in zs:
+                    for x in (-width * 0.5, width * 0.5):
+                        occupied.add((round(x / spacing), round(y / spacing), round(z / spacing)))
+            roof_y = round(height / spacing)
+            for x in xs:
+                for z in zs:
+                    occupied.add((round(x / spacing), roof_y, round(z / spacing)))
+            volume = spacing ** 3 * 0.28
+            for gx, gy, gz in occupied:
+                y = gy * spacing
+                self.append(
+                    (cx + gx * spacing, y, cz + gz * spacing), (0.0, 0.0, 0.0),
+                    spacing * 0.48, 850.0 * volume, volume, 1, 1,
+                    int(shop["id"]), int(gy == 0), STRUCT_WALL if gy != roof_y else STRUCT_SLAB,
+                )
+                counts["small_buildings"] += 1
         return counts
 
     def as_numpy(self):

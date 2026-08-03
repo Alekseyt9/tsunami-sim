@@ -64,7 +64,11 @@ def main() -> None:
     last = metrics[-1]
     initial_volume = first["fluid_volume_m3"] + first["shallow_water_volume_m3"]
     final_volume = last["fluid_volume_m3"] + last["shallow_water_volume_m3"]
-    volume_drift = final_volume / initial_volume - 1.0
+    injected_volume = (
+        last.get("wave_train_injected_volume_m3", 0.0)
+        - first.get("wave_train_injected_volume_m3", 0.0)
+    )
+    volume_drift = (final_volume - injected_volume) / initial_volume - 1.0
     if abs(volume_drift) > args.maximum_volume_drift:
         raise AssertionError(f"combined 2D/3D water drift is {volume_drift:.3%}")
     invalid_particles = max(row.get("invalid_zero_volume_particles", 0) for row in metrics)
