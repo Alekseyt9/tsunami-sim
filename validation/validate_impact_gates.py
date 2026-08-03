@@ -10,7 +10,7 @@ import warp as wp
 
 HERE = Path(__file__).resolve().parent
 
-from hybrid_kernels import (
+from kernels.hybrid import (
     accumulate_material_impact,
     activate_buildings_from_load,
     apply_building_activity,
@@ -18,8 +18,8 @@ from hybrid_kernels import (
     material_impact_damage_drive,
     preloaded_structure_gravity_fraction,
 )
-from kernels import integrate
-from scene import STRUCT_CORE, STRUCT_GLASS, STRUCT_WALL
+from kernels.base import integrate
+from simulation.scene import STRUCT_CORE, STRUCT_GLASS, STRUCT_WALL
 
 
 def validate_velocity_guard(device: str) -> None:

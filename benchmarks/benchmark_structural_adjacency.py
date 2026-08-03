@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from _bootstrap import ROOT  # noqa: F401
+
 import argparse
 from collections import defaultdict
 import copy
@@ -16,7 +18,7 @@ import warp as wp
 from deluge_v3 import HybridDelugeSolver
 
 
-HERE = Path(__file__).resolve().parent
+HERE = ROOT
 DEFAULT_CHECKPOINT = (
     HERE / "outputs" / "v3_45_cinematic_environment_25s_24fps_20260803"
     / "checkpoints" / "state_00528.npz"

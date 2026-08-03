@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from _bootstrap import ROOT  # noqa: F401
+
 import argparse
 import json
 from pathlib import Path
@@ -9,10 +11,10 @@ import numpy as np
 from PIL import Image
 import warp as wp
 
-HERE = Path(__file__).resolve().parent
+HERE = ROOT
 
-from solver_base import compose_hero_insets, compose_quad_view  # noqa: E402
-from hybrid_renderer import HybridRenderer  # noqa: E402
+from simulation.solver_base import compose_hero_insets, compose_quad_view  # noqa: E402
+from rendering.hybrid_renderer import HybridRenderer  # noqa: E402
 
 
 def main():

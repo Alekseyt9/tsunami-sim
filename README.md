@@ -211,6 +211,11 @@ and preserves combined water volume to `1.17e-8`. It nevertheless raises final
 fluid height p99 from 7.32 m to 12.40 m, changes longitudinal fluid momentum,
 and releases 58 fewer cohesive fragments. The checked-in top-level implicit
 flag therefore remains disabled while 2x/3x timestep gates are evaluated.
+The subsequent 0.06012 s `3x dt` checkpoint sweep is also a rejection: the
+late-stage speedup is only 0.99x and structural position RMS still differs by
+0.25 m. A `2x` step cannot recover performance with the same six projection
+iterations, so the next fluid optimization target is the conservative
+narrow-band SPH/grid split rather than enabling this DFSPH path.
 
 `benchmark_early_rigidification.py` converts 343 additional detached clusters
 (159,684 particles) in the late checkpoint, but does not reduce total substep

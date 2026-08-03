@@ -7,7 +7,7 @@ import numpy as np
 from PIL import Image
 import warp as wp
 
-from kernels import (
+from kernels.base import (
     apply_directional_screen_shadows,
     bilateral_depth_axis,
     apply_cinematic_postprocess,
@@ -17,9 +17,9 @@ from kernels import (
     raster_water_depth,
     shade_water_surface,
 )
-from renderer import ParticleRenderer
-from hybrid_kernels import deform_facade_vertices, raster_facade_color, raster_facade_depth
-from surface_kernels import raster_anisotropic_water_depth, raster_water_mesh_depth
+from rendering.renderer import ParticleRenderer
+from kernels.hybrid import deform_facade_vertices, raster_facade_color, raster_facade_depth
+from kernels.surface import raster_anisotropic_water_depth, raster_water_mesh_depth
 
 
 class HybridRenderer(ParticleRenderer):

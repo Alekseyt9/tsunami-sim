@@ -21,7 +21,7 @@ except ImportError:  # The renderer retains its box fallback in minimal environm
     QhullError = RuntimeError
     cKDTree = None
 
-from scene import (
+from simulation.scene import (
     STRUCT_BEAM,
     STRUCT_COLUMN,
     STRUCT_CORE,

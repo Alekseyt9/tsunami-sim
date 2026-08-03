@@ -7,11 +7,11 @@ from _bootstrap import ROOT  # noqa: F401
 import numpy as np
 import warp as wp
 
-from hybrid_kernels import (  # noqa: E402
+from kernels.hybrid import (  # noqa: E402
     compute_fluid_forces_multirate,
     precompute_sph_kernel_coefficients,
 )
-from surface_kernels import classify_water_surface  # noqa: E402
+from kernels.surface import classify_water_surface  # noqa: E402
 
 
 def classify(grid, arrays, count: int) -> None:

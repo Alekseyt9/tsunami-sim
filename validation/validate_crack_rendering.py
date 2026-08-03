@@ -7,7 +7,7 @@ from _bootstrap import ROOT  # noqa: F401
 import numpy as np
 import warp as wp
 
-from hybrid_kernels import facade_crack_mask
+from kernels.hybrid import facade_crack_mask
 
 
 @wp.kernel

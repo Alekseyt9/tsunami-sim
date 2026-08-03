@@ -7,9 +7,9 @@ from _bootstrap import ROOT  # noqa: F401
 import numpy as np
 import warp as wp
 
-from kernels import refine_entering_fluid
-from hybrid_kernels import apply_conservative_fluid_merges
-from hybrid_model import select_conservative_fluid_merges
+from kernels.base import refine_entering_fluid
+from kernels.hybrid import apply_conservative_fluid_merges
+from simulation.hybrid_model import select_conservative_fluid_merges
 
 
 def main() -> None:

@@ -7,7 +7,7 @@ from _bootstrap import ROOT  # noqa: F401
 import numpy as np
 import warp as wp
 
-from surface_kernels import classify_water_surface  # noqa: E402
+from kernels.surface import classify_water_surface  # noqa: E402
 
 
 def main() -> None:

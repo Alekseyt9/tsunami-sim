@@ -19,15 +19,15 @@ import warp as wp
 
 HERE = Path(__file__).resolve().parent
 
-from solver_base import DelugeSolver  # noqa: E402
-from kernels import (  # noqa: E402
+from simulation.solver_base import DelugeSolver  # noqa: E402
+from kernels.base import (  # noqa: E402
     clear_int,
     clear_vec3,
     compute_density,
     compute_fluid_forces,
     integrate,
 )
-from hybrid_kernels import (  # noqa: E402
+from kernels.hybrid import (  # noqa: E402
     accumulate_rigid_body_loads,
     accumulate_rigid_contacts,
     accumulate_rigid_proxy_boundaries,
@@ -88,7 +88,7 @@ from hybrid_kernels import (  # noqa: E402
     accumulate_deformable_contacts_adjacency,
     accumulate_indexed_deformable_contacts_adjacency,
 )
-from hybrid_model import (  # noqa: E402
+from simulation.hybrid_model import (  # noqa: E402
     FragmentSupportGraph,
     SolidRefinementPolicy,
     build_fragment_ids,
@@ -100,16 +100,16 @@ from hybrid_model import (  # noqa: E402
     select_conservative_fluid_merges,
     write_facade_skin,
 )
-from hybrid_renderer import HybridRenderer  # noqa: E402
-from rigid_clusters import (  # noqa: E402
+from rendering.hybrid_renderer import HybridRenderer  # noqa: E402
+from simulation.rigid_clusters import (  # noqa: E402
     fit_rigid_cluster_to_reference,
     fit_rigid_collision_proxy,
 )
-from experimental_optimizations import (  # noqa: E402
+from simulation.experimental_optimizations import (  # noqa: E402
     ImplicitFluidPreparation,
     NarrowBandVolumePreparation,
 )
-from shallow_water import (  # noqa: E402
+from simulation.shallow_water import (  # noqa: E402
     ShallowWaterFarField,
     compact_float_particles,
     compact_int_particles,
@@ -119,14 +119,14 @@ from shallow_water import (  # noqa: E402
     mark_sph_return_particles,
     remap_particle_indices,
 )
-from surface_kernels import (  # noqa: E402
+from kernels.surface import (  # noqa: E402
     blend_sparse_fields,
     build_water_phase_masks,
     classify_water_surface,
     smooth_sparse_field_axis,
     splat_sparse_surface_field,
 )
-from scene import STRUCT_SLAB, building_profile  # noqa: E402
+from simulation.scene import STRUCT_SLAB, building_profile  # noqa: E402
 
 
 def robust_axis_bounds(positions: np.ndarray, lower_quantile, upper_quantile):

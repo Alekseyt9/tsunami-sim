@@ -7,13 +7,13 @@ from _bootstrap import ROOT  # noqa: F401
 import numpy as np
 import warp as wp
 
-from hybrid_kernels import (  # noqa: E402
+from kernels.hybrid import (  # noqa: E402
     accumulate_rigid_body_loads,
     clear_body_accumulators,
     integrate_rigid_bodies,
     scatter_rigid_particles,
 )
-from rigid_clusters import fit_rigid_cluster, fit_rigid_cluster_to_reference  # noqa: E402
+from simulation.rigid_clusters import fit_rigid_cluster, fit_rigid_cluster_to_reference  # noqa: E402
 
 
 def main() -> None:

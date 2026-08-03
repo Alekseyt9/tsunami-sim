@@ -11,7 +11,7 @@ import warp as wp
 
 HERE = Path(__file__).resolve().parent
 
-from hybrid_kernels import (  # noqa: E402
+from kernels.hybrid import (  # noqa: E402
     accumulate_building_damage,
     collapse_gravity_fraction,
     deformable_contact_magnitude,

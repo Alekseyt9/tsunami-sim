@@ -7,7 +7,7 @@ from _bootstrap import ROOT  # noqa: F401
 import numpy as np
 import warp as wp
 
-from hybrid_kernels import (
+from kernels.hybrid import (
     accumulate_rigid_contacts,
     clear_body_accumulators,
     reactivate_rigid_after_impact,

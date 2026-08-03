@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from _bootstrap import ROOT  # noqa: F401
+
 import argparse
 from collections import defaultdict
 import json
@@ -14,7 +16,7 @@ import warp as wp
 from deluge_v3 import HybridDelugeSolver
 
 
-HERE = Path(__file__).resolve().parent
+HERE = ROOT
 
 
 def main() -> None:

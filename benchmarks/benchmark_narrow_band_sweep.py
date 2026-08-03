@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from _bootstrap import ROOT  # noqa: F401
+
 import argparse
 import copy
 import json
@@ -12,7 +14,7 @@ import numpy as np
 import warp as wp
 
 from deluge_v3 import HERE, HybridDelugeSolver
-from experimental_optimizations import NarrowBandVolumePreparation
+from simulation.experimental_optimizations import NarrowBandVolumePreparation
 
 
 DEFAULT_RUN = HERE / "outputs" / "v3_106_production_15s_24fps_20260803"

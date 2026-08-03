@@ -12,14 +12,14 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent.parent
 
-from scene import ParticleScene, building_profile, environment_layout  # noqa: E402
-from hybrid_model import (  # noqa: E402
+from simulation.scene import ParticleScene, building_profile, environment_layout  # noqa: E402
+from simulation.hybrid_model import (  # noqa: E402
     build_facade_skin,
     build_fragment_cell_faces,
     build_fragment_debris_skin,
     build_fragment_ids,
 )
-from scene import STRUCT_WALL  # noqa: E402
+from simulation.scene import STRUCT_WALL  # noqa: E402
 
 
 def main() -> None:

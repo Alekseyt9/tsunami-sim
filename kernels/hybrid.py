@@ -100,7 +100,7 @@ def apply_conservative_fluid_merges(
     phase_candidate[particle] = 0
     phase_candidate_age[particle] = 0
 
-from kernels import (
+from kernels.base import (
     material_failure_strain,
     material_stiffness,
     poly6,
@@ -108,7 +108,7 @@ from kernels import (
     spiky_grad,
     viscosity_laplacian,
 )
-from scene import STRUCT_BEAM, STRUCT_COLUMN, STRUCT_CORE, STRUCT_GLASS, STRUCT_SLAB, STRUCT_WALL
+from simulation.scene import STRUCT_BEAM, STRUCT_COLUMN, STRUCT_CORE, STRUCT_GLASS, STRUCT_SLAB, STRUCT_WALL
 
 
 @wp.func

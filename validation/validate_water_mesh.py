@@ -7,7 +7,7 @@ from _bootstrap import ROOT  # noqa: F401
 import numpy as np
 import warp as wp
 
-from surface_kernels import smooth_sparse_field_axis, splat_sparse_surface_field  # noqa: E402
+from kernels.surface import smooth_sparse_field_axis, splat_sparse_surface_field  # noqa: E402
 
 
 def component_count(vertex_count: int, faces: np.ndarray) -> int:

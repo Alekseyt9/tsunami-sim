@@ -13,7 +13,7 @@ from PIL import Image
 import imageio_ffmpeg
 import warp as wp
 
-from kernels import (
+from kernels.base import (
     bilateral_depth_axis, clear_depth, clear_render, clear_scalar, raster_color, raster_depth,
     raster_water_depth, shade_water_surface,
 )

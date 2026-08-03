@@ -12,7 +12,7 @@ import time
 import numpy as np
 
 
-from renderer import StreamingVideoWriter  # noqa: E402
+from rendering.renderer import StreamingVideoWriter  # noqa: E402
 
 
 def probe_duration(path: Path) -> float:

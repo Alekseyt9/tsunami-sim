@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from _bootstrap import ROOT  # noqa: F401
+
 import argparse
 from collections import defaultdict
 import copy
@@ -15,10 +17,10 @@ import numpy as np
 import warp as wp
 
 from deluge_v3 import HybridDelugeSolver
-from solver_base import compose_quad_view
+from simulation.solver_base import compose_quad_view
 
 
-HERE = Path(__file__).resolve().parent
+HERE = ROOT
 DEFAULT_CHECKPOINT = (
     HERE.parent / ".publish" / "tsunami-sim" / "outputs"
     / "v3_7_prefix97_for_v3_8_20260802" / "checkpoints" / "state_00096.npz"

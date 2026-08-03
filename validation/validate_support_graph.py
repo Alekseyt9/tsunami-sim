@@ -9,7 +9,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
-from hybrid_model import (  # noqa: E402
+from simulation.hybrid_model import (  # noqa: E402
     build_fragment_support_graph,
     evaluate_fragment_fracture_energy,
     evaluate_fragment_support,

@@ -9,11 +9,11 @@ import json
 import numpy as np
 import warp as wp
 
-from experimental_optimizations import (  # noqa: E402
+from simulation.experimental_optimizations import (  # noqa: E402
     ImplicitFluidPreparation,
     NarrowBandVolumePreparation,
 )
-from hybrid_kernels import update_rigid_sleep_state  # noqa: E402
+from kernels.hybrid import update_rigid_sleep_state  # noqa: E402
 
 
 def main() -> None:

@@ -7,7 +7,7 @@ from _bootstrap import ROOT  # noqa: F401
 import numpy as np
 import warp as wp
 
-from hybrid_kernels import (
+from kernels.hybrid import (
     accumulate_rigid_sample_bottom,
     accumulate_rigid_proxy_boundaries,
     accumulate_rigid_proxy_contacts,
@@ -18,7 +18,7 @@ from hybrid_kernels import (
     reactivate_rigid_after_impact,
     update_rigid_proxy_bounds,
 )
-from rigid_clusters import fit_rigid_collision_proxy
+from simulation.rigid_clusters import fit_rigid_collision_proxy
 
 
 def main() -> None:

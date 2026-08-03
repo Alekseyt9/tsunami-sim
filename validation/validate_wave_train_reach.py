@@ -10,7 +10,7 @@ import json
 import numpy as np
 import warp as wp
 
-from shallow_water import ShallowWaterFarField
+from simulation.shallow_water import ShallowWaterFarField
 
 
 def main() -> None:

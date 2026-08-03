@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from _bootstrap import ROOT  # noqa: F401
+
 import json
 from pathlib import Path
 import time
@@ -9,8 +11,8 @@ import time
 import warp as wp
 
 from deluge_v3 import HERE, HybridDelugeSolver
-from kernels import clear_vec3, compute_density, compute_fluid_forces
-from hybrid_kernels import (
+from kernels.base import clear_vec3, compute_density, compute_fluid_forces
+from kernels.hybrid import (
     compute_density_multirate,
     compute_fluid_forces_multirate,
     consume_deferred_fluid_impulse,

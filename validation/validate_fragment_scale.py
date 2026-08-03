@@ -11,8 +11,8 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent.parent
 
-from scene import ParticleScene  # noqa: E402
-from hybrid_model import build_fragment_ids  # noqa: E402
+from simulation.scene import ParticleScene  # noqa: E402
+from simulation.hybrid_model import build_fragment_ids  # noqa: E402
 
 
 def main() -> None:

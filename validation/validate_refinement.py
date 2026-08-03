@@ -7,7 +7,7 @@ from _bootstrap import ROOT  # noqa: F401
 import numpy as np
 import warp as wp
 
-from scene import (  # noqa: E402
+from simulation.scene import (  # noqa: E402
     STRUCT_BEAM,
     STRUCT_COLUMN,
     STRUCT_CORE,
@@ -15,7 +15,7 @@ from scene import (  # noqa: E402
     STRUCT_SLAB,
     STRUCT_WALL,
 )
-from hybrid_kernels import refine_impacted_solids  # noqa: E402
+from kernels.hybrid import refine_impacted_solids  # noqa: E402
 
 
 def gpu_array(values: np.ndarray, dtype, device: str):

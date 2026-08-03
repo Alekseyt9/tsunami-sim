@@ -6,7 +6,7 @@ from _bootstrap import ROOT  # noqa: F401
 
 import numpy as np
 
-from hybrid_model import (
+from simulation.hybrid_model import (
     FragmentSupportGraph,
     evaluate_fragment_fracture_energy,
     rebaseline_fragment_support_graph,

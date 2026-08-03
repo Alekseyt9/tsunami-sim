@@ -240,6 +240,10 @@ before they may replace production physics:
   12.40 m versus 7.32 m, longitudinal momentum diverged, and 58 fewer fragments
   were released. Keep it disabled; next compare 2x/3x dt and require momentum,
   water-height, and structural deltas to converge before any production trial.
+  A 0.06012 s `3x dt` sweep subsequently measured only 0.99x late-stage
+  performance with 0.25 m structural position RMS, so it also fails. Do not
+  spend a production-length run on `2x` with the current six projection
+  iterations; prioritize the conservative narrow-band grid path instead.
 - **Early rigidification:** transition, checkpoint, sleep and wake mechanics
   are implemented, but converting 343 more clusters did not improve the late
   substep. Do not enable it as a performance feature until rigid sample clouds

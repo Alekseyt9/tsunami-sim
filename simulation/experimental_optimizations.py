@@ -14,7 +14,7 @@ from typing import Any
 import numpy as np
 import warp as wp
 
-from kernels import poly6, spiky_grad, viscosity_laplacian
+from kernels.base import poly6, spiky_grad, viscosity_laplacian
 
 
 @wp.kernel

@@ -2,7 +2,7 @@
 
 import warp as wp
 
-from kernels import project_point
+from kernels.base import project_point
 
 
 @wp.kernel

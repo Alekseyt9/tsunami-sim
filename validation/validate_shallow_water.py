@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import warp as wp
 
-from shallow_water import ShallowWaterFarField, emit_sph_interface_particles
+from simulation.shallow_water import ShallowWaterFarField, emit_sph_interface_particles
 
 
 HERE = Path(__file__).resolve().parent.parent

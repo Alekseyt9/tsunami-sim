@@ -16,12 +16,15 @@ import numpy as np
 from PIL import Image
 import warp as wp
 
-from kernels import (
+from kernels.base import (
     clear_int, clear_vec3, compute_density, compute_fluid_forces, compute_solid_forces, count_damaged,
     integrate, refine_entering_fluid,
 )
-from renderer import ParticleRenderer, StreamingVideoWriter, encode_video
-from scene import ParticleScene
+from rendering.renderer import ParticleRenderer, StreamingVideoWriter, encode_video
+from simulation.scene import ParticleScene
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def compose_quad_view(frames: dict[str, np.ndarray], order: list[str], width: int, height: int) -> np.ndarray:
@@ -551,7 +554,7 @@ class DelugeSolver:
 
 def main():
     parser = argparse.ArgumentParser(description="DELUGE V2 offline CUDA particle simulation")
-    parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config_preview.json"))
+    parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "config_preview.json")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--smoke", action="store_true", help="Compile and test all CUDA stages using two frames")
@@ -559,7 +562,7 @@ def main():
     args = parser.parse_args()
 
     cfg = json.loads(args.config.read_text(encoding="utf-8"))
-    output = args.output or Path(__file__).with_name("outputs") / datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    output = args.output or PROJECT_ROOT / "outputs" / datetime.now().strftime("run_%Y%m%d_%H%M%S")
     output.mkdir(parents=True, exist_ok=True)
     (output / "config_used.json").write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
     wp.init()
