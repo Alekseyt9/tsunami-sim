@@ -12,7 +12,7 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent.parent
 
-from scene import ParticleScene, building_profile  # noqa: E402
+from scene import ParticleScene, building_profile, environment_layout  # noqa: E402
 from hybrid_model import (  # noqa: E402
     build_facade_skin,
     build_fragment_cell_faces,
@@ -37,6 +37,18 @@ def main() -> None:
         changed_profiles += int(slices[0] != slices[-1])
     if len(signatures) < 10 or changed_profiles < 10:
         raise AssertionError(f"city profiles are insufficiently varied: {len(signatures)} signatures")
+    layout = environment_layout(cfg)
+    shop_back = max(
+        float(shop["center"][1]) + 0.5 * float(shop["size"][1])
+        for shop in layout["small_buildings"]
+    )
+    first_row_front = min(
+        float(spec[1]) - 0.5 * float(spec[3]) for spec in cfg["buildings"][:5]
+    )
+    if shop_back >= first_row_front - 1.5:
+        raise AssertionError(
+            "foreground shops do not leave a visible water corridor before the first row"
+        )
 
     scene_cfg = dict(cfg)
     scene_cfg["solid_spacing"] = float(cfg["v3"]["solid_refinement"]["coarse_spacing"])

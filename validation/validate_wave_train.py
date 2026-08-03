@@ -29,7 +29,14 @@ def main() -> None:
         raise AssertionError("secondary wave produced invalid or negative shallow-water state")
     injected = float(field.wave_train_injected_volume)
     momentum = float(field.wave_train_injected_momentum_z)
-    if not 8000.0 <= injected <= 12500.0:
+    # Integral of the raised-cosine spatial profile is length/2; the temporal
+    # rate integrates to one. Allow cell-centre quadrature and final-step
+    # clipping tolerance instead of hard-coding one historical pulse size.
+    expected_volume = (
+        float(cfg["domain_width"]) * float(wave_train["length_m"]) * 0.5
+        * float(wave_train["height"])
+    )
+    if abs(injected - expected_volume) > expected_volume * 0.035:
         raise AssertionError(f"unexpected injected volume: {injected:.3f} m3")
     transport_velocity = momentum / max(injected, 1.0e-9)
     expected_velocity = float(wave_train["background_current"]) + float(wave_train["speed"])

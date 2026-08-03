@@ -3437,10 +3437,15 @@ def raster_facade_color(
     diffuse = wp.clamp(wp.dot(normal, sun_direction), 0.0, 1.0)
     light = 0.09 + 0.91 * diffuse
     family = material[panel] // 10
+    specular_broad = float(0.0)
+    specular_glint = float(0.0)
     if family == 2 or family == 5:
         half_vector = wp.normalize(view_direction + sun_direction)
-        specular = wp.pow(wp.clamp(wp.dot(normal, half_vector), 0.0, 1.0), 20.0)
-        base += wp.vec3(0.42, 0.46, 0.47) * specular * 0.58
+        specular_alignment = wp.clamp(
+            wp.dot(normal, half_vector), 0.0, 1.0
+        )
+        specular_broad = wp.pow(specular_alignment, 8.0)
+        specular_glint = wp.pow(specular_alignment, 38.0)
     anchor_base = panel * 4
     damage_0 = particle_damage[anchor[anchor_base]]
     damage_1 = particle_damage[anchor[anchor_base + 1]]
@@ -3459,6 +3464,18 @@ def raster_facade_color(
     # contrast after the facade skin actually tears.
     base *= 1.0 - 0.32 * wp.clamp(panel_damage, 0.0, 1.0)
     base *= light
+    if family == 2:
+        # Glass keeps a cool sky reflection, but a narrow warm solar glint is
+        # added after diffuse lighting so it remains visible on a shaded
+        # facade. Slight deterministic panel variation avoids one flat stripe.
+        glint_variation = 0.76 + 0.24 * facade_hash01(panel, 83)
+        base += wp.vec3(0.44, 0.57, 0.64) * specular_broad * 0.56
+        base += wp.vec3(0.24, 0.27, 0.25) * diffuse * 0.16
+        base += wp.vec3(1.00, 0.86, 0.61) * specular_glint * (
+            1.85 * glint_variation
+        )
+    elif family == 5:
+        base += wp.vec3(0.72, 0.76, 0.75) * specular_broad * 0.52
     rest_a = rest_vertex[ids[0]]; rest_b = rest_vertex[ids[1]]; rest_c = rest_vertex[ids[2]]
     panel_vertex = panel * 4
     rest_origin = rest_vertex[panel_vertex]

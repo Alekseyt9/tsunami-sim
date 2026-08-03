@@ -63,7 +63,11 @@
     "seed": 7319,
     "cars": {"count": 30},
     "trees": {"count": 24},
-    "small_buildings": {"count": 6}
+    "small_buildings": {
+      "count": 6,
+      "front_z": 2.0,
+      "stagger_z": 0.8
+    }
   },
   "v3": {
     "initially_active_buildings": [],
@@ -86,6 +90,15 @@
       "maximum_pressure_iterations": 4,
       "pressure_relaxation": 0.25,
       "warmstart_blend": 0.5,
+      "divergence_projection": true,
+      "divergence_iterations": 2,
+      "divergence_relaxation": 0.25,
+      "selective_compression": {
+        "enabled": true,
+        "density_threshold": 0.002,
+        "divergence_threshold_per_s": 2.0,
+        "expand_neighbor_rings": 1
+      },
       "bootstrap_ratio_minimum": 0.80,
       "bootstrap_ratio_maximum": 1.20
     },
@@ -132,12 +145,12 @@
       "forced_capture_depth": 0.75,
       "wave_train": {
         "enabled": true,
-        "start_seconds": 10.0,
-        "duration_seconds": 2.0,
-        "height": 6.0,
-        "speed": 14.0,
-        "background_current": 5.0,
-        "length_m": 24.0
+        "start_seconds": 9.0,
+        "duration_seconds": 1.25,
+        "height": 10.0,
+        "speed": 20.0,
+        "background_current": 7.0,
+        "length_m": 18.0
       }
     },
     "activation_force_per_mass": 8.0,

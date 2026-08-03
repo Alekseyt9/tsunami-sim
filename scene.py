@@ -43,12 +43,18 @@ def environment_layout(cfg: dict) -> dict[str, list[dict]]:
         trees.append({"id": -2000 - index, "center": (x, z), "height": 6.0 + 1.5 * (index % 3)})
 
     shops = []
-    requested = int(policy.get("small_buildings", {}).get("count", 6))
+    shop_policy = policy.get("small_buildings", {})
+    requested = int(shop_policy.get("count", 6))
+    # Keep the low-rise foreground legible instead of hiding it behind the
+    # third tower row.  The first high-rise facades begin near z=8.5 m; these
+    # centres leave a water corridor of roughly 2--3 m before that row.
+    front_z = float(shop_policy.get("front_z", 2.0))
+    stagger_z = float(shop_policy.get("stagger_z", 0.8))
     for index in range(requested):
         x = -55.0 + index * (110.0 / max(requested - 1, 1))
         shops.append({
             "id": -3000 - index,
-            "center": (x, 116.0 + (index % 2) * 7.5),
+            "center": (x, front_z + (index % 2) * stagger_z),
             "size": (8.0 + (index % 2) * 2.0, 7.0, 5.5 + (index % 3)),
             "palette": index % 6,
         })

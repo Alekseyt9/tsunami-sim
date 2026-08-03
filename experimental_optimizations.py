@@ -325,7 +325,7 @@ def dfsph_pressure_acceleration_verlet(
     neighbour_capacity: int,
     rest_density: float,
     max_support: float,
-    apply_boundary_reaction: int,
+    boundary_reaction_scale: float,
 ):
     slot = wp.tid()
     i = fluid_particle[slot]
@@ -362,8 +362,11 @@ def dfsph_pressure_acceleration_verlet(
             + neighbour_term
         ) * spiky_grad(delta, distance, support)
         acceleration += pair_acceleration
-        if kind[j] != 0 and apply_boundary_reaction != 0:
-            wp.atomic_add(solid_force, j, -pair_acceleration * mass[i])
+        if kind[j] != 0 and boundary_reaction_scale > 0.0:
+            wp.atomic_add(
+                solid_force, j,
+                -pair_acceleration * mass[i] * boundary_reaction_scale,
+            )
     pressure_acceleration[i] = acceleration
 
 
@@ -439,19 +442,546 @@ def dfsph_jacobi_update_verlet(
 
 
 @wp.kernel
-def dfsph_finalize_acceleration(
+def dfsph_apply_velocity_correction(
+    fluid_particle: wp.array(dtype=wp.int32),
+    predicted_velocity: wp.array(dtype=wp.vec3),
+    correction: wp.array(dtype=wp.vec3),
+    correction_scale: float,
+):
+    slot = wp.tid()
+    i = fluid_particle[slot]
+    predicted_velocity[i] += correction[i] * correction_scale
+
+
+@wp.kernel
+def dfsph_finalize_predicted_acceleration(
     fluid_particle: wp.array(dtype=wp.int32),
     v: wp.array(dtype=wp.vec3),
     predicted_velocity: wp.array(dtype=wp.vec3),
-    pressure_acceleration: wp.array(dtype=wp.vec3),
     acceleration: wp.array(dtype=wp.vec3),
     inverse_dt: float,
 ):
     slot = wp.tid()
     i = fluid_particle[slot]
-    acceleration[i] = (
-        predicted_velocity[i] + pressure_acceleration[i] / inverse_dt - v[i]
-    ) * inverse_dt
+    acceleration[i] = (predicted_velocity[i] - v[i]) * inverse_dt
+
+
+@wp.kernel
+def dfsph_divergence_advected_verlet(
+    x: wp.array(dtype=wp.vec3),
+    fluid_particle: wp.array(dtype=wp.int32),
+    solid_velocity: wp.array(dtype=wp.vec3),
+    predicted_velocity: wp.array(dtype=wp.vec3),
+    radius: wp.array(dtype=float),
+    mass: wp.array(dtype=float),
+    volume: wp.array(dtype=float),
+    kind: wp.array(dtype=wp.int32),
+    water_phase: wp.array(dtype=wp.int32),
+    rho_reference: wp.array(dtype=float),
+    divergence_advected: wp.array(dtype=float),
+    neighbour_count: wp.array(dtype=wp.int32),
+    neighbour_offset: wp.array(dtype=wp.int32),
+    neighbour_index: wp.array(dtype=wp.int32),
+    neighbour_capacity: int,
+    rest_density: float,
+    max_support: float,
+):
+    slot = wp.tid()
+    i = fluid_particle[slot]
+    if water_phase[i] == 2:
+        divergence_advected[i] = 0.0
+        return
+    xi = x[i]
+    vi = predicted_velocity[i]
+    inverse_reference = 1.0 / wp.max(
+        rho_reference[i], rest_density * 0.05
+    )
+    divergence = float(0.0)
+    start = neighbour_offset[slot]
+    end = wp.min(start + neighbour_count[slot], neighbour_capacity)
+    for edge in range(start, end):
+        j = neighbour_index[edge]
+        if j == i or (kind[j] == 0 and water_phase[j] == 2):
+            continue
+        delta = xi - x[j]
+        distance = wp.length(delta)
+        support = 4.0 * wp.max(radius[i], radius[j])
+        if distance <= 1.0e-5 or distance >= support or distance >= max_support:
+            continue
+        neighbour_velocity = solid_velocity[j]
+        effective_mass = rest_density * volume[j]
+        if kind[j] == 0:
+            neighbour_velocity = predicted_velocity[j]
+            effective_mass = mass[j]
+        divergence += effective_mass * inverse_reference * wp.dot(
+            vi - neighbour_velocity,
+            spiky_grad(delta, distance, support),
+        )
+    divergence_advected[i] = divergence
+
+
+@wp.kernel
+def dfsph_initialize_divergence_kappa(
+    fluid_particle: wp.array(dtype=wp.int32),
+    water_phase: wp.array(dtype=wp.int32),
+    divergence_advected: wp.array(dtype=float),
+    factor: wp.array(dtype=float),
+    kappa: wp.array(dtype=float),
+):
+    slot = wp.tid()
+    i = fluid_particle[slot]
+    if water_phase[i] == 2:
+        kappa[i] = 0.0
+        return
+    kappa[i] = wp.max(divergence_advected[i], 0.0) * factor[i]
+
+
+@wp.kernel
+def dfsph_divergence_jacobi_update_verlet(
+    x: wp.array(dtype=wp.vec3),
+    fluid_particle: wp.array(dtype=wp.int32),
+    radius: wp.array(dtype=float),
+    mass: wp.array(dtype=float),
+    volume: wp.array(dtype=float),
+    kind: wp.array(dtype=wp.int32),
+    water_phase: wp.array(dtype=wp.int32),
+    divergence_advected: wp.array(dtype=float),
+    rho_reference: wp.array(dtype=float),
+    factor: wp.array(dtype=float),
+    velocity_correction: wp.array(dtype=wp.vec3),
+    kappa: wp.array(dtype=float),
+    compression_residual: wp.array(dtype=float),
+    error_accumulator: wp.array(dtype=float),
+    sample_counter: wp.array(dtype=wp.int32),
+    neighbour_count: wp.array(dtype=wp.int32),
+    neighbour_offset: wp.array(dtype=wp.int32),
+    neighbour_index: wp.array(dtype=wp.int32),
+    neighbour_capacity: int,
+    rest_density: float,
+    max_support: float,
+    relaxation: float,
+):
+    slot = wp.tid()
+    i = fluid_particle[slot]
+    if water_phase[i] == 2:
+        return
+    xi = x[i]
+    correction_i = velocity_correction[i]
+    inverse_reference = 1.0 / wp.max(
+        rho_reference[i], rest_density * 0.05
+    )
+    correction_divergence = float(0.0)
+    start = neighbour_offset[slot]
+    end = wp.min(start + neighbour_count[slot], neighbour_capacity)
+    for edge in range(start, end):
+        j = neighbour_index[edge]
+        if j == i or (kind[j] == 0 and water_phase[j] == 2):
+            continue
+        delta = xi - x[j]
+        distance = wp.length(delta)
+        support = 4.0 * wp.max(radius[i], radius[j])
+        if distance <= 1.0e-5 or distance >= support or distance >= max_support:
+            continue
+        neighbour_correction = wp.vec3(0.0)
+        effective_mass = rest_density * volume[j]
+        if kind[j] == 0:
+            neighbour_correction = velocity_correction[j]
+            effective_mass = mass[j]
+        correction_divergence += effective_mass * inverse_reference * wp.dot(
+            correction_i - neighbour_correction,
+            spiky_grad(delta, distance, support),
+        )
+    residual = divergence_advected[i] + correction_divergence
+    compression_error = wp.max(residual, 0.0)
+    compression_residual[i] = compression_error
+    kappa[i] = wp.max(
+        kappa[i] + relaxation * residual * factor[i], 0.0
+    )
+    wp.atomic_add(error_accumulator, 0, compression_error)
+    wp.atomic_max(error_accumulator, 1, compression_error)
+    wp.atomic_add(sample_counter, 0, 1)
+
+
+@wp.kernel
+def dfsph_clear_selection(
+    fluid_particle: wp.array(dtype=wp.int32),
+    water_phase: wp.array(dtype=wp.int32),
+    fluid_slot: wp.array(dtype=wp.int32),
+    selection: wp.array(dtype=wp.int32),
+    expanded_selection: wp.array(dtype=wp.int32),
+    kappa: wp.array(dtype=float),
+    correction: wp.array(dtype=wp.vec3),
+):
+    """Reset cheap per-particle state and build particle -> fluid-slot map."""
+    slot = wp.tid()
+    i = fluid_particle[slot]
+    fluid_slot[i] = slot
+    selection[slot] = 0
+    expanded_selection[slot] = 0
+    kappa[i] = 0.0
+    correction[i] = wp.vec3(0.0)
+
+
+@wp.kernel
+def dfsph_mark_density_compression(
+    fluid_particle: wp.array(dtype=wp.int32),
+    water_phase: wp.array(dtype=wp.int32),
+    density_advected: wp.array(dtype=float),
+    selection: wp.array(dtype=wp.int32),
+    threshold: float,
+):
+    slot = wp.tid()
+    i = fluid_particle[slot]
+    if water_phase[i] != 2 and density_advected[i] - 1.0 >= threshold:
+        selection[slot] = 1
+
+
+@wp.kernel
+def dfsph_mark_divergence_compression(
+    fluid_particle: wp.array(dtype=wp.int32),
+    water_phase: wp.array(dtype=wp.int32),
+    divergence_advected: wp.array(dtype=float),
+    selection: wp.array(dtype=wp.int32),
+    threshold: float,
+):
+    slot = wp.tid()
+    i = fluid_particle[slot]
+    if water_phase[i] != 2 and divergence_advected[i] >= threshold:
+        selection[slot] = 1
+
+
+@wp.kernel
+def dfsph_expand_selection_one_ring(
+    fluid_particle: wp.array(dtype=wp.int32),
+    kind: wp.array(dtype=wp.int32),
+    fluid_slot: wp.array(dtype=wp.int32),
+    selection: wp.array(dtype=wp.int32),
+    expanded_selection: wp.array(dtype=wp.int32),
+    neighbour_count: wp.array(dtype=wp.int32),
+    neighbour_offset: wp.array(dtype=wp.int32),
+    neighbour_index: wp.array(dtype=wp.int32),
+    neighbour_capacity: int,
+):
+    slot = wp.tid()
+    if selection[slot] == 0:
+        return
+    wp.atomic_max(expanded_selection, slot, 1)
+    start = neighbour_offset[slot]
+    end = wp.min(start + neighbour_count[slot], neighbour_capacity)
+    for edge in range(start, end):
+        j = neighbour_index[edge]
+        if kind[j] == 0:
+            neighbour_slot = fluid_slot[j]
+            if neighbour_slot >= 0:
+                wp.atomic_max(expanded_selection, neighbour_slot, 1)
+
+
+@wp.kernel
+def dfsph_collect_selected_slots(
+    selection: wp.array(dtype=wp.int32),
+    selected_slot: wp.array(dtype=wp.int32),
+    selected_count: wp.array(dtype=wp.int32),
+):
+    slot = wp.tid()
+    if selection[slot] != 0:
+        destination = wp.atomic_add(selected_count, 0, 1)
+        selected_slot[destination] = slot
+
+
+@wp.kernel
+def dfsph_initialize_kappa_selected(
+    fluid_particle: wp.array(dtype=wp.int32),
+    selected_slot: wp.array(dtype=wp.int32),
+    selected_count: wp.array(dtype=wp.int32),
+    water_phase: wp.array(dtype=wp.int32),
+    density_advected: wp.array(dtype=float),
+    factor: wp.array(dtype=float),
+    kappa: wp.array(dtype=float),
+    kappa_warmstart: wp.array(dtype=float),
+    inverse_dt_squared: float,
+    warmstart_blend: float,
+):
+    selected_index = wp.tid()
+    if selected_index >= selected_count[0]:
+        return
+    slot = selected_slot[selected_index]
+    i = fluid_particle[slot]
+    if water_phase[i] == 2:
+        return
+    initial = (
+        wp.max(density_advected[i] - 1.0, 0.0)
+        * factor[i] * inverse_dt_squared
+    )
+    warm = kappa_warmstart[i] * warmstart_blend * inverse_dt_squared
+    if warm > 0.0:
+        kappa[i] = warm
+    else:
+        kappa[i] = initial
+
+
+@wp.kernel
+def dfsph_initialize_divergence_kappa_selected(
+    fluid_particle: wp.array(dtype=wp.int32),
+    selected_slot: wp.array(dtype=wp.int32),
+    selected_count: wp.array(dtype=wp.int32),
+    water_phase: wp.array(dtype=wp.int32),
+    divergence_advected: wp.array(dtype=float),
+    factor: wp.array(dtype=float),
+    kappa: wp.array(dtype=float),
+):
+    selected_index = wp.tid()
+    if selected_index >= selected_count[0]:
+        return
+    slot = selected_slot[selected_index]
+    i = fluid_particle[slot]
+    if water_phase[i] != 2:
+        kappa[i] = wp.max(divergence_advected[i], 0.0) * factor[i]
+
+
+@wp.kernel
+def dfsph_pressure_acceleration_selected_verlet(
+    x: wp.array(dtype=wp.vec3),
+    fluid_particle: wp.array(dtype=wp.int32),
+    selected_slot: wp.array(dtype=wp.int32),
+    selected_count: wp.array(dtype=wp.int32),
+    radius: wp.array(dtype=float),
+    mass: wp.array(dtype=float),
+    volume: wp.array(dtype=float),
+    kind: wp.array(dtype=wp.int32),
+    water_phase: wp.array(dtype=wp.int32),
+    rho_reference: wp.array(dtype=float),
+    kappa: wp.array(dtype=float),
+    pressure_acceleration: wp.array(dtype=wp.vec3),
+    solid_force: wp.array(dtype=wp.vec3),
+    neighbour_count: wp.array(dtype=wp.int32),
+    neighbour_offset: wp.array(dtype=wp.int32),
+    neighbour_index: wp.array(dtype=wp.int32),
+    neighbour_capacity: int,
+    rest_density: float,
+    max_support: float,
+    boundary_reaction_scale: float,
+):
+    selected_index = wp.tid()
+    if selected_index >= selected_count[0]:
+        return
+    slot = selected_slot[selected_index]
+    i = fluid_particle[slot]
+    if water_phase[i] == 2:
+        return
+    xi = x[i]
+    acceleration = wp.vec3(0.0)
+    reference_i = wp.max(rho_reference[i], rest_density * 0.05)
+    inverse_mass_i = 1.0 / wp.max(mass[i], 1.0e-8)
+    start = neighbour_offset[slot]
+    end = wp.min(start + neighbour_count[slot], neighbour_capacity)
+    for edge in range(start, end):
+        j = neighbour_index[edge]
+        if j == i or (kind[j] == 0 and water_phase[j] == 2):
+            continue
+        delta = xi - x[j]
+        distance = wp.length(delta)
+        support = 4.0 * wp.max(radius[i], radius[j])
+        if distance <= 1.0e-5 or distance >= support or distance >= max_support:
+            continue
+        effective_mass_j = rest_density * volume[j]
+        neighbour_term = float(0.0)
+        if kind[j] == 0:
+            effective_mass_j = mass[j]
+            neighbour_term = kappa[j] / wp.max(
+                rho_reference[j], rest_density * 0.05
+            )
+        pair_acceleration = -(
+            kappa[i] * effective_mass_j * inverse_mass_i / reference_i
+            + neighbour_term
+        ) * spiky_grad(delta, distance, support)
+        acceleration += pair_acceleration
+        if kind[j] != 0 and boundary_reaction_scale > 0.0:
+            wp.atomic_add(
+                solid_force, j,
+                -pair_acceleration * mass[i] * boundary_reaction_scale,
+            )
+    pressure_acceleration[i] = acceleration
+
+
+@wp.kernel
+def dfsph_density_jacobi_update_selected_verlet(
+    x: wp.array(dtype=wp.vec3),
+    fluid_particle: wp.array(dtype=wp.int32),
+    selected_slot: wp.array(dtype=wp.int32),
+    selected_count: wp.array(dtype=wp.int32),
+    radius: wp.array(dtype=float),
+    mass: wp.array(dtype=float),
+    volume: wp.array(dtype=float),
+    kind: wp.array(dtype=wp.int32),
+    water_phase: wp.array(dtype=wp.int32),
+    density_advected: wp.array(dtype=float),
+    rho_reference: wp.array(dtype=float),
+    factor: wp.array(dtype=float),
+    pressure_acceleration: wp.array(dtype=wp.vec3),
+    kappa: wp.array(dtype=float),
+    compression_residual: wp.array(dtype=float),
+    error_accumulator: wp.array(dtype=float),
+    sample_counter: wp.array(dtype=wp.int32),
+    neighbour_count: wp.array(dtype=wp.int32),
+    neighbour_offset: wp.array(dtype=wp.int32),
+    neighbour_index: wp.array(dtype=wp.int32),
+    neighbour_capacity: int,
+    rest_density: float,
+    max_support: float,
+    dt_squared: float,
+    relaxation: float,
+):
+    selected_index = wp.tid()
+    if selected_index >= selected_count[0]:
+        return
+    slot = selected_slot[selected_index]
+    i = fluid_particle[slot]
+    if water_phase[i] == 2:
+        return
+    xi = x[i]
+    ai = pressure_acceleration[i]
+    pressure_density_change = float(0.0)
+    start = neighbour_offset[slot]
+    end = wp.min(start + neighbour_count[slot], neighbour_capacity)
+    for edge in range(start, end):
+        j = neighbour_index[edge]
+        if j == i or (kind[j] == 0 and water_phase[j] == 2):
+            continue
+        delta = xi - x[j]
+        distance = wp.length(delta)
+        support = 4.0 * wp.max(radius[i], radius[j])
+        if distance <= 1.0e-5 or distance >= support or distance >= max_support:
+            continue
+        neighbour_acceleration = wp.vec3(0.0)
+        neighbour_volume = volume[j]
+        if kind[j] == 0:
+            neighbour_acceleration = pressure_acceleration[j]
+            neighbour_volume = mass[j] / rest_density
+        pressure_density_change += neighbour_volume * wp.dot(
+            ai - neighbour_acceleration,
+            spiky_grad(delta, distance, support),
+        )
+    normalization = rest_density / wp.max(
+        rho_reference[i], rest_density * 0.05
+    )
+    residual = (
+        density_advected[i] - 1.0
+        + dt_squared * normalization * pressure_density_change
+    )
+    compression_error = wp.max(residual, 0.0)
+    compression_residual[i] = compression_error
+    kappa[i] = wp.max(
+        kappa[i] + relaxation * residual * factor[i]
+        / wp.max(dt_squared, 1.0e-12),
+        0.0,
+    )
+    wp.atomic_add(error_accumulator, 0, compression_error)
+    wp.atomic_max(error_accumulator, 1, compression_error)
+    wp.atomic_add(sample_counter, 0, 1)
+
+
+@wp.kernel
+def dfsph_divergence_jacobi_update_selected_verlet(
+    x: wp.array(dtype=wp.vec3),
+    fluid_particle: wp.array(dtype=wp.int32),
+    selected_slot: wp.array(dtype=wp.int32),
+    selected_count: wp.array(dtype=wp.int32),
+    radius: wp.array(dtype=float),
+    mass: wp.array(dtype=float),
+    volume: wp.array(dtype=float),
+    kind: wp.array(dtype=wp.int32),
+    water_phase: wp.array(dtype=wp.int32),
+    divergence_advected: wp.array(dtype=float),
+    rho_reference: wp.array(dtype=float),
+    factor: wp.array(dtype=float),
+    velocity_correction: wp.array(dtype=wp.vec3),
+    kappa: wp.array(dtype=float),
+    compression_residual: wp.array(dtype=float),
+    error_accumulator: wp.array(dtype=float),
+    sample_counter: wp.array(dtype=wp.int32),
+    neighbour_count: wp.array(dtype=wp.int32),
+    neighbour_offset: wp.array(dtype=wp.int32),
+    neighbour_index: wp.array(dtype=wp.int32),
+    neighbour_capacity: int,
+    rest_density: float,
+    max_support: float,
+    relaxation: float,
+):
+    selected_index = wp.tid()
+    if selected_index >= selected_count[0]:
+        return
+    slot = selected_slot[selected_index]
+    i = fluid_particle[slot]
+    if water_phase[i] == 2:
+        return
+    xi = x[i]
+    correction_i = velocity_correction[i]
+    inverse_reference = 1.0 / wp.max(
+        rho_reference[i], rest_density * 0.05
+    )
+    correction_divergence = float(0.0)
+    start = neighbour_offset[slot]
+    end = wp.min(start + neighbour_count[slot], neighbour_capacity)
+    for edge in range(start, end):
+        j = neighbour_index[edge]
+        if j == i or (kind[j] == 0 and water_phase[j] == 2):
+            continue
+        delta = xi - x[j]
+        distance = wp.length(delta)
+        support = 4.0 * wp.max(radius[i], radius[j])
+        if distance <= 1.0e-5 or distance >= support or distance >= max_support:
+            continue
+        neighbour_correction = wp.vec3(0.0)
+        effective_mass = rest_density * volume[j]
+        if kind[j] == 0:
+            neighbour_correction = velocity_correction[j]
+            effective_mass = mass[j]
+        correction_divergence += effective_mass * inverse_reference * wp.dot(
+            correction_i - neighbour_correction,
+            spiky_grad(delta, distance, support),
+        )
+    residual = divergence_advected[i] + correction_divergence
+    compression_error = wp.max(residual, 0.0)
+    compression_residual[i] = compression_error
+    kappa[i] = wp.max(
+        kappa[i] + relaxation * residual * factor[i], 0.0
+    )
+    wp.atomic_add(error_accumulator, 0, compression_error)
+    wp.atomic_max(error_accumulator, 1, compression_error)
+    wp.atomic_add(sample_counter, 0, 1)
+
+
+@wp.kernel
+def dfsph_apply_velocity_correction_selected(
+    fluid_particle: wp.array(dtype=wp.int32),
+    selected_slot: wp.array(dtype=wp.int32),
+    selected_count: wp.array(dtype=wp.int32),
+    predicted_velocity: wp.array(dtype=wp.vec3),
+    correction: wp.array(dtype=wp.vec3),
+    correction_scale: float,
+):
+    selected_index = wp.tid()
+    if selected_index >= selected_count[0]:
+        return
+    i = fluid_particle[selected_slot[selected_index]]
+    predicted_velocity[i] += correction[i] * correction_scale
+
+
+@wp.kernel
+def dfsph_store_warmstart_selected(
+    fluid_particle: wp.array(dtype=wp.int32),
+    water_phase: wp.array(dtype=wp.int32),
+    selection: wp.array(dtype=wp.int32),
+    kappa: wp.array(dtype=float),
+    kappa_warmstart: wp.array(dtype=float),
+    dt_squared: float,
+):
+    slot = wp.tid()
+    i = fluid_particle[slot]
+    if water_phase[i] == 2 or selection[slot] == 0:
+        kappa_warmstart[i] = 0.0
+    else:
+        kappa_warmstart[i] = kappa[i] * dt_squared
 
 
 @wp.kernel
@@ -573,6 +1103,29 @@ class ImplicitFluidPreparation:
         self.warmstart_blend = min(
             1.0, max(0.0, float(policy.get("warmstart_blend", 0.5)))
         )
+        self.divergence_projection_enabled = bool(
+            policy.get("divergence_projection", True)
+        )
+        self.divergence_iterations = max(
+            1, int(policy.get("divergence_iterations", 2))
+        )
+        self.divergence_relaxation = min(
+            1.0, max(0.05, float(policy.get("divergence_relaxation", 0.25)))
+        )
+        selective_policy = policy.get("selective_compression", {})
+        self.selective_compression_enabled = bool(
+            selective_policy.get("enabled", False)
+        )
+        self.density_selection_threshold = max(
+            0.0, float(selective_policy.get("density_threshold", 0.002))
+        )
+        self.divergence_selection_threshold = max(
+            0.0,
+            float(selective_policy.get("divergence_threshold_per_s", 2.0)),
+        )
+        self.selection_neighbor_rings = min(
+            1, max(0, int(selective_policy.get("expand_neighbor_rings", 1)))
+        )
         self.bootstrap_ratio_minimum = min(
             1.0, max(0.1, float(policy.get("bootstrap_ratio_minimum", 0.80)))
         )
@@ -589,6 +1142,9 @@ class ImplicitFluidPreparation:
         )
         self.kappa_divergence = wp.zeros(allocation, dtype=float, device=device)
         self.density_advected = wp.zeros(allocation, dtype=float, device=device)
+        self.divergence_advected = wp.zeros(
+            allocation, dtype=float, device=device
+        )
         self.velocity_predicted = wp.zeros(
             allocation, dtype=wp.vec3, device=device
         )
@@ -600,9 +1156,100 @@ class ImplicitFluidPreparation:
         )
         self.error_accumulator = wp.zeros(2, dtype=float, device=device)
         self.sample_counter = wp.zeros(1, dtype=wp.int32, device=device)
+        self.divergence_error_accumulator = wp.zeros(
+            2, dtype=float, device=device
+        )
+        self.divergence_sample_counter = wp.zeros(
+            1, dtype=wp.int32, device=device
+        )
+        self.fluid_slot = wp.zeros(
+            allocation, dtype=wp.int32, device=device
+        )
+        self.compression_selection = wp.zeros(
+            allocation, dtype=wp.int32, device=device
+        )
+        self.expanded_compression_selection = wp.zeros(
+            allocation, dtype=wp.int32, device=device
+        )
+        self.selected_slot = wp.zeros(
+            allocation, dtype=wp.int32, device=device
+        )
+        self.density_selected_count = wp.zeros(
+            1, dtype=wp.int32, device=device
+        )
+        self.divergence_selected_count = wp.zeros(
+            1, dtype=wp.int32, device=device
+        )
         self.last_execution_iterations = 0
+        self.last_divergence_iterations = 0
+        self.last_density_selected_count = 0
+        self.last_divergence_selected_count = 0
+        self.last_fluid_particle_count = 0
         self.execution_calls = 0
         self.last_diagnostics: dict[str, float | int | str] = {}
+
+    def _select_compressed_particles(
+        self,
+        arrays: dict[str, wp.array],
+        fluid_particle: wp.array,
+        fluid_particle_count: int,
+        neighbour_count: wp.array,
+        neighbour_offset: wp.array,
+        neighbour_index: wp.array,
+        neighbour_capacity: int,
+        kappa: wp.array,
+        selected_count: wp.array,
+        density_mode: bool,
+        count: int,
+        device: str,
+    ) -> wp.array:
+        """Build an entirely device-side compact high-compression work list."""
+        wp.launch(
+            dfsph_clear_selection, dim=fluid_particle_count,
+            inputs=[
+                fluid_particle, arrays["water_phase"][:count],
+                self.fluid_slot, self.compression_selection,
+                self.expanded_compression_selection, kappa,
+                self.pressure_acceleration,
+            ], device=device,
+        )
+        if density_mode:
+            wp.launch(
+                dfsph_mark_density_compression, dim=fluid_particle_count,
+                inputs=[
+                    fluid_particle, arrays["water_phase"][:count],
+                    self.density_advected, self.compression_selection,
+                    self.density_selection_threshold,
+                ], device=device,
+            )
+        else:
+            wp.launch(
+                dfsph_mark_divergence_compression, dim=fluid_particle_count,
+                inputs=[
+                    fluid_particle, arrays["water_phase"][:count],
+                    self.divergence_advected, self.compression_selection,
+                    self.divergence_selection_threshold,
+                ], device=device,
+            )
+        active_selection = self.compression_selection
+        if self.selection_neighbor_rings > 0:
+            wp.launch(
+                dfsph_expand_selection_one_ring, dim=fluid_particle_count,
+                inputs=[
+                    fluid_particle, arrays["kind"][:count], self.fluid_slot,
+                    self.compression_selection,
+                    self.expanded_compression_selection, neighbour_count,
+                    neighbour_offset, neighbour_index, neighbour_capacity,
+                ], device=device,
+            )
+            active_selection = self.expanded_compression_selection
+        selected_count.zero_()
+        wp.launch(
+            dfsph_collect_selected_slots, dim=fluid_particle_count,
+            inputs=[active_selection, self.selected_slot, selected_count],
+            device=device,
+        )
+        return active_selection
 
     def execute_density_projection(
         self,
@@ -675,18 +1322,142 @@ class ImplicitFluidPreparation:
             ], device=device,
         )
         inverse_dt_squared = 1.0 / max(dt * dt, 1.0e-12)
-        wp.launch(
-            dfsph_initialize_kappa, dim=fluid_particle_count,
-            inputs=[
-                fluid_particle, arrays["water_phase"][:count],
-                self.density_advected, self.factor, self.kappa_density,
-                self.kappa_density_warmstart, inverse_dt_squared,
-                self.warmstart_blend,
-            ], device=device,
-        )
-        for _ in range(self.maximum_pressure_iterations):
+        density_selection = self.compression_selection
+        if self.selective_compression_enabled:
+            density_selection = self._select_compressed_particles(
+                arrays, fluid_particle, fluid_particle_count,
+                neighbour_count, neighbour_offset, neighbour_index,
+                neighbour_capacity, self.kappa_density,
+                self.density_selected_count, True, count, device,
+            )
             wp.launch(
-                dfsph_pressure_acceleration_verlet, dim=fluid_particle_count,
+                dfsph_initialize_kappa_selected, dim=fluid_particle_count,
+                inputs=[
+                    fluid_particle, self.selected_slot,
+                    self.density_selected_count,
+                    arrays["water_phase"][:count], self.density_advected,
+                    self.factor, self.kappa_density,
+                    self.kappa_density_warmstart, inverse_dt_squared,
+                    self.warmstart_blend,
+                ], device=device,
+            )
+        else:
+            wp.launch(
+                dfsph_initialize_kappa, dim=fluid_particle_count,
+                inputs=[
+                    fluid_particle, arrays["water_phase"][:count],
+                    self.density_advected, self.factor, self.kappa_density,
+                    self.kappa_density_warmstart, inverse_dt_squared,
+                    self.warmstart_blend,
+                ], device=device,
+            )
+        for _ in range(self.maximum_pressure_iterations):
+            if self.selective_compression_enabled:
+                self.pressure_acceleration.zero_()
+                wp.launch(
+                    dfsph_pressure_acceleration_selected_verlet,
+                    dim=fluid_particle_count,
+                    inputs=[
+                        arrays["x"][:count], fluid_particle,
+                        self.selected_slot, self.density_selected_count,
+                        arrays["radius"][:count], arrays["mass"][:count],
+                        arrays["volume"][:count], arrays["kind"][:count],
+                        arrays["water_phase"][:count],
+                        arrays["rho_reference"][:count], self.kappa_density,
+                        self.pressure_acceleration, solid_force,
+                        neighbour_count, neighbour_offset, neighbour_index,
+                        neighbour_capacity, rest_density, max_support, 0.0,
+                    ], device=device,
+                )
+            else:
+                wp.launch(
+                    dfsph_pressure_acceleration_verlet,
+                    dim=fluid_particle_count,
+                    inputs=[
+                        arrays["x"][:count], fluid_particle,
+                        arrays["radius"][:count], arrays["mass"][:count],
+                        arrays["volume"][:count], arrays["kind"][:count],
+                        arrays["water_phase"][:count],
+                        arrays["rho_reference"][:count], self.kappa_density,
+                        self.pressure_acceleration, solid_force,
+                        neighbour_count, neighbour_offset, neighbour_index,
+                        neighbour_capacity, rest_density, max_support, 0.0,
+                    ], device=device,
+                )
+            self.error_accumulator.zero_()
+            self.sample_counter.zero_()
+            if self.selective_compression_enabled:
+                wp.launch(
+                    dfsph_density_jacobi_update_selected_verlet,
+                    dim=fluid_particle_count,
+                    inputs=[
+                        arrays["x"][:count], fluid_particle,
+                        self.selected_slot, self.density_selected_count,
+                        arrays["radius"][:count], arrays["mass"][:count],
+                        arrays["volume"][:count], arrays["kind"][:count],
+                        arrays["water_phase"][:count], self.density_advected,
+                        arrays["rho_reference"][:count], self.factor,
+                        self.pressure_acceleration, self.kappa_density,
+                        self.compression_residual, self.error_accumulator,
+                        self.sample_counter, neighbour_count, neighbour_offset,
+                        neighbour_index, neighbour_capacity, rest_density,
+                        max_support, dt * dt, self.pressure_relaxation,
+                    ], device=device,
+                )
+            else:
+                wp.launch(
+                    dfsph_jacobi_update_verlet, dim=fluid_particle_count,
+                    inputs=[
+                        arrays["x"][:count], fluid_particle,
+                        arrays["radius"][:count], arrays["mass"][:count],
+                        arrays["volume"][:count], arrays["kind"][:count],
+                        arrays["water_phase"][:count], self.density_advected,
+                        arrays["rho_reference"][:count], self.factor,
+                        self.pressure_acceleration,
+                        self.kappa_density, self.compression_residual,
+                        self.error_accumulator, self.sample_counter,
+                        neighbour_count, neighbour_offset, neighbour_index,
+                        neighbour_capacity, rest_density, max_support,
+                        dt * dt, self.pressure_relaxation,
+                    ], device=device,
+                )
+        if self.selective_compression_enabled:
+            self.pressure_acceleration.zero_()
+            wp.launch(
+                dfsph_pressure_acceleration_selected_verlet,
+                dim=fluid_particle_count,
+                inputs=[
+                    arrays["x"][:count], fluid_particle, self.selected_slot,
+                    self.density_selected_count, arrays["radius"][:count],
+                    arrays["mass"][:count], arrays["volume"][:count],
+                    arrays["kind"][:count], arrays["water_phase"][:count],
+                    arrays["rho_reference"][:count], self.kappa_density,
+                    self.pressure_acceleration, solid_force,
+                    neighbour_count, neighbour_offset, neighbour_index,
+                    neighbour_capacity, rest_density, max_support, 1.0,
+                ], device=device,
+            )
+            wp.launch(
+                dfsph_apply_velocity_correction_selected,
+                dim=fluid_particle_count,
+                inputs=[
+                    fluid_particle, self.selected_slot,
+                    self.density_selected_count, self.velocity_predicted,
+                    self.pressure_acceleration, dt,
+                ], device=device,
+            )
+            wp.launch(
+                dfsph_store_warmstart_selected, dim=fluid_particle_count,
+                inputs=[
+                    fluid_particle, arrays["water_phase"][:count],
+                    density_selection, self.kappa_density,
+                    self.kappa_density_warmstart, dt * dt,
+                ], device=device,
+            )
+        else:
+            wp.launch(
+                dfsph_pressure_acceleration_verlet,
+                dim=fluid_particle_count,
                 inputs=[
                     arrays["x"][:count], fluid_particle,
                     arrays["radius"][:count], arrays["mass"][:count],
@@ -695,56 +1466,213 @@ class ImplicitFluidPreparation:
                     arrays["rho_reference"][:count], self.kappa_density,
                     self.pressure_acceleration, solid_force,
                     neighbour_count, neighbour_offset, neighbour_index,
-                    neighbour_capacity, rest_density, max_support, 0,
+                    neighbour_capacity, rest_density, max_support, 1.0,
                 ], device=device,
             )
-            self.error_accumulator.zero_()
-            self.sample_counter.zero_()
             wp.launch(
-                dfsph_jacobi_update_verlet, dim=fluid_particle_count,
+                dfsph_apply_velocity_correction, dim=fluid_particle_count,
                 inputs=[
-                    arrays["x"][:count], fluid_particle,
-                    arrays["radius"][:count], arrays["mass"][:count],
-                    arrays["volume"][:count], arrays["kind"][:count],
-                    arrays["water_phase"][:count], self.density_advected,
-                    arrays["rho_reference"][:count], self.factor,
-                    self.pressure_acceleration,
-                    self.kappa_density, self.compression_residual,
-                    self.error_accumulator,
-                    self.sample_counter, neighbour_count, neighbour_offset,
-                    neighbour_index, neighbour_capacity, rest_density,
-                    max_support, dt * dt, self.pressure_relaxation,
+                    fluid_particle, self.velocity_predicted,
+                    self.pressure_acceleration, dt,
                 ], device=device,
             )
+            wp.launch(
+                dfsph_store_warmstart, dim=fluid_particle_count,
+                inputs=[
+                    fluid_particle, arrays["water_phase"][:count],
+                    self.kappa_density, self.kappa_density_warmstart,
+                    dt * dt,
+                ], device=device,
+            )
+        if self.divergence_projection_enabled:
+            wp.launch(
+                dfsph_divergence_advected_verlet, dim=fluid_particle_count,
+                inputs=[
+                    arrays["x"][:count], fluid_particle, arrays["v"][:count],
+                    self.velocity_predicted, arrays["radius"][:count],
+                    arrays["mass"][:count], arrays["volume"][:count],
+                    arrays["kind"][:count], arrays["water_phase"][:count],
+                    arrays["rho_reference"][:count],
+                    self.divergence_advected,
+                    neighbour_count, neighbour_offset, neighbour_index,
+                    neighbour_capacity, rest_density, max_support,
+                ], device=device,
+            )
+            if self.selective_compression_enabled:
+                self._select_compressed_particles(
+                    arrays, fluid_particle, fluid_particle_count,
+                    neighbour_count, neighbour_offset, neighbour_index,
+                    neighbour_capacity, self.kappa_divergence,
+                    self.divergence_selected_count, False, count, device,
+                )
+                wp.launch(
+                    dfsph_initialize_divergence_kappa_selected,
+                    dim=fluid_particle_count,
+                    inputs=[
+                        fluid_particle, self.selected_slot,
+                        self.divergence_selected_count,
+                        arrays["water_phase"][:count],
+                        self.divergence_advected, self.factor,
+                        self.kappa_divergence,
+                    ], device=device,
+                )
+            else:
+                wp.launch(
+                    dfsph_initialize_divergence_kappa,
+                    dim=fluid_particle_count,
+                    inputs=[
+                        fluid_particle, arrays["water_phase"][:count],
+                        self.divergence_advected, self.factor,
+                        self.kappa_divergence,
+                    ], device=device,
+                )
+            for _ in range(self.divergence_iterations):
+                if self.selective_compression_enabled:
+                    self.pressure_acceleration.zero_()
+                    wp.launch(
+                        dfsph_pressure_acceleration_selected_verlet,
+                        dim=fluid_particle_count,
+                        inputs=[
+                            arrays["x"][:count], fluid_particle,
+                            self.selected_slot, self.divergence_selected_count,
+                            arrays["radius"][:count], arrays["mass"][:count],
+                            arrays["volume"][:count], arrays["kind"][:count],
+                            arrays["water_phase"][:count],
+                            arrays["rho_reference"][:count],
+                            self.kappa_divergence,
+                            self.pressure_acceleration, solid_force,
+                            neighbour_count, neighbour_offset,
+                            neighbour_index, neighbour_capacity, rest_density,
+                            max_support, 0.0,
+                        ], device=device,
+                    )
+                else:
+                    wp.launch(
+                        dfsph_pressure_acceleration_verlet,
+                        dim=fluid_particle_count,
+                        inputs=[
+                            arrays["x"][:count], fluid_particle,
+                            arrays["radius"][:count], arrays["mass"][:count],
+                            arrays["volume"][:count], arrays["kind"][:count],
+                            arrays["water_phase"][:count],
+                            arrays["rho_reference"][:count],
+                            self.kappa_divergence,
+                            self.pressure_acceleration, solid_force,
+                            neighbour_count, neighbour_offset, neighbour_index,
+                            neighbour_capacity, rest_density, max_support, 0.0,
+                        ], device=device,
+                    )
+                self.divergence_error_accumulator.zero_()
+                self.divergence_sample_counter.zero_()
+                if self.selective_compression_enabled:
+                    wp.launch(
+                        dfsph_divergence_jacobi_update_selected_verlet,
+                        dim=fluid_particle_count,
+                        inputs=[
+                            arrays["x"][:count], fluid_particle,
+                            self.selected_slot, self.divergence_selected_count,
+                            arrays["radius"][:count], arrays["mass"][:count],
+                            arrays["volume"][:count], arrays["kind"][:count],
+                            arrays["water_phase"][:count],
+                            self.divergence_advected,
+                            arrays["rho_reference"][:count], self.factor,
+                            self.pressure_acceleration,
+                            self.kappa_divergence,
+                            self.compression_residual,
+                            self.divergence_error_accumulator,
+                            self.divergence_sample_counter, neighbour_count,
+                            neighbour_offset, neighbour_index,
+                            neighbour_capacity, rest_density, max_support,
+                            self.divergence_relaxation,
+                        ], device=device,
+                    )
+                else:
+                    wp.launch(
+                        dfsph_divergence_jacobi_update_verlet,
+                        dim=fluid_particle_count,
+                        inputs=[
+                            arrays["x"][:count], fluid_particle,
+                            arrays["radius"][:count], arrays["mass"][:count],
+                            arrays["volume"][:count], arrays["kind"][:count],
+                            arrays["water_phase"][:count],
+                            self.divergence_advected,
+                            arrays["rho_reference"][:count], self.factor,
+                            self.pressure_acceleration,
+                            self.kappa_divergence,
+                            self.compression_residual,
+                            self.divergence_error_accumulator,
+                            self.divergence_sample_counter, neighbour_count,
+                            neighbour_offset, neighbour_index,
+                            neighbour_capacity, rest_density, max_support,
+                            self.divergence_relaxation,
+                        ], device=device,
+                    )
+            boundary_scale = 1.0 / max(dt, 1.0e-12)
+            if self.selective_compression_enabled:
+                self.pressure_acceleration.zero_()
+                wp.launch(
+                    dfsph_pressure_acceleration_selected_verlet,
+                    dim=fluid_particle_count,
+                    inputs=[
+                        arrays["x"][:count], fluid_particle,
+                        self.selected_slot, self.divergence_selected_count,
+                        arrays["radius"][:count], arrays["mass"][:count],
+                        arrays["volume"][:count], arrays["kind"][:count],
+                        arrays["water_phase"][:count],
+                        arrays["rho_reference"][:count],
+                        self.kappa_divergence, self.pressure_acceleration,
+                        solid_force, neighbour_count, neighbour_offset,
+                        neighbour_index, neighbour_capacity, rest_density,
+                        max_support, boundary_scale,
+                    ], device=device,
+                )
+                wp.launch(
+                    dfsph_apply_velocity_correction_selected,
+                    dim=fluid_particle_count,
+                    inputs=[
+                        fluid_particle, self.selected_slot,
+                        self.divergence_selected_count,
+                        self.velocity_predicted,
+                        self.pressure_acceleration, 1.0,
+                    ], device=device,
+                )
+            else:
+                wp.launch(
+                    dfsph_pressure_acceleration_verlet,
+                    dim=fluid_particle_count,
+                    inputs=[
+                        arrays["x"][:count], fluid_particle,
+                        arrays["radius"][:count], arrays["mass"][:count],
+                        arrays["volume"][:count], arrays["kind"][:count],
+                        arrays["water_phase"][:count],
+                        arrays["rho_reference"][:count],
+                        self.kappa_divergence, self.pressure_acceleration,
+                        solid_force, neighbour_count, neighbour_offset,
+                        neighbour_index, neighbour_capacity, rest_density,
+                        max_support, boundary_scale,
+                    ], device=device,
+                )
+                wp.launch(
+                    dfsph_apply_velocity_correction,
+                    dim=fluid_particle_count,
+                    inputs=[
+                        fluid_particle, self.velocity_predicted,
+                        self.pressure_acceleration, 1.0,
+                    ], device=device,
+                )
+            self.last_divergence_iterations = self.divergence_iterations
+        else:
+            self.last_divergence_iterations = 0
         wp.launch(
-            dfsph_pressure_acceleration_verlet, dim=fluid_particle_count,
-            inputs=[
-                arrays["x"][:count], fluid_particle,
-                arrays["radius"][:count], arrays["mass"][:count],
-                arrays["volume"][:count], arrays["kind"][:count],
-                arrays["water_phase"][:count],
-                arrays["rho_reference"][:count], self.kappa_density,
-                self.pressure_acceleration, solid_force,
-                neighbour_count, neighbour_offset, neighbour_index,
-                neighbour_capacity, rest_density, max_support, 1,
-            ], device=device,
-        )
-        wp.launch(
-            dfsph_finalize_acceleration, dim=fluid_particle_count,
+            dfsph_finalize_predicted_acceleration, dim=fluid_particle_count,
             inputs=[
                 fluid_particle, arrays["v"][:count], self.velocity_predicted,
-                self.pressure_acceleration, arrays["acceleration"][:count],
+                arrays["acceleration"][:count],
                 1.0 / max(dt, 1.0e-12),
             ], device=device,
         )
-        wp.launch(
-            dfsph_store_warmstart, dim=fluid_particle_count,
-            inputs=[
-                fluid_particle, arrays["water_phase"][:count],
-                self.kappa_density, self.kappa_density_warmstart, dt * dt,
-            ], device=device,
-        )
         self.last_execution_iterations = self.maximum_pressure_iterations
+        self.last_fluid_particle_count = fluid_particle_count
         self.execution_calls += 1
         return True
 
@@ -753,12 +1681,48 @@ class ImplicitFluidPreparation:
             return {}
         error = self.error_accumulator.numpy()
         samples = max(int(self.sample_counter.numpy()[0]), 1)
-        return {
+        result = {
             "implicit_execution_mode": self.mode,
             "implicit_pressure_iterations": self.last_execution_iterations,
             "implicit_density_error_mean_percent": 100.0 * float(error[0]) / samples,
             "implicit_density_error_max_percent": 100.0 * float(error[1]),
         }
+        if self.last_divergence_iterations > 0:
+            divergence_error = self.divergence_error_accumulator.numpy()
+            divergence_samples = max(
+                int(self.divergence_sample_counter.numpy()[0]), 1
+            )
+            result.update({
+                "implicit_divergence_iterations": self.last_divergence_iterations,
+                "implicit_divergence_error_mean_per_s": float(
+                    divergence_error[0]
+                ) / divergence_samples,
+                "implicit_divergence_error_max_per_s": float(
+                    divergence_error[1]
+                ),
+            })
+        if self.selective_compression_enabled:
+            density_selected = int(self.density_selected_count.numpy()[0])
+            divergence_selected = int(
+                self.divergence_selected_count.numpy()[0]
+            )
+            fluid_count = max(self.last_fluid_particle_count, 1)
+            self.last_density_selected_count = density_selected
+            self.last_divergence_selected_count = divergence_selected
+            result.update({
+                "implicit_selective_compression": 1,
+                "implicit_density_selected_particles": density_selected,
+                "implicit_density_selected_percent": (
+                    100.0 * density_selected / fluid_count
+                ),
+                "implicit_divergence_selected_particles": (
+                    divergence_selected
+                ),
+                "implicit_divergence_selected_percent": (
+                    100.0 * divergence_selected / fluid_count
+                ),
+            })
+        return result
 
     def analyze(
         self,
