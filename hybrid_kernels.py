@@ -7,6 +7,53 @@ expensive bond traversal until enough facade particles receive water load.
 import warp as wp
 
 
+SPH_PI = wp.constant(3.141592653589793)
+
+
+@wp.kernel
+def precompute_sph_kernel_coefficients(
+    radius: wp.array(dtype=float),
+    support: wp.array(dtype=float),
+    support_squared: wp.array(dtype=float),
+    poly6_coefficient: wp.array(dtype=float),
+    spiky_coefficient: wp.array(dtype=float),
+    viscosity_coefficient: wp.array(dtype=float),
+):
+    """Cache radius-dependent SPH powers once instead of per neighbour pair."""
+    i = wp.tid()
+    h = 4.0 * radius[i]
+    h2 = h * h
+    h3 = h2 * h
+    h6 = h3 * h3
+    h9 = h6 * h3
+    support[i] = h
+    support_squared[i] = h2
+    poly6_coefficient[i] = 315.0 / (64.0 * SPH_PI * h9)
+    spiky_coefficient[i] = -45.0 / (SPH_PI * h6)
+    viscosity_coefficient[i] = 45.0 / (SPH_PI * h6)
+
+
+@wp.func
+def cached_poly6(r2: float, h2: float, coefficient: float) -> float:
+    value = wp.max(h2 - r2, 0.0)
+    return coefficient * value * value * value
+
+
+@wp.func
+def cached_spiky_grad(
+    r: wp.vec3, distance: float, h: float, coefficient: float
+) -> wp.vec3:
+    value = wp.max(h - distance, 0.0)
+    return coefficient * value * value * r / distance
+
+
+@wp.func
+def cached_viscosity_laplacian(
+    distance: float, h: float, coefficient: float
+) -> float:
+    return coefficient * wp.max(h - distance, 0.0)
+
+
 @wp.kernel
 def apply_conservative_fluid_merges(
     representatives: wp.array(dtype=wp.int32),
@@ -762,6 +809,190 @@ def compute_clustered_solid_forces_adjacency(
 
 
 @wp.kernel
+def append_dynamic_solid_particles(
+    kind: wp.array(dtype=wp.int32),
+    fixed: wp.array(dtype=wp.int32),
+    membership: wp.array(dtype=wp.int32),
+    particle_index: wp.array(dtype=wp.int32),
+    particle_count: wp.array(dtype=wp.int32),
+):
+    """Incrementally append newly dynamic solids without rebuilding the list."""
+    i = wp.tid()
+    if kind[i] == 0 or fixed[i] != 0 or membership[i] != 0:
+        return
+    membership[i] = 1
+    slot = wp.atomic_add(particle_count, 0, 1)
+    particle_index[slot] = i
+
+
+@wp.kernel
+def mark_spatial_dynamic_solid_particles(
+    grid: wp.uint64,
+    kind: wp.array(dtype=wp.int32),
+    fixed: wp.array(dtype=wp.int32),
+    spatial_particle: wp.array(dtype=wp.int32),
+    spatial_flag: wp.array(dtype=wp.int32),
+):
+    tid = wp.tid()
+    i = wp.hash_grid_point_id(grid, tid)
+    spatial_particle[tid] = i
+    spatial_flag[tid] = int(kind[i] != 0 and fixed[i] == 0)
+
+
+@wp.kernel
+def scatter_spatial_dynamic_solid_particles(
+    spatial_particle: wp.array(dtype=wp.int32),
+    spatial_flag: wp.array(dtype=wp.int32),
+    spatial_offset: wp.array(dtype=wp.int32),
+    particle_index: wp.array(dtype=wp.int32),
+    particle_count: wp.array(dtype=wp.int32),
+    total_particles: int,
+):
+    tid = wp.tid()
+    if spatial_flag[tid] != 0:
+        particle_index[spatial_offset[tid]] = spatial_particle[tid]
+    if tid == total_particles - 1:
+        particle_count[0] = spatial_offset[tid] + spatial_flag[tid]
+
+
+@wp.kernel
+def clear_deformable_fragment_bounds(
+    bounds_lower_accum: wp.array2d(dtype=float),
+    bounds_upper_accum: wp.array2d(dtype=float),
+    active_fragment: wp.array(dtype=wp.int32),
+    contact_candidate: wp.array(dtype=wp.int32),
+):
+    fragment = wp.tid()
+    for axis in range(3):
+        bounds_lower_accum[fragment, axis] = 1.0e6
+        bounds_upper_accum[fragment, axis] = -1.0e6
+    active_fragment[fragment] = 0
+    contact_candidate[fragment] = 0
+
+
+@wp.kernel
+def accumulate_deformable_fragment_bounds(
+    x: wp.array(dtype=wp.vec3),
+    radius: wp.array(dtype=float),
+    kind: wp.array(dtype=wp.int32),
+    fixed: wp.array(dtype=wp.int32),
+    fragment_id: wp.array(dtype=wp.int32),
+    rigid_state: wp.array(dtype=wp.int32),
+    bounds_lower_accum: wp.array2d(dtype=float),
+    bounds_upper_accum: wp.array2d(dtype=float),
+    active_fragment: wp.array(dtype=wp.int32),
+):
+    particle = wp.tid()
+    fragment = fragment_id[particle]
+    if kind[particle] == 0 or fixed[particle] != 0 or fragment < 0:
+        return
+    position = x[particle]
+    particle_radius = radius[particle]
+    for axis in range(3):
+        wp.atomic_min(
+            bounds_lower_accum, fragment, axis,
+            position[axis] - particle_radius,
+        )
+        wp.atomic_max(
+            bounds_upper_accum, fragment, axis,
+            position[axis] + particle_radius,
+        )
+    active_fragment[fragment] = 1
+
+
+@wp.kernel
+def finalize_deformable_fragment_bounds(
+    bounds_lower_accum: wp.array2d(dtype=float),
+    bounds_upper_accum: wp.array2d(dtype=float),
+    active_fragment: wp.array(dtype=wp.int32),
+    bounds_lower: wp.array(dtype=wp.vec3),
+    bounds_upper: wp.array(dtype=wp.vec3),
+    margin: float,
+):
+    fragment = wp.tid()
+    if active_fragment[fragment] == 0:
+        far = 2.0e6 + float(fragment) * 2.0
+        bounds_lower[fragment] = wp.vec3(far, far, far)
+        bounds_upper[fragment] = wp.vec3(far + 0.01, far + 0.01, far + 0.01)
+        return
+    lower = wp.vec3(
+        bounds_lower_accum[fragment, 0],
+        bounds_lower_accum[fragment, 1],
+        bounds_lower_accum[fragment, 2],
+    ) - wp.vec3(margin)
+    upper = wp.vec3(
+        bounds_upper_accum[fragment, 0],
+        bounds_upper_accum[fragment, 1],
+        bounds_upper_accum[fragment, 2],
+    ) + wp.vec3(margin)
+    bounds_lower[fragment] = lower
+    bounds_upper[fragment] = upper
+
+
+@wp.kernel
+def mark_deformable_fragment_contact_candidates_bvh(
+    bvh_id: wp.uint64,
+    bounds_lower: wp.array(dtype=wp.vec3),
+    bounds_upper: wp.array(dtype=wp.vec3),
+    active_fragment: wp.array(dtype=wp.int32),
+    fragment_building: wp.array(dtype=wp.int32),
+    fragment_support: wp.array(dtype=float),
+    fragment_fracture_energy: wp.array(dtype=float),
+    contact_candidate: wp.array(dtype=wp.int32),
+    fracture_threshold: float,
+):
+    left = wp.tid()
+    if active_fragment[left] == 0:
+        return
+    # A released deformable fragment can fold onto itself.  Its non-bonded
+    # particle contacts are physically active even when its AABB does not
+    # overlap another fragment, so it must not be culled by a pair-only gate.
+    if (
+        fragment_support[left] < 0.5
+        or fragment_fracture_energy[left] >= fracture_threshold
+    ):
+        contact_candidate[left] = 1
+    query = wp.bvh_query_aabb(bvh_id, bounds_lower[left], bounds_upper[left])
+    right = int(0)
+    while wp.bvh_query_next(query, right):
+        if right <= left or active_fragment[right] == 0:
+            continue
+        released = (
+            fragment_support[left] < 0.5 or fragment_support[right] < 0.5
+            or fragment_fracture_energy[left] >= fracture_threshold
+            or fragment_fracture_energy[right] >= fracture_threshold
+        )
+        if fragment_building[left] != fragment_building[right] or released:
+            wp.atomic_max(contact_candidate, left, 1)
+            wp.atomic_max(contact_candidate, right, 1)
+
+
+@wp.kernel
+def mark_environment_fragment_contact_candidates_bvh(
+    bvh_id: wp.uint64,
+    x: wp.array(dtype=wp.vec3),
+    radius: wp.array(dtype=float),
+    kind: wp.array(dtype=wp.int32),
+    fixed: wp.array(dtype=wp.int32),
+    fragment_id: wp.array(dtype=wp.int32),
+    active_fragment: wp.array(dtype=wp.int32),
+    contact_candidate: wp.array(dtype=wp.int32),
+    margin: float,
+):
+    particle = wp.tid()
+    if kind[particle] == 0 or fixed[particle] != 0 or fragment_id[particle] >= 0:
+        return
+    extent = radius[particle] + margin
+    lower = x[particle] - wp.vec3(extent)
+    upper = x[particle] + wp.vec3(extent)
+    query = wp.bvh_query_aabb(bvh_id, lower, upper)
+    fragment = int(0)
+    while wp.bvh_query_next(query, fragment):
+        if active_fragment[fragment] != 0:
+            wp.atomic_max(contact_candidate, fragment, 1)
+
+
+@wp.kernel
 def accumulate_deformable_contacts_adjacency(
     grid: wp.uint64,
     x: wp.array(dtype=wp.vec3),
@@ -775,6 +1006,7 @@ def accumulate_deformable_contacts_adjacency(
     rigid_state: wp.array(dtype=wp.int32),
     fixed: wp.array(dtype=wp.int32),
     damage: wp.array(dtype=float),
+    fragment_contact_candidate: wp.array(dtype=wp.int32),
     acceleration: wp.array(dtype=wp.vec3),
     query_radius: float,
 ):
@@ -786,6 +1018,83 @@ def accumulate_deformable_contacts_adjacency(
     xi = x[i]
     ri = rest_x[i]
     fid = fragment_id[i]
+    if fid >= 0 and fragment_contact_candidate[fid] == 0:
+        return
+    body_rigid = fid >= 0 and rigid_state[fid] != 0
+    contact_force = wp.vec3(0.0)
+    query = wp.hash_grid_query(grid, xi, query_radius)
+    for j in query:
+        if j == i or kind[j] == 0:
+            continue
+        delta = x[j] - xi
+        dist_sq = wp.dot(delta, delta)
+        contact_distance = radius[i] + radius[j]
+        if dist_sq <= 1.0e-10 or dist_sq >= contact_distance * contact_distance:
+            continue
+        dist = wp.sqrt(dist_sq)
+        neighbour_fid = fragment_id[j]
+        neighbour_rigid = neighbour_fid >= 0 and rigid_state[neighbour_fid] != 0
+        same_fragment = fid >= 0 and fid == neighbour_fid
+        rest_delta = rest_x[j] - ri
+        rest_dist_sq = wp.dot(rest_delta, rest_delta)
+        bond_range = 3.2 * wp.max(radius[i], radius[j])
+        bonded = (
+            building_id[i] == building_id[j]
+            and rest_dist_sq < bond_range * bond_range
+        )
+        spring_active = (
+            (bonded and same_fragment)
+            or (
+                bonded and damage[i] < 1.0
+                and not body_rigid and not neighbour_rigid
+            )
+        )
+        if spring_active or (body_rigid and neighbour_rigid):
+            continue
+        normal = delta / dist
+        closing = wp.dot(v[j] - v[i], normal)
+        contact_force -= normal * deformable_contact_magnitude(
+            contact_distance - dist, closing, 3.0e6, 9000.0
+        )
+    ai = acceleration[i] + contact_force / wp.max(mass[i], 1.0)
+    a_len = wp.length(ai)
+    if a_len > 6000.0:
+        ai *= 6000.0 / a_len
+    acceleration[i] = ai
+
+
+@wp.kernel
+def accumulate_indexed_deformable_contacts_adjacency(
+    grid: wp.uint64,
+    x: wp.array(dtype=wp.vec3),
+    rest_x: wp.array(dtype=wp.vec3),
+    v: wp.array(dtype=wp.vec3),
+    radius: wp.array(dtype=float),
+    mass: wp.array(dtype=float),
+    kind: wp.array(dtype=wp.int32),
+    building_id: wp.array(dtype=wp.int32),
+    fragment_id: wp.array(dtype=wp.int32),
+    rigid_state: wp.array(dtype=wp.int32),
+    fixed: wp.array(dtype=wp.int32),
+    damage: wp.array(dtype=float),
+    fragment_contact_candidate: wp.array(dtype=wp.int32),
+    acceleration: wp.array(dtype=wp.vec3),
+    dynamic_particle_index: wp.array(dtype=wp.int32),
+    dynamic_particle_count: wp.array(dtype=wp.int32),
+    query_radius: float,
+):
+    """Resolve contacts only for solids that have ever become dynamic."""
+    slot = wp.tid()
+    if slot >= dynamic_particle_count[0]:
+        return
+    i = dynamic_particle_index[slot]
+    if kind[i] == 0 or fixed[i] != 0:
+        return
+    xi = x[i]
+    ri = rest_x[i]
+    fid = fragment_id[i]
+    if fid >= 0 and fragment_contact_candidate[fid] == 0:
+        return
     body_rigid = fid >= 0 and rigid_state[fid] != 0
     contact_force = wp.vec3(0.0)
     query = wp.hash_grid_query(grid, xi, query_radius)
@@ -1877,9 +2186,81 @@ def reactivate_rigid_after_impact(
     acceleration_threshold: float,
 ):
     body = wp.tid()
-    if rigid_state[body] != 0 and contact_acceleration_peak[body] >= acceleration_threshold:
+    # State 2 is a sleeping rigid proxy. It is woken by the dedicated sleep
+    # policy, not expanded straight back into the deformable particle graph.
+    if rigid_state[body] == 1 and contact_acceleration_peak[body] >= acceleration_threshold:
         rigid_state[body] = 0
         wp.atomic_add(reactivated_count, 0, 1)
+
+
+@wp.kernel
+def update_rigid_sleep_state(
+    rigid_state: wp.array(dtype=wp.int32),
+    quiet_substeps: wp.array(dtype=wp.int32),
+    sample_bottom: wp.array(dtype=float),
+    body_linear_velocity: wp.array(dtype=wp.vec3),
+    body_angular_velocity: wp.array(dtype=wp.vec3),
+    body_half_extent: wp.array(dtype=wp.vec3),
+    body_force: wp.array2d(dtype=float),
+    body_mass: wp.array(dtype=float),
+    contact_acceleration_peak: wp.array(dtype=float),
+    transition_counts: wp.array(dtype=wp.int32),
+    required_quiet_substeps: int,
+    ground_margin: float,
+    maximum_linear_speed: float,
+    maximum_tip_speed: float,
+    wake_contact_acceleration: float,
+    wake_external_acceleration: float,
+):
+    """Sleep grounded quiet proxies; wake without losing their rigid shape."""
+    body = wp.tid()
+    state = rigid_state[body]
+    mass = body_mass[body]
+    if state == 0 or mass <= 0.0:
+        quiet_substeps[body] = 0
+        return
+
+    linear = body_linear_velocity[body]
+    angular = body_angular_velocity[body]
+    tip_speed = wp.length(angular) * wp.max(wp.length(body_half_extent[body]), 0.25)
+    net_acceleration = wp.vec3(
+        body_force[body, 0] / mass,
+        body_force[body, 1] / mass,
+        body_force[body, 2] / mass,
+    )
+    # Remove nominal gravity when testing for new external loading. A settled
+    # penalty contact may leave a small residual, hence a configurable margin.
+    external_acceleration = net_acceleration - wp.vec3(0.0, -9.81, 0.0)
+    must_wake = (
+        contact_acceleration_peak[body] >= wake_contact_acceleration
+        or wp.length(external_acceleration) >= wake_external_acceleration
+    )
+    if state == 2:
+        if must_wake:
+            rigid_state[body] = 1
+            quiet_substeps[body] = 0
+            wp.atomic_add(transition_counts, 1, 1)
+        else:
+            body_linear_velocity[body] = wp.vec3(0.0)
+            body_angular_velocity[body] = wp.vec3(0.0)
+        return
+
+    grounded = sample_bottom[body] <= ground_margin
+    quiet = (
+        grounded
+        and wp.length(linear) <= maximum_linear_speed
+        and tip_speed <= maximum_tip_speed
+        and not must_wake
+    )
+    if quiet:
+        quiet_substeps[body] += 1
+        if quiet_substeps[body] >= required_quiet_substeps:
+            rigid_state[body] = 2
+            body_linear_velocity[body] = wp.vec3(0.0)
+            body_angular_velocity[body] = wp.vec3(0.0)
+            wp.atomic_add(transition_counts, 0, 1)
+    else:
+        quiet_substeps[body] = 0
 
 
 @wp.kernel
@@ -1905,7 +2286,7 @@ def integrate_rigid_bodies(
     maximum_tip_speed: float,
 ):
     body = wp.tid()
-    if rigid_state[body] == 0 or body_mass[body] <= 0.0:
+    if rigid_state[body] != 1 or body_mass[body] <= 0.0:
         return
     force = wp.vec3(body_force[body, 0], body_force[body, 1], body_force[body, 2])
     torque = wp.vec3(body_torque[body, 0], body_torque[body, 1], body_torque[body, 2])
@@ -2089,13 +2470,206 @@ def select_active_time_level(
 
 
 @wp.kernel
+def update_hydraulic_boundary_mask(
+    kind: wp.array(dtype=wp.int32),
+    base_boundary: wp.array(dtype=wp.int32),
+    damage: wp.array(dtype=float),
+    fragment_id: wp.array(dtype=wp.int32),
+    rigid_state: wp.array(dtype=wp.int32),
+    boundary: wp.array(dtype=wp.int32),
+    exposure_damage: float,
+):
+    i = wp.tid()
+    if kind[i] == 0:
+        boundary[i] = 0
+        return
+    fid = fragment_id[i]
+    exposed = base_boundary[i] != 0 or damage[i] >= exposure_damage
+    if fid >= 0 and rigid_state[fid] != 0:
+        exposed = True
+    boundary[i] = int(exposed)
+
+
+@wp.kernel
+def recalibrate_density_reference_hydraulic(
+    grid: wp.uint64,
+    x: wp.array(dtype=wp.vec3),
+    radius: wp.array(dtype=float),
+    sph_support: wp.array(dtype=float),
+    sph_support_squared: wp.array(dtype=float),
+    sph_poly6_coefficient: wp.array(dtype=float),
+    mass: wp.array(dtype=float),
+    volume: wp.array(dtype=float),
+    kind: wp.array(dtype=wp.int32),
+    hydraulic_boundary: wp.array(dtype=wp.int32),
+    water_phase: wp.array(dtype=wp.int32),
+    rho: wp.array(dtype=float),
+    rho_reference: wp.array(dtype=float),
+    rest_density: float,
+    max_support: float,
+):
+    """Preserve current pressure while changing the solid boundary quadrature."""
+    tid = wp.tid()
+    i = wp.hash_grid_point_id(grid, tid)
+    if kind[i] != 0 or water_phase[i] == 2:
+        return
+    xi = x[i]
+    density_sum = float(0.0)
+    query = wp.hash_grid_query(grid, xi, max_support)
+    for j in query:
+        if kind[j] != 0 and hydraulic_boundary[j] == 0:
+            continue
+        if kind[j] == 0 and water_phase[j] == 2:
+            continue
+        delta = xi - x[j]
+        support = 4.0 * wp.max(radius[i], radius[j])
+        distance_squared = wp.dot(delta, delta)
+        if distance_squared >= max_support * max_support:
+            continue
+        effective_mass = mass[j]
+        if kind[j] != 0:
+            effective_mass = rest_density * volume[j]
+        density_sum += effective_mass * poly6(distance_squared, support)
+    density_sum = wp.max(density_sum, rest_density * 0.15)
+    rho_reference[i] = (
+        density_sum * rest_density / wp.max(rho[i], rest_density * 0.15)
+    )
+
+
+@wp.kernel
+def mark_spatial_fluid_particles(
+    grid: wp.uint64,
+    kind: wp.array(dtype=wp.int32),
+    spatial_particle: wp.array(dtype=wp.int32),
+    fluid_flag: wp.array(dtype=wp.int32),
+):
+    slot = wp.tid()
+    particle = wp.hash_grid_point_id(grid, slot)
+    spatial_particle[slot] = particle
+    fluid_flag[slot] = int(kind[particle] == 0)
+
+
+@wp.kernel
+def scatter_spatial_fluid_particles(
+    spatial_particle: wp.array(dtype=wp.int32),
+    fluid_flag: wp.array(dtype=wp.int32),
+    fluid_offset: wp.array(dtype=wp.int32),
+    fluid_particle: wp.array(dtype=wp.int32),
+):
+    slot = wp.tid()
+    if fluid_flag[slot] != 0:
+        fluid_particle[fluid_offset[slot]] = spatial_particle[slot]
+
+
+@wp.kernel
+def count_fluid_verlet_neighbors(
+    grid: wp.uint64,
+    x: wp.array(dtype=wp.vec3),
+    fluid_particle: wp.array(dtype=wp.int32),
+    kind: wp.array(dtype=wp.int32),
+    hydraulic_boundary: wp.array(dtype=wp.int32),
+    neighbour_count: wp.array(dtype=wp.int32),
+    core_radius: float,
+    verlet_radius: float,
+):
+    slot = wp.tid()
+    i = fluid_particle[slot]
+    xi = x[i]
+    core_squared = core_radius * core_radius
+    verlet_squared = verlet_radius * verlet_radius
+    count = int(0)
+    core_query = wp.hash_grid_query(grid, xi, core_radius)
+    for j in core_query:
+        if kind[j] != 0 and hydraulic_boundary[j] == 0:
+            continue
+        delta = x[j] - xi
+        if wp.dot(delta, delta) < core_squared:
+            count += 1
+    halo_query = wp.hash_grid_query(grid, xi, verlet_radius)
+    for j in halo_query:
+        if kind[j] != 0 and hydraulic_boundary[j] == 0:
+            continue
+        delta = x[j] - xi
+        distance_squared = wp.dot(delta, delta)
+        if distance_squared >= core_squared and distance_squared < verlet_squared:
+            count += 1
+    neighbour_count[slot] = count
+
+
+@wp.kernel
+def fill_fluid_verlet_neighbors(
+    grid: wp.uint64,
+    x: wp.array(dtype=wp.vec3),
+    fluid_particle: wp.array(dtype=wp.int32),
+    kind: wp.array(dtype=wp.int32),
+    hydraulic_boundary: wp.array(dtype=wp.int32),
+    neighbour_offset: wp.array(dtype=wp.int32),
+    neighbour_index: wp.array(dtype=wp.int32),
+    neighbour_capacity: int,
+    overflow: wp.array(dtype=wp.int32),
+    core_radius: float,
+    verlet_radius: float,
+):
+    slot = wp.tid()
+    i = fluid_particle[slot]
+    xi = x[i]
+    core_squared = core_radius * core_radius
+    verlet_squared = verlet_radius * verlet_radius
+    cursor = neighbour_offset[slot]
+    core_query = wp.hash_grid_query(grid, xi, core_radius)
+    for j in core_query:
+        if kind[j] != 0 and hydraulic_boundary[j] == 0:
+            continue
+        delta = x[j] - xi
+        if wp.dot(delta, delta) < core_squared:
+            if cursor < neighbour_capacity:
+                neighbour_index[cursor] = j
+            else:
+                overflow[0] = 1
+            cursor += 1
+    halo_query = wp.hash_grid_query(grid, xi, verlet_radius)
+    for j in halo_query:
+        if kind[j] != 0 and hydraulic_boundary[j] == 0:
+            continue
+        delta = x[j] - xi
+        distance_squared = wp.dot(delta, delta)
+        if distance_squared >= core_squared and distance_squared < verlet_squared:
+            if cursor < neighbour_capacity:
+                neighbour_index[cursor] = j
+            else:
+                overflow[0] = 1
+            cursor += 1
+
+
+@wp.kernel
+def finalize_verlet_rebuild(
+    neighbour_count: wp.array(dtype=wp.int32),
+    neighbour_offset: wp.array(dtype=wp.int32),
+    fluid_count: int,
+    capacity: int,
+    total_entries: wp.array(dtype=wp.int32),
+    overflow: wp.array(dtype=wp.int32),
+):
+    if wp.tid() == 0:
+        total = int(0)
+        if fluid_count > 0:
+            last = fluid_count - 1
+            total = neighbour_offset[last] + neighbour_count[last]
+        total_entries[0] = total
+        overflow[0] = int(total > capacity)
+
+
+@wp.kernel
 def compute_density_multirate(
     grid: wp.uint64,
     x: wp.array(dtype=wp.vec3),
     radius: wp.array(dtype=float),
+    sph_support_squared: wp.array(dtype=float),
+    sph_poly6_coefficient: wp.array(dtype=float),
     mass: wp.array(dtype=float),
     volume: wp.array(dtype=float),
     kind: wp.array(dtype=wp.int32),
+    hydraulic_boundary: wp.array(dtype=wp.int32),
     water_phase: wp.array(dtype=wp.int32),
     time_active: wp.array(dtype=wp.int32),
     rho: wp.array(dtype=float),
@@ -2119,10 +2693,14 @@ def compute_density_multirate(
     rhoi = float(0.0)
     query = wp.hash_grid_query(grid, xi, max_support)
     for j in query:
+        if kind[j] != 0 and hydraulic_boundary[j] == 0:
+            continue
         if kind[j] == 0 and water_phase[j] == 2:
             continue
         rij = xi - x[j]
         r2 = wp.dot(rij, rij)
+        if r2 >= max_support * max_support:
+            continue
         support = 4.0 * wp.max(radius[i], radius[j])
         effective_mass = mass[j]
         if kind[j] != 0:
@@ -2135,6 +2713,74 @@ def compute_density_multirate(
         stiffness = rest_density * sound_speed * sound_speed / gamma
         crest_dz = (xi[2] - reservoir_z_max + 5.0) / 7.5
         local_surface = hydrostatic_depth + initial_wave_height * wp.exp(-crest_dz * crest_dz)
+        water_column = wp.max(local_surface - xi[1], 0.0)
+        hydro_pressure = rest_density * 9.81 * water_column
+        target_ratio = wp.pow(1.0 + hydro_pressure / stiffness, 1.0 / gamma)
+        rho_reference[i] = rhoi / target_ratio
+        rho[i] = rest_density * target_ratio
+    else:
+        rho[i] = wp.max(rhoi * rest_density / reference, rest_density * 0.15)
+
+
+@wp.kernel
+def compute_density_multirate_verlet(
+    x: wp.array(dtype=wp.vec3),
+    fluid_particle: wp.array(dtype=wp.int32),
+    radius: wp.array(dtype=float),
+    sph_support_squared: wp.array(dtype=float),
+    sph_poly6_coefficient: wp.array(dtype=float),
+    mass: wp.array(dtype=float),
+    volume: wp.array(dtype=float),
+    kind: wp.array(dtype=wp.int32),
+    water_phase: wp.array(dtype=wp.int32),
+    time_active: wp.array(dtype=wp.int32),
+    rho: wp.array(dtype=float),
+    rho_reference: wp.array(dtype=float),
+    neighbour_count: wp.array(dtype=wp.int32),
+    neighbour_offset: wp.array(dtype=wp.int32),
+    neighbour_index: wp.array(dtype=wp.int32),
+    neighbour_capacity: int,
+    rest_density: float,
+    sound_speed: float,
+    hydrostatic_depth: float,
+    initial_wave_height: float,
+    reservoir_z_max: float,
+    max_support: float,
+):
+    slot = wp.tid()
+    i = fluid_particle[slot]
+    if time_active[i] == 0:
+        return
+    if water_phase[i] == 2:
+        rho[i] = rest_density
+        rho_reference[i] = rest_density
+        return
+    xi = x[i]
+    rhoi = float(0.0)
+    start = neighbour_offset[slot]
+    end = wp.min(start + neighbour_count[slot], neighbour_capacity)
+    for edge in range(start, end):
+        j = neighbour_index[edge]
+        if kind[j] == 0 and water_phase[j] == 2:
+            continue
+        rij = xi - x[j]
+        r2 = wp.dot(rij, rij)
+        if r2 >= max_support * max_support:
+            continue
+        support = 4.0 * wp.max(radius[i], radius[j])
+        effective_mass = mass[j]
+        if kind[j] != 0:
+            effective_mass = rest_density * volume[j]
+        rhoi += effective_mass * poly6(r2, support)
+    rhoi = wp.max(rhoi, rest_density * 0.15)
+    reference = rho_reference[i]
+    if reference <= 0.0:
+        gamma = 7.0
+        stiffness = rest_density * sound_speed * sound_speed / gamma
+        crest_dz = (xi[2] - reservoir_z_max + 5.0) / 7.5
+        local_surface = hydrostatic_depth + initial_wave_height * wp.exp(
+            -crest_dz * crest_dz
+        )
         water_column = wp.max(local_surface - xi[1], 0.0)
         hydro_pressure = rest_density * 9.81 * water_column
         target_ratio = wp.pow(1.0 + hydro_pressure / stiffness, 1.0 / gamma)
@@ -2188,9 +2834,15 @@ def compute_fluid_forces_multirate(
     x: wp.array(dtype=wp.vec3),
     v: wp.array(dtype=wp.vec3),
     radius: wp.array(dtype=float),
+    sph_support: wp.array(dtype=float),
+    sph_support_squared: wp.array(dtype=float),
+    sph_poly6_coefficient: wp.array(dtype=float),
+    sph_spiky_coefficient: wp.array(dtype=float),
+    sph_viscosity_coefficient: wp.array(dtype=float),
     mass: wp.array(dtype=float),
     volume: wp.array(dtype=float),
     kind: wp.array(dtype=wp.int32),
+    hydraulic_boundary: wp.array(dtype=wp.int32),
     water_phase: wp.array(dtype=wp.int32),
     rho: wp.array(dtype=float),
     pressure: wp.array(dtype=float),
@@ -2229,7 +2881,7 @@ def compute_fluid_forces_multirate(
         ballistic_acceleration = wp.vec3(0.0, -9.81, 0.0)
         ballistic_query = wp.hash_grid_query(grid, xi, max_support)
         for j in ballistic_query:
-            if kind[j] == 0:
+            if kind[j] == 0 or hydraulic_boundary[j] == 0:
                 continue
             delta = xi - x[j]
             distance = wp.length(delta)
@@ -2253,12 +2905,14 @@ def compute_fluid_forces_multirate(
     for j in query:
         if j == i:
             continue
+        if kind[j] != 0 and hydraulic_boundary[j] == 0:
+            continue
         if kind[j] == 0 and water_phase[j] == 2:
             continue
         r = xi - x[j]
         dist = wp.length(r)
         support = 4.0 * wp.max(radius[i], radius[j])
-        if dist >= support or dist <= 1.0e-5:
+        if dist >= max_support or dist >= support or dist <= 1.0e-5:
             continue
         pressure_term_j = pi / (rest_density * rest_density)
         inverse_rhoj = 1.0 / rest_density
@@ -2285,6 +2939,125 @@ def compute_fluid_forces_multirate(
             # The slow particle represents several base ticks, so its boundary
             # reaction must carry the same integrated impulse.
             wp.atomic_add(solid_force, j, -pair_acc * mass[i] * float(stride_i))
+    ai += xsph * (xsph_strength / wp.max(effective_dt, 1.0e-7))
+    a_len = wp.length(ai)
+    if a_len > 8000.0:
+        ai *= 8000.0 / a_len
+    acceleration[i] = ai
+
+
+@wp.kernel
+def compute_fluid_forces_multirate_verlet(
+    x: wp.array(dtype=wp.vec3),
+    fluid_particle: wp.array(dtype=wp.int32),
+    v: wp.array(dtype=wp.vec3),
+    radius: wp.array(dtype=float),
+    sph_support: wp.array(dtype=float),
+    sph_support_squared: wp.array(dtype=float),
+    sph_poly6_coefficient: wp.array(dtype=float),
+    sph_spiky_coefficient: wp.array(dtype=float),
+    sph_viscosity_coefficient: wp.array(dtype=float),
+    mass: wp.array(dtype=float),
+    volume: wp.array(dtype=float),
+    kind: wp.array(dtype=wp.int32),
+    water_phase: wp.array(dtype=wp.int32),
+    pressure: wp.array(dtype=float),
+    inverse_density: wp.array(dtype=float),
+    mass_over_density: wp.array(dtype=float),
+    pressure_over_density_squared: wp.array(dtype=float),
+    time_level: wp.array(dtype=wp.int32),
+    time_active: wp.array(dtype=wp.int32),
+    deferred_impulse: wp.array2d(dtype=float),
+    acceleration: wp.array(dtype=wp.vec3),
+    solid_force: wp.array(dtype=wp.vec3),
+    neighbour_count: wp.array(dtype=wp.int32),
+    neighbour_offset: wp.array(dtype=wp.int32),
+    neighbour_index: wp.array(dtype=wp.int32),
+    neighbour_capacity: int,
+    rest_density: float,
+    viscosity: float,
+    xsph_strength: float,
+    max_support: float,
+    base_dt: float,
+):
+    slot = wp.tid()
+    i = fluid_particle[slot]
+    if time_active[i] == 0:
+        return
+    level_i = time_level[i]
+    stride_i = 1
+    if level_i == 1:
+        stride_i = 2
+    elif level_i >= 2:
+        stride_i = 4
+    effective_dt = base_dt * float(stride_i)
+    xi = x[i]
+    vi = v[i]
+    start = neighbour_offset[slot]
+    end = wp.min(start + neighbour_count[slot], neighbour_capacity)
+    if water_phase[i] == 2:
+        ballistic_acceleration = wp.vec3(0.0, -9.81, 0.0)
+        for edge in range(start, end):
+            j = neighbour_index[edge]
+            if kind[j] == 0:
+                continue
+            delta = xi - x[j]
+            distance = wp.length(delta)
+            contact_distance = radius[i] + radius[j]
+            if distance <= 1.0e-5 or distance >= contact_distance:
+                continue
+            normal = delta / distance
+            penetration = contact_distance - distance
+            approach_speed = wp.min(wp.dot(vi - v[j], normal), 0.0)
+            contact_acceleration = normal * (
+                2400.0 * penetration - 55.0 * approach_speed
+            )
+            ballistic_acceleration += contact_acceleration
+            wp.atomic_add(
+                solid_force, j,
+                -contact_acceleration * mass[i] * float(stride_i),
+            )
+        acceleration[i] = ballistic_acceleration
+        return
+    pi = pressure[i]
+    inverse_rhoi = inverse_density[i]
+    pressure_term_i = pressure_over_density_squared[i]
+    ai = wp.vec3(0.0, -9.81, 0.0)
+    xsph = wp.vec3(0.0)
+    for edge in range(start, end):
+        j = neighbour_index[edge]
+        if j == i or (kind[j] == 0 and water_phase[j] == 2):
+            continue
+        r = xi - x[j]
+        dist = wp.length(r)
+        support = 4.0 * wp.max(radius[i], radius[j])
+        if dist >= max_support or dist >= support or dist <= 1.0e-5:
+            continue
+        pressure_term_j = pi / (rest_density * rest_density)
+        inverse_rhoj = 1.0 / rest_density
+        if kind[j] == 0:
+            pressure_term_j = pressure_over_density_squared[j]
+            inverse_rhoj = inverse_density[j]
+        grad = spiky_grad(r, dist, support)
+        neighbour_mass = mass[j]
+        if kind[j] != 0:
+            neighbour_mass = rest_density * volume[j]
+        pair_acc = -neighbour_mass * (
+            pressure_term_i + pressure_term_j
+        ) * grad
+        pair_acc += (
+            viscosity * neighbour_mass * (v[j] - vi)
+            * inverse_rhoj * viscosity_laplacian(dist, support) * inverse_rhoi
+        )
+        ai += pair_acc
+        if kind[j] == 0:
+            xsph += mass_over_density[j] * (v[j] - vi) * poly6(
+                wp.dot(r, r), support
+            )
+        else:
+            wp.atomic_add(
+                solid_force, j, -pair_acc * mass[i] * float(stride_i)
+            )
     ai += xsph * (xsph_strength / wp.max(effective_dt, 1.0e-7))
     a_len = wp.length(ai)
     if a_len > 8000.0:
@@ -2787,6 +3560,8 @@ def refine_impacted_solids(
     solid_force: wp.array(dtype=wp.vec3),
     impact_impulse: wp.array(dtype=float),
     local_impact_active: wp.array(dtype=wp.int32),
+    hydraulic_boundary_base: wp.array(dtype=wp.int32),
+    hydraulic_boundary: wp.array(dtype=wp.int32),
     fragment_id: wp.array(dtype=wp.int32),
     normal_axis: wp.array(dtype=wp.int32),
     rigid_state: wp.array(dtype=wp.int32),
@@ -2838,6 +3613,8 @@ def refine_impacted_solids(
     parent_fixed = fixed[i]; parent_base_fixed = base_fixed[i]
     parent_damage = damage[i]; parent_rho = rho_reference[i]
     parent_impact = impact_impulse[i]; parent_local_impact = local_impact_active[i]
+    parent_hydraulic_base = hydraulic_boundary_base[i]
+    parent_hydraulic = hydraulic_boundary[i]
     parent_fragment = fragment_id[i]; axis = normal_axis[i]
     child_offset = parent_radius * 0.5208333333
 
@@ -2870,5 +3647,7 @@ def refine_impacted_solids(
         solid_force[target] = wp.vec3(0.0)
         impact_impulse[target] = parent_impact
         local_impact_active[target] = parent_local_impact
+        hydraulic_boundary_base[target] = parent_hydraulic_base
+        hydraulic_boundary[target] = parent_hydraulic
         fragment_id[target] = parent_fragment
         normal_axis[target] = axis

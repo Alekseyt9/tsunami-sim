@@ -22,11 +22,27 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=HERE / "config_v3_rtx5070.json")
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--iterations", type=int, default=12)
+    parser.add_argument(
+        "--disable-deformable-bvh", action="store_true",
+        help="Profile the exact same checkpoint with the fragment BVH gate disabled.",
+    )
+    parser.add_argument(
+        "--enable-deformable-bvh", action="store_true",
+        help="Enable the experimental fragment BVH for an A/B profile.",
+    )
     args = parser.parse_args()
     if args.iterations <= 0:
         raise ValueError("--iterations must be positive")
     wp.init()
     cfg = json.loads(args.config.read_text(encoding="utf-8"))
+    if args.disable_deformable_bvh:
+        cfg.setdefault("v3", {}).setdefault(
+            "deformable_fragment_bvh", {}
+        )["enabled"] = False
+    if args.enable_deformable_bvh:
+        cfg.setdefault("v3", {}).setdefault(
+            "deformable_fragment_bvh", {}
+        )["enabled"] = True
     substeps = int(math.ceil((1.0 / float(cfg["output_fps"])) / float(cfg["dt"])))
     dt = (1.0 / float(cfg["output_fps"])) / substeps
     with tempfile.TemporaryDirectory(prefix="deluge_profile_") as temporary:
@@ -50,6 +66,22 @@ def main() -> None:
         print(
             f"Profile: particles={solver.count:,}; iterations={args.iterations}; "
             f"wall={wall_total / args.iterations:.3f} ms/substep"
+        )
+        if solver.deformable_fragment_bvh_enabled:
+            active = int((solver.deformable_fragment_active.numpy() != 0).sum())
+            candidates = int(
+                (solver.deformable_fragment_contact_candidate.numpy() != 0).sum()
+            )
+            print(
+                f"Deformable BVH: active={active:,}; "
+                f"contact candidates={candidates:,}; "
+                f"refits={solver.deformable_fragment_bvh_refit_count}"
+            )
+        print(
+            f"Fluid Verlet: fluid={solver.fluid_particle_count:,}; "
+            f"entries={int(solver.fluid_verlet_entries_device.numpy()[0]):,}; "
+            f"capacity={solver.fluid_verlet_capacity:,}; "
+            f"overflow={int(solver.fluid_verlet_overflow.numpy()[0])}"
         )
         for name in sorted(totals, key=totals.get, reverse=True):
             per_step = totals[name] / args.iterations

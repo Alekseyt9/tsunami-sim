@@ -41,6 +41,14 @@ from hybrid_kernels import (  # noqa: E402
     activate_buildings_from_debris_impact,
     apply_dormant_impact_damage,
     apply_building_activity,
+    append_dynamic_solid_particles,
+    mark_spatial_dynamic_solid_particles,
+    scatter_spatial_dynamic_solid_particles,
+    clear_deformable_fragment_bounds,
+    accumulate_deformable_fragment_bounds,
+    finalize_deformable_fragment_bounds,
+    mark_deformable_fragment_contact_candidates_bvh,
+    mark_environment_fragment_contact_candidates_bvh,
     clear_body_accumulators,
     clear_rigid_sample_bottom,
     classify_time_levels,
@@ -48,25 +56,37 @@ from hybrid_kernels import (  # noqa: E402
     compute_clustered_solid_forces_adjacency,
     compute_clustered_solid_forces,
     compute_density_multirate,
+    compute_density_multirate_verlet,
     compute_fluid_pressure_multirate,
     compute_fluid_forces_multirate,
+    compute_fluid_forces_multirate_verlet,
+    precompute_sph_kernel_coefficients,
     consume_deferred_fluid_impulse,
     count_structural_adjacency,
+    count_fluid_verlet_neighbors,
     accumulate_loaded_building_volume,
     integrate_rigid_bodies,
     integrate_multirate,
     fill_structural_adjacency,
+    fill_fluid_verlet_neighbors,
+    finalize_verlet_rebuild,
+    mark_spatial_fluid_particles,
+    scatter_spatial_fluid_particles,
     accumulate_compact_deformable_contacts,
     finalize_deformable_acceleration,
     mask_rigid_particles_as_fixed,
     refine_impacted_solids,
+    recalibrate_density_reference_hydraulic,
     accumulate_rigid_sample_bottom,
     project_rigid_samples_above_ground,
     reactivate_rigid_after_impact,
     scatter_rigid_particles,
     select_active_time_level,
+    update_hydraulic_boundary_mask,
     update_rigid_proxy_bounds,
+    update_rigid_sleep_state,
     accumulate_deformable_contacts_adjacency,
+    accumulate_indexed_deformable_contacts_adjacency,
 )
 from hybrid_model import (  # noqa: E402
     FragmentSupportGraph,
@@ -85,6 +105,10 @@ from rigid_clusters import (  # noqa: E402
     fit_rigid_cluster_to_reference,
     fit_rigid_collision_proxy,
 )
+from experimental_optimizations import (  # noqa: E402
+    ImplicitFluidPreparation,
+    NarrowBandVolumePreparation,
+)
 from shallow_water import (  # noqa: E402
     ShallowWaterFarField,
     compact_float_particles,
@@ -102,6 +126,7 @@ from surface_kernels import (  # noqa: E402
     smooth_sparse_field_axis,
     splat_sparse_surface_field,
 )
+from scene import STRUCT_SLAB, building_profile  # noqa: E402
 
 
 def robust_axis_bounds(positions: np.ndarray, lower_quantile, upper_quantile):
@@ -469,12 +494,23 @@ class HybridDelugeSolver(DelugeSolver):
         self._initialize_multirate()
         self._initialize_contact_grid()
         self._initialize_structural_adjacency()
+        self._initialize_deformable_fragment_bvh()
         self.shallow_water = ShallowWaterFarField(cfg, self.device, v3_resume)
         self.return_keep = wp.zeros(self.capacity, dtype=wp.int32, device=self.device)
         self.return_offsets = wp.zeros(self.capacity, dtype=wp.int32, device=self.device)
         self.particle_compaction_scratch = None
         self.last_adaptive_merge_frame = -1
         self._initialize_water_surface(v3_resume)
+        self._initialize_hydraulic_boundaries()
+        self._initialize_fluid_verlet()
+        self.implicit_fluid_preparation = ImplicitFluidPreparation(
+            self.v3_cfg.get("implicit_fluid", {}), self.capacity, self.device
+        )
+        self.narrow_band_volume_preparation = NarrowBandVolumePreparation(
+            self.v3_cfg.get("narrow_band_volume", {}), self.cfg,
+            self.capacity, self.device,
+        )
+        self.optimization_preparation_stats_calls = 0
 
         self._update_fragment_support_graph(
             self.arrays["x"][:self.count].numpy(),
@@ -492,6 +528,7 @@ class HybridDelugeSolver(DelugeSolver):
                     self.arrays["fixed"][:self.count]],
             device=self.device,
         )
+        self._append_dynamic_solid_particles()
         skin_path = output / "facade_skin.npz"
         panel_count = write_facade_skin(
             skin_path, cfg, rest_host, kind_host, building_host, fragment_host,
@@ -731,8 +768,203 @@ class HybridDelugeSolver(DelugeSolver):
         self.deformable_contact_candidate_count = wp.zeros(
             1, dtype=wp.int32, device=self.device
         )
+        dynamic_policy = self.v3_cfg.get("dynamic_solid_contact_list", {})
+        self.dynamic_solid_contact_list_enabled = bool(
+            dynamic_policy.get("enabled", True)
+        )
+        self.dynamic_solid_contact_list_mode = str(
+            dynamic_policy.get("mode", "spatial_compact")
+        )
+        self.dynamic_solid_membership = wp.zeros(
+            self.capacity, dtype=wp.int32, device=self.device
+        )
+        self.dynamic_solid_particle_index = wp.zeros(
+            self.capacity, dtype=wp.int32, device=self.device
+        )
+        self.dynamic_solid_particle_count = wp.zeros(
+            1, dtype=wp.int32, device=self.device
+        )
+        self.dynamic_solid_spatial_particle = wp.zeros(
+            self.capacity, dtype=wp.int32, device=self.device
+        )
+        self.dynamic_solid_spatial_flag = wp.zeros(
+            self.capacity, dtype=wp.int32, device=self.device
+        )
+        self.dynamic_solid_spatial_offset = wp.zeros(
+            self.capacity, dtype=wp.int32, device=self.device
+        )
         if self.structural_adjacency_enabled:
             self._rebuild_structural_adjacency()
+
+    def _initialize_deformable_fragment_bvh(self):
+        policy = self.v3_cfg.get("deformable_fragment_bvh", {})
+        self.deformable_fragment_bvh_enabled = bool(
+            policy.get("enabled", True)
+        ) and wp.get_device(self.device).is_cuda and not self.compact_contact_candidates_enabled
+        fragment_capacity = max(1, self.fragment_count)
+        self.deformable_fragment_bounds_lower_accum = wp.zeros(
+            (fragment_capacity, 3), dtype=float, device=self.device
+        )
+        self.deformable_fragment_bounds_upper_accum = wp.zeros(
+            (fragment_capacity, 3), dtype=float, device=self.device
+        )
+        self.deformable_fragment_bounds_lower = wp.zeros(
+            fragment_capacity, dtype=wp.vec3, device=self.device
+        )
+        self.deformable_fragment_bounds_upper = wp.zeros(
+            fragment_capacity, dtype=wp.vec3, device=self.device
+        )
+        self.deformable_fragment_active = wp.zeros(
+            fragment_capacity, dtype=wp.int32, device=self.device
+        )
+        self.deformable_fragment_contact_candidate = wp.ones(
+            fragment_capacity, dtype=wp.int32, device=self.device
+        )
+        self.fragment_building = wp.array(
+            self.fragment_building_host, dtype=wp.int32, device=self.device
+        )
+        self.deformable_fragment_bvh = None
+        self.deformable_fragment_bvh_tick = 0
+        self.deformable_fragment_bvh_refit_count = 0
+        self.deformable_fragment_bvh_refit_interval = max(
+            1, int(policy.get("refit_every_substeps", 8))
+        )
+        self.deformable_fragment_bvh_margin = float(
+            policy.get("base_margin", self.solid_contact_support)
+        ) + (
+            float(self.cfg.get("maximum_solid_speed", 40.0))
+            * float(self.cfg["dt"]) * self.deformable_fragment_bvh_refit_interval
+        )
+        if self.deformable_fragment_bvh_enabled:
+            self._refit_deformable_fragment_bvh(rebuild=True)
+
+    def _refit_deformable_fragment_bvh(self, rebuild: bool = False):
+        if not self.deformable_fragment_bvh_enabled or self.fragment_count <= 0:
+            return
+        wp.launch(
+            clear_deformable_fragment_bounds, dim=self.fragment_count,
+            inputs=[
+                self.deformable_fragment_bounds_lower_accum,
+                self.deformable_fragment_bounds_upper_accum,
+                self.deformable_fragment_active,
+                self.deformable_fragment_contact_candidate,
+            ], device=self.device,
+        )
+        wp.launch(
+            accumulate_deformable_fragment_bounds, dim=self.count,
+            inputs=[
+                self.arrays["x"][:self.count], self.arrays["radius"][:self.count],
+                self.arrays["kind"][:self.count], self.arrays["fixed"][:self.count],
+                self.fragment_id[:self.count], self.rigid_state,
+                self.deformable_fragment_bounds_lower_accum,
+                self.deformable_fragment_bounds_upper_accum,
+                self.deformable_fragment_active,
+            ], device=self.device,
+        )
+        wp.launch(
+            finalize_deformable_fragment_bounds, dim=self.fragment_count,
+            inputs=[
+                self.deformable_fragment_bounds_lower_accum,
+                self.deformable_fragment_bounds_upper_accum,
+                self.deformable_fragment_active,
+                self.deformable_fragment_bounds_lower,
+                self.deformable_fragment_bounds_upper,
+                self.deformable_fragment_bvh_margin,
+            ], device=self.device,
+        )
+        if self.deformable_fragment_bvh is None:
+            wp.synchronize_device(self.device)
+            self.deformable_fragment_bvh = wp.Bvh(
+                self.deformable_fragment_bounds_lower,
+                self.deformable_fragment_bounds_upper,
+                constructor="lbvh",
+            )
+        elif rebuild:
+            self.deformable_fragment_bvh.rebuild()
+        else:
+            self.deformable_fragment_bvh.refit()
+        wp.launch(
+            mark_deformable_fragment_contact_candidates_bvh,
+            dim=self.fragment_count,
+            inputs=[
+                self.deformable_fragment_bvh.id,
+                self.deformable_fragment_bounds_lower,
+                self.deformable_fragment_bounds_upper,
+                self.deformable_fragment_active, self.fragment_building,
+                self.fragment_support, self.fragment_fracture_energy,
+                self.deformable_fragment_contact_candidate,
+                float(self.v3_cfg.get("deformable_fragment_bvh", {}).get(
+                    "fracture_energy_threshold", 0.03
+                )),
+            ], device=self.device,
+        )
+        wp.launch(
+            mark_environment_fragment_contact_candidates_bvh, dim=self.count,
+            inputs=[
+                self.deformable_fragment_bvh.id,
+                self.arrays["x"][:self.count], self.arrays["radius"][:self.count],
+                self.arrays["kind"][:self.count], self.arrays["fixed"][:self.count],
+                self.fragment_id[:self.count], self.deformable_fragment_active,
+                self.deformable_fragment_contact_candidate,
+                self.deformable_fragment_bvh_margin,
+            ], device=self.device,
+        )
+        self.deformable_fragment_bvh_refit_count += 1
+
+    def _append_dynamic_solid_particles(self):
+        if (
+            not self.dynamic_solid_contact_list_enabled
+            or self.dynamic_solid_contact_list_mode != "persistent_append"
+            or self.count <= 0
+        ):
+            return
+        wp.launch(
+            append_dynamic_solid_particles, dim=self.count,
+            inputs=[
+                self.arrays["kind"][:self.count], self.arrays["fixed"][:self.count],
+                self.dynamic_solid_membership[:self.count],
+                self.dynamic_solid_particle_index,
+                self.dynamic_solid_particle_count,
+            ], device=self.device,
+        )
+
+    def _rebuild_dynamic_solid_particles(self):
+        if not self.dynamic_solid_contact_list_enabled:
+            return
+        self.dynamic_solid_membership.zero_()
+        self.dynamic_solid_particle_count.zero_()
+        self._append_dynamic_solid_particles()
+
+    def _build_spatial_dynamic_solid_particles(self):
+        if (
+            not self.dynamic_solid_contact_list_enabled
+            or self.dynamic_solid_contact_list_mode != "spatial_compact"
+            or self.count <= 0
+        ):
+            return
+        wp.launch(
+            mark_spatial_dynamic_solid_particles, dim=self.count,
+            inputs=[
+                self.contact_grid.id, self.arrays["kind"][:self.count],
+                self.arrays["fixed"][:self.count],
+                self.dynamic_solid_spatial_particle[:self.count],
+                self.dynamic_solid_spatial_flag[:self.count],
+            ], device=self.device,
+        )
+        wp.utils.array_scan(
+            self.dynamic_solid_spatial_flag[:self.count],
+            self.dynamic_solid_spatial_offset[:self.count], inclusive=False,
+        )
+        wp.launch(
+            scatter_spatial_dynamic_solid_particles, dim=self.count,
+            inputs=[
+                self.dynamic_solid_spatial_particle[:self.count],
+                self.dynamic_solid_spatial_flag[:self.count],
+                self.dynamic_solid_spatial_offset[:self.count],
+                self.dynamic_solid_particle_index,
+                self.dynamic_solid_particle_count, self.count,
+            ], device=self.device,
+        )
 
     def _rebuild_structural_adjacency(self):
         if not self.structural_adjacency_enabled or self.count <= 0:
@@ -814,6 +1046,22 @@ class HybridDelugeSolver(DelugeSolver):
         self.fluid_pressure_over_density_squared = wp.zeros(
             self.capacity, dtype=float, device=self.device
         )
+        self.sph_kernel_support = wp.zeros(
+            self.capacity, dtype=float, device=self.device
+        )
+        self.sph_kernel_support_squared = wp.zeros(
+            self.capacity, dtype=float, device=self.device
+        )
+        self.sph_poly6_coefficient = wp.zeros(
+            self.capacity, dtype=float, device=self.device
+        )
+        self.sph_spiky_coefficient = wp.zeros(
+            self.capacity, dtype=float, device=self.device
+        )
+        self.sph_viscosity_coefficient = wp.zeros(
+            self.capacity, dtype=float, device=self.device
+        )
+        self._update_sph_kernel_coefficients()
         self.precompute_fluid_pressure = True
         self.multirate_tick = 0
         if self.multirate_enabled:
@@ -831,7 +1079,7 @@ class HybridDelugeSolver(DelugeSolver):
                         self.arrays["rho_reference"][:self.count], float(self.cfg["rest_density"]),
                         float(self.cfg["sound_speed"]), float(self.cfg["water_depth"]),
                         float(self.cfg["wave_height"]), float(self.cfg["reservoir_z_max"]),
-                        self.max_support], device=self.device,
+                self.max_support], device=self.device,
             )
 
             wp.launch(
@@ -844,6 +1092,26 @@ class HybridDelugeSolver(DelugeSolver):
                         float(self.multirate_cfg.get("active_damage", 0.02))],
                 device=self.device,
             )
+
+    def _update_sph_kernel_coefficients(self, start: int = 0):
+        if not bool(self.v3_cfg.get("sph_kernel_coefficients", {}).get(
+            "enabled", False
+        )):
+            return
+        if self.count <= start:
+            return
+        wp.launch(
+            precompute_sph_kernel_coefficients, dim=self.count - start,
+            inputs=[
+                self.arrays["radius"][start:self.count],
+                self.sph_kernel_support[start:self.count],
+                self.sph_kernel_support_squared[start:self.count],
+                self.sph_poly6_coefficient[start:self.count],
+                self.sph_spiky_coefficient[start:self.count],
+                self.sph_viscosity_coefficient[start:self.count],
+            ], device=self.device,
+        )
+
     def _initialize_water_surface(self, checkpoint: Path | None = None):
         self.surface_cfg = self.v3_cfg.get("water_surface", {})
         self.surface_enabled = bool(self.surface_cfg.get("enabled", True))
@@ -926,6 +1194,116 @@ class HybridDelugeSolver(DelugeSolver):
                         float(self.cfg["sound_speed"]),
                         float(self.cfg.get("max_density_ratio", 1.08))],
                 device=self.device,
+            )
+
+    def _initialize_hydraulic_boundaries(self):
+        """Mark exterior city surfaces without exposing intact apartment interiors."""
+        policy = self.v3_cfg.get("hydraulic_boundary_layer", {})
+        self.hydraulic_boundary_enabled = bool(policy.get("enabled", True))
+        kind = self.arrays["kind"][:self.count].numpy()
+        building = self.arrays["building_id"][:self.count].numpy()
+        rest = self.arrays["rest_x"][:self.count].numpy()
+        role = self.arrays["structural_class"][:self.count].numpy()
+        base = np.zeros(self.capacity, dtype=np.int32)
+        # Cars, trees and small environment structures have no hidden interior
+        # particle lattice and therefore remain complete hydraulic boundaries.
+        base[:self.count][(kind != 0) & (building < 0)] = 1
+        spacing = float(self.cfg.get("solid_spacing", 0.65))
+        margin = spacing * float(policy.get("exterior_margin_scale", 0.82))
+        styles = self.cfg.get("building_styles", [])
+        for bid, spec in enumerate(self.cfg.get("buildings", [])):
+            indices = np.flatnonzero((kind != 0) & (building == bid))
+            if not len(indices):
+                continue
+            center_x, center_z, width, depth, height = map(float, spec)
+            y = rest[indices, 1].astype(np.float64, copy=False)
+            levels, inverse = np.unique(np.round(y, 4), return_inverse=True)
+            style = styles[bid] if bid < len(styles) else None
+            profiles = np.asarray(
+                [building_profile(style, width, depth, height, float(level))
+                 for level in levels], dtype=np.float64,
+            )
+            next_profiles = np.asarray(
+                [building_profile(style, width, depth, height,
+                                  min(height, float(level) + spacing * 1.1))
+                 for level in levels], dtype=np.float64,
+            )
+            ox = profiles[inverse, 0]
+            oz = profiles[inverse, 1]
+            local_width = profiles[inverse, 2]
+            local_depth = profiles[inverse, 3]
+            dx = rest[indices, 0] - (center_x + ox)
+            dz = rest[indices, 2] - (center_z + oz)
+            perimeter = (
+                np.abs(np.abs(dx) - local_width * 0.5) <= margin
+            ) | (
+                np.abs(np.abs(dz) - local_depth * 0.5) <= margin
+            )
+            next_ox = next_profiles[inverse, 0]
+            next_oz = next_profiles[inverse, 1]
+            next_width = next_profiles[inverse, 2]
+            next_depth = next_profiles[inverse, 3]
+            outside_next_profile = (
+                np.abs(rest[indices, 0] - (center_x + next_ox))
+                > next_width * 0.5 - margin
+            ) | (
+                np.abs(rest[indices, 2] - (center_z + next_oz))
+                > next_depth * 0.5 - margin
+            )
+            roof_or_terrace = (role[indices] == STRUCT_SLAB) & (
+                (y >= height - margin) | outside_next_profile
+            )
+            base[indices[perimeter | roof_or_terrace]] = 1
+        if not self.hydraulic_boundary_enabled:
+            base[:self.count][kind != 0] = 1
+        self.hydraulic_boundary_base = wp.array(
+            base, dtype=wp.int32, device=self.device
+        )
+        self.hydraulic_boundary = wp.zeros(
+            self.capacity, dtype=wp.int32, device=self.device
+        )
+        wp.launch(
+            update_hydraulic_boundary_mask, dim=self.count,
+            inputs=[
+                self.arrays["kind"][:self.count],
+                self.hydraulic_boundary_base[:self.count],
+                self.arrays["damage"][:self.count], self.fragment_id[:self.count],
+                self.rigid_state, self.hydraulic_boundary[:self.count],
+                float(policy.get("exposure_damage", 0.18)),
+            ], device=self.device,
+        )
+        # Preserve the checkpoint's current pressure while changing only the
+        # boundary quadrature used by subsequent density evaluations.
+        view = self.arrays["x"][:self.count]
+        self.grid.build(view, self.max_support)
+        wp.launch(
+            recalibrate_density_reference_hydraulic, dim=self.count,
+            inputs=[
+                self.grid.id, view, self.arrays["radius"][:self.count],
+                self.sph_kernel_support[:self.count],
+                self.sph_kernel_support_squared[:self.count],
+                self.sph_poly6_coefficient[:self.count],
+                self.arrays["mass"][:self.count], self.arrays["volume"][:self.count],
+                self.arrays["kind"][:self.count], self.hydraulic_boundary[:self.count],
+                self.arrays["water_phase"][:self.count], self.arrays["rho"][:self.count],
+                self.arrays["rho_reference"][:self.count],
+                float(self.cfg["rest_density"]), self.max_support,
+            ], device=self.device,
+        )
+        if self.multirate_enabled:
+            wp.launch(
+                compute_fluid_pressure_multirate, dim=self.count,
+                inputs=[
+                    self.arrays["kind"][:self.count],
+                    self.arrays["water_phase"][:self.count],
+                    self.time_active[:self.count], self.arrays["rho"][:self.count],
+                    self.arrays["mass"][:self.count], self.fluid_pressure[:self.count],
+                    self.fluid_inverse_density[:self.count],
+                    self.fluid_mass_over_density[:self.count],
+                    self.fluid_pressure_over_density_squared[:self.count],
+                    float(self.cfg["rest_density"]), float(self.cfg["sound_speed"]),
+                    float(self.cfg.get("max_density_ratio", 1.08)),
+                ], device=self.device,
             )
 
     def update_water_surface(self):
@@ -1118,6 +1496,7 @@ class HybridDelugeSolver(DelugeSolver):
                 inputs=[field, self.water_sparse_field, min(0.45, temporal_weight)],
                 device=self.device,
             )
+
         wp.synchronize_device(self.device)
         self.water_mesh_field_ms = (time.perf_counter() - field_started) * 1000.0
         marching_started = time.perf_counter()
@@ -1156,6 +1535,169 @@ class HybridDelugeSolver(DelugeSolver):
         self.arrays["water_mesh_vertices"] = vertices
         self.arrays["water_mesh_indices"] = indices
         self.water_mesh_total_ms = (time.perf_counter() - build_started) * 1000.0
+
+    def _initialize_fluid_verlet(self):
+        policy = self.v3_cfg.get("fluid_verlet", {})
+        self.fluid_verlet_enabled = bool(policy.get("enabled", True))
+        self.fluid_verlet_skin = max(0.05, float(policy.get("skin", 0.30)))
+        self.fluid_verlet_radius = self.max_support + self.fluid_verlet_skin
+        configured_interval = max(1, int(policy.get("rebuild_every_substeps", 12)))
+        maximum_relative_speed = (
+            float(self.cfg.get("maximum_fluid_speed", 30.0))
+            + float(self.cfg.get("maximum_solid_speed", 40.0))
+        )
+        safe_interval = max(
+            1, int(
+                0.80 * self.fluid_verlet_skin
+                / max(maximum_relative_speed * float(self.cfg["dt"]), 1.0e-8)
+            ),
+        )
+        self.fluid_verlet_rebuild_interval = min(configured_interval, safe_interval)
+        self.fluid_verlet_maximum_entries = int(
+            policy.get("maximum_entries", 80000000)
+        )
+        self.fluid_verlet_count = wp.zeros(
+            self.capacity, dtype=wp.int32, device=self.device
+        )
+        self.fluid_verlet_offset = wp.zeros(
+            self.capacity, dtype=wp.int32, device=self.device
+        )
+        self.fluid_verlet_index = wp.zeros(1, dtype=wp.int32, device=self.device)
+        self.fluid_spatial_particle = wp.zeros(
+            self.capacity, dtype=wp.int32, device=self.device
+        )
+        self.fluid_spatial_flag = wp.zeros(
+            self.capacity, dtype=wp.int32, device=self.device
+        )
+        self.fluid_spatial_offset = wp.zeros(
+            self.capacity, dtype=wp.int32, device=self.device
+        )
+        self.fluid_particle = wp.zeros(
+            self.capacity, dtype=wp.int32, device=self.device
+        )
+        self.fluid_verlet_entries_device = wp.zeros(
+            1, dtype=wp.int32, device=self.device
+        )
+        self.fluid_verlet_overflow = wp.zeros(
+            1, dtype=wp.int32, device=self.device
+        )
+        self.fluid_particle_count = -1
+        self.fluid_verlet_entries = 0
+        self.fluid_verlet_capacity = 1
+        self.fluid_verlet_age = self.fluid_verlet_rebuild_interval
+        self.fluid_verlet_particle_count = -1
+        self.fluid_verlet_rebuild_count = 0
+        self.fluid_verlet_last_rebuild_ms = 0.0
+
+    def _rebuild_fluid_verlet(self, view):
+        if not self.fluid_verlet_enabled or self.count <= 0:
+            return
+        started = time.perf_counter()
+        topology_changed = self.count != self.fluid_verlet_particle_count
+        wp.launch(
+            mark_spatial_fluid_particles, dim=self.count,
+            inputs=[
+                self.grid.id, self.arrays["kind"][:self.count],
+                self.fluid_spatial_particle[:self.count],
+                self.fluid_spatial_flag[:self.count],
+            ], device=self.device,
+        )
+        wp.utils.array_scan(
+            self.fluid_spatial_flag[:self.count],
+            self.fluid_spatial_offset[:self.count], inclusive=False,
+        )
+        if topology_changed or self.fluid_particle_count < 0:
+            wp.synchronize_device(self.device)
+            last_particle = self.count - 1
+            self.fluid_particle_count = (
+                int(self.fluid_spatial_offset[last_particle:last_particle + 1].numpy()[0])
+                + int(self.fluid_spatial_flag[last_particle:last_particle + 1].numpy()[0])
+            )
+        wp.launch(
+            scatter_spatial_fluid_particles, dim=self.count,
+            inputs=[
+                self.fluid_spatial_particle[:self.count],
+                self.fluid_spatial_flag[:self.count],
+                self.fluid_spatial_offset[:self.count], self.fluid_particle,
+            ], device=self.device,
+        )
+        if self.fluid_particle_count <= 0:
+            self.fluid_verlet_entries = 0
+            self.fluid_verlet_age = 0
+            self.fluid_verlet_particle_count = self.count
+            return
+        wp.launch(
+            count_fluid_verlet_neighbors, dim=self.fluid_particle_count,
+            inputs=[
+                self.grid.id, view, self.fluid_particle,
+                self.arrays["kind"][:self.count],
+                self.hydraulic_boundary[:self.count],
+                self.fluid_verlet_count[:self.fluid_particle_count], self.max_support,
+                self.fluid_verlet_radius,
+            ], device=self.device,
+        )
+        wp.utils.array_scan(
+            self.fluid_verlet_count[:self.fluid_particle_count],
+            self.fluid_verlet_offset[:self.fluid_particle_count], inclusive=False,
+        )
+        needs_capacity = topology_changed or self.fluid_verlet_capacity <= 1
+        if needs_capacity:
+            wp.synchronize_device(self.device)
+            last = self.fluid_particle_count - 1
+            total = (
+                int(self.fluid_verlet_offset[last:last + 1].numpy()[0])
+                + int(self.fluid_verlet_count[last:last + 1].numpy()[0])
+            )
+            if total > self.fluid_verlet_maximum_entries:
+                print(
+                    f"WARNING: fluid Verlet needs {total:,} entries; limit is "
+                    f"{self.fluid_verlet_maximum_entries:,}. Falling back to HashGrid queries."
+                )
+                self.fluid_verlet_enabled = False
+                self.fluid_verlet_entries = 0
+                return
+            if total > self.fluid_verlet_capacity:
+                self.fluid_verlet_capacity = max(total, int(total * 1.35), 1)
+                self.fluid_verlet_index = wp.zeros(
+                    self.fluid_verlet_capacity, dtype=wp.int32, device=self.device
+                )
+            self.fluid_verlet_entries = total
+        wp.launch(
+            finalize_verlet_rebuild, dim=1,
+            inputs=[
+                self.fluid_verlet_count, self.fluid_verlet_offset,
+                self.fluid_particle_count, self.fluid_verlet_capacity,
+                self.fluid_verlet_entries_device, self.fluid_verlet_overflow,
+            ], device=self.device,
+        )
+        wp.launch(
+            fill_fluid_verlet_neighbors, dim=self.fluid_particle_count,
+            inputs=[
+                self.grid.id, view, self.fluid_particle,
+                self.arrays["kind"][:self.count],
+                self.hydraulic_boundary[:self.count],
+                self.fluid_verlet_offset, self.fluid_verlet_index,
+                self.fluid_verlet_capacity, self.fluid_verlet_overflow,
+                self.max_support, self.fluid_verlet_radius,
+            ], device=self.device,
+        )
+        self.fluid_verlet_age = 0
+        self.fluid_verlet_particle_count = self.count
+        self.fluid_verlet_rebuild_count += 1
+        self.fluid_verlet_last_rebuild_ms = (
+            time.perf_counter() - started
+        ) * 1000.0
+
+    def _maintain_fluid_verlet(self, view):
+        if not self.fluid_verlet_enabled:
+            return
+        if (
+            self.count != self.fluid_verlet_particle_count
+            or self.fluid_verlet_age >= self.fluid_verlet_rebuild_interval
+        ):
+            self._rebuild_fluid_verlet(view)
+        else:
+            self.fluid_verlet_age += 1
 
     def _append_shallow_surface_mesh(self, vertices, indices):
         shallow_vertices, shallow_indices = self.shallow_water.surface_mesh()
@@ -1284,6 +1826,10 @@ class HybridDelugeSolver(DelugeSolver):
             normal_axis=self.normal_axis[:self.count].numpy(),
             rigid_state=self.rigid_state.numpy(),
             rigid_quiet_scans=self.rigid_quiet_scans_host,
+            rigid_detached_scans=self.rigid_detached_scans_host,
+            early_rigidified_total=np.int64(self.early_rigidified_total),
+            rigid_sleep_quiet_substeps=self.rigid_sleep_quiet_substeps.numpy(),
+            rigid_sleep_transition_totals=self.rigid_sleep_transition_counts.numpy(),
             rigid_local_position=self.rigid_local_position[:self.count].numpy(),
             body_center=self.body_center.numpy(),
             body_orientation=self.body_orientation.numpy(),
@@ -1331,6 +1877,9 @@ class HybridDelugeSolver(DelugeSolver):
         body_capacity = max(1, self.fragment_count)
         state = np.zeros(body_capacity, dtype=np.int32)
         quiet = np.zeros(body_capacity, dtype=np.int32)
+        detached = np.zeros(body_capacity, dtype=np.int32)
+        sleep_quiet = np.zeros(body_capacity, dtype=np.int32)
+        sleep_transitions = np.zeros(2, dtype=np.int32)
         local = np.zeros((self.capacity, 3), dtype=np.float32)
         center = np.zeros((body_capacity, 3), dtype=np.float32)
         orientation = np.zeros((body_capacity, 4), dtype=np.float32)
@@ -1354,6 +1903,9 @@ class HybridDelugeSolver(DelugeSolver):
                     target[:length] = source[:length]
                 restore("rigid_state", state)
                 restore("rigid_quiet_scans", quiet)
+                restore("rigid_detached_scans", detached)
+                restore("rigid_sleep_quiet_substeps", sleep_quiet)
+                restore("rigid_sleep_transition_totals", sleep_transitions)
                 restore("rigid_local_position", local)
                 restore("body_center", center)
                 restore("body_orientation", orientation)
@@ -1366,6 +1918,13 @@ class HybridDelugeSolver(DelugeSolver):
                 restore("rigid_proxy_half_extent", proxy_half_extent)
                 restore("rigid_proxy_material", proxy_material)
                 restored_proxy_state = "rigid_proxy_enabled" in saved
+
+        sleep_policy = self.v3_cfg.get("rigid_clusters", {}).get("sleeping", {})
+        if not bool(sleep_policy.get("enabled", False)):
+            # A checkpoint made with sleeping enabled remains usable with the
+            # feature disabled: sleeping proxies resume as ordinary rigids.
+            state[state == 2] = 1
+            sleep_quiet.fill(0)
 
         proxy_policy = self.v3_cfg.get("rigid_clusters", {}).get("collision_proxy", {})
         if not bool(proxy_policy.get("enabled", True)):
@@ -1391,6 +1950,12 @@ class HybridDelugeSolver(DelugeSolver):
 
         self.rigid_state_host = state
         self.rigid_quiet_scans_host = quiet
+        self.rigid_detached_scans_host = detached
+        self.early_rigidified_total = 0
+        if checkpoint is not None and checkpoint.exists():
+            with np.load(checkpoint, allow_pickle=False) as saved:
+                if "early_rigidified_total" in saved:
+                    self.early_rigidified_total = int(saved["early_rigidified_total"])
         self.rigid_local_host = local
         self.rigid_state = wp.array(state, dtype=wp.int32, device=self.device)
         self.rigid_local_position = wp.array(local, dtype=wp.vec3, device=self.device)
@@ -1512,6 +2077,12 @@ class HybridDelugeSolver(DelugeSolver):
         self._refresh_collision_proxy_pairs()
         self.body_force = wp.zeros((body_capacity, 3), dtype=float, device=self.device)
         self.body_torque = wp.zeros((body_capacity, 3), dtype=float, device=self.device)
+        self.rigid_sleep_quiet_substeps = wp.array(
+            sleep_quiet, dtype=wp.int32, device=self.device
+        )
+        self.rigid_sleep_transition_counts = wp.array(
+            sleep_transitions, dtype=wp.int32, device=self.device
+        )
         self.rigid_stats_calls = 0
         self.last_rigid_count = int(np.count_nonzero(state))
         self.rigid_active_count = self.last_rigid_count
@@ -1564,7 +2135,11 @@ class HybridDelugeSolver(DelugeSolver):
         # deformable fragment on the GPU. Preserve that transition before the
         # host-side quiet-fragment scanner uploads new rigid conversions.
         previous_proxy_active_count = self.rigid_proxy_active_count
-        self.rigid_state_host[:] = self.rigid_state.numpy()
+        gpu_rigid_state = self.rigid_state.numpy()
+        newly_reactivated = (self.rigid_state_host != 0) & (gpu_rigid_state == 0)
+        self.rigid_state_host[:] = gpu_rigid_state
+        self.rigid_quiet_scans_host[newly_reactivated] = 0
+        self.rigid_detached_scans_host[newly_reactivated] = 0
         self.rigid_active_count = int(np.count_nonzero(self.rigid_state_host))
         self.rigid_proxy_active_count = int(np.count_nonzero(
             (self.rigid_proxy_enabled_host != 0) & (self.rigid_state_host != 0)
@@ -1573,7 +2148,13 @@ class HybridDelugeSolver(DelugeSolver):
             self._refresh_collision_proxy_pairs()
             self.rigid_proxy_bvh_needs_rebuild = True
         self.rigid_stats_calls += 1
-        if self.rigid_stats_calls % max(1, int(policy.get("scan_every_frames", 8))) != 0:
+        early_policy = policy.get("early_rigidification", {})
+        early_enabled = bool(early_policy.get("enabled", False))
+        scan_every_frames = (
+            int(early_policy.get("scan_every_frames", 2))
+            if early_enabled else int(policy.get("scan_every_frames", 8))
+        )
+        if self.rigid_stats_calls % max(1, scan_every_frames) != 0:
             return
 
         fragment = self.fragment_id[:self.count].numpy()
@@ -1587,12 +2168,24 @@ class HybridDelugeSolver(DelugeSolver):
         radius = self.arrays["radius"][:self.count].numpy()
         material = self.arrays["material"][:self.count].numpy()
         fully_damaged_threshold = float(policy.get("fully_damaged_threshold", 0.95))
-        release_fraction = float(policy.get("release_damage_fraction", 0.12))
+        release_fraction = float(
+            early_policy.get("release_damage_fraction", 0.30)
+            if early_enabled else policy.get("release_damage_fraction", 0.12)
+        )
         minimum_particles = int(policy.get("minimum_particles", 6))
-        maximum_residual = float(policy.get("maximum_internal_velocity_rms", 2.5))
-        required_quiet = int(policy.get("required_quiet_scans", 2))
+        maximum_residual = float(
+            early_policy.get("maximum_internal_velocity_rms", 3.0)
+            if early_enabled else policy.get("maximum_internal_velocity_rms", 2.5)
+        )
+        required_quiet = int(
+            early_policy.get("required_quiet_scans", 1)
+            if early_enabled else policy.get("required_quiet_scans", 2)
+        )
+        minimum_detached_scans = max(
+            1, int(early_policy.get("minimum_detached_scans", 2))
+        ) if early_enabled else 1
         proxy_policy = policy.get("collision_proxy", {})
-        converted: list[tuple[int, np.ndarray, object, bool]] = []
+        converted: list[tuple[int, np.ndarray, object, bool, bool]] = []
         plastic_position_rms = float(policy.get("plastic_rigidize_position_rms", 0.75))
         plastic_release_fraction = float(policy.get("plastic_rigidize_release_fraction", 0.35))
 
@@ -1604,6 +2197,11 @@ class HybridDelugeSolver(DelugeSolver):
             # Damage alone is not detachment: converting a still-supported
             # upper section made intact towers float as giant rigid pieces.
             if self.fragment_support_host[fid] > 0.5:
+                self.rigid_quiet_scans_host[fid] = 0
+                self.rigid_detached_scans_host[fid] = 0
+                continue
+            self.rigid_detached_scans_host[fid] += 1
+            if self.rigid_detached_scans_host[fid] < minimum_detached_scans:
                 self.rigid_quiet_scans_host[fid] = 0
                 continue
             indices = np.flatnonzero((fragment == fid) & (kind != 0))
@@ -1636,7 +2234,9 @@ class HybridDelugeSolver(DelugeSolver):
             else:
                 self.rigid_quiet_scans_host[fid] += 1
             if self.rigid_quiet_scans_host[fid] >= required_quiet:
-                converted.append((fid, indices, fit, plastic_rigidize))
+                converted.append((
+                    fid, indices, fit, plastic_rigidize, early_enabled
+                ))
 
         if not converted:
             return
@@ -1649,7 +2249,7 @@ class HybridDelugeSolver(DelugeSolver):
         body_mass = self.body_mass.numpy()
         inverse_inertia = self.body_inverse_inertia.numpy()
         plastic_count = 0
-        for fid, indices, fit, plastic_rigidize in converted:
+        for fid, indices, fit, plastic_rigidize, early_conversion in converted:
             self.rigid_state_host[fid] = 1
             self.rigid_local_host[indices] = fit.local_positions
             center[fid] = fit.center
@@ -1666,6 +2266,8 @@ class HybridDelugeSolver(DelugeSolver):
                 release_velocity[1] = min(
                     float(release_velocity[1]), max(minimum_upward, mass_limit)
                 )
+            if early_conversion:
+                self.early_rigidified_total += 1
             linear_velocity[fid] = release_velocity
             angular_velocity[fid] = fit.angular_velocity
             body_mass[fid] = fit.mass
@@ -1711,7 +2313,7 @@ class HybridDelugeSolver(DelugeSolver):
         self.rigid_active_count = int(np.count_nonzero(self.rigid_state_host))
         print(
             f"  V3 rigid conversion: +{len(converted)} clusters / "
-            f"{sum(len(indices) for _, indices, _, _ in converted):,} surface particles "
+            f"{sum(len(indices) for _, indices, _, _, _ in converted):,} surface particles "
             f"({plastic_count} plastic-collapse conversions)"
         )
 
@@ -1725,6 +2327,26 @@ class HybridDelugeSolver(DelugeSolver):
         view = a["x"][:self.count]
         self.grid.build(view, self.max_support)
         self.contact_grid.build(view, self.solid_contact_support)
+        self._build_spatial_dynamic_solid_particles()
+        if self.deformable_fragment_bvh_enabled:
+            if (
+                self.deformable_fragment_bvh_tick
+                % self.deformable_fragment_bvh_refit_interval == 0
+            ):
+                self._refit_deformable_fragment_bvh()
+            self.deformable_fragment_bvh_tick += 1
+        wp.launch(
+            update_hydraulic_boundary_mask, dim=self.count,
+            inputs=[
+                a["kind"][:self.count], self.hydraulic_boundary_base[:self.count],
+                a["damage"][:self.count], self.fragment_id[:self.count],
+                self.rigid_state, self.hydraulic_boundary[:self.count],
+                float(self.v3_cfg.get("hydraulic_boundary_layer", {}).get(
+                    "exposure_damage", 0.18
+                )),
+            ], device=self.device,
+        )
+        self._maintain_fluid_verlet(view)
         wp.launch(clear_vec3, dim=self.count, inputs=[a["solid_force"][:self.count]], device=self.device)
         shallow_policy = self.v3_cfg.get("shallow_water", {})
         merge_enabled = bool(shallow_policy.get("merge_sph", False))
@@ -1735,7 +2357,23 @@ class HybridDelugeSolver(DelugeSolver):
             and bool(shallow_policy.get("replace_far_sph", False))
             else float(self.cfg["reservoir_z_min"])
         )
-        if self.multirate_enabled:
+        implicit_executed = self.implicit_fluid_preparation.execute_density_projection(
+            a, self.fluid_particle, self.fluid_particle_count,
+            self.fluid_verlet_count, self.fluid_verlet_offset,
+            self.fluid_verlet_index, self.fluid_verlet_capacity,
+            a["solid_force"][:self.count], self.cfg, self.count,
+            self.max_support, dt, self.device,
+        )
+        if self.implicit_fluid_preparation.execution_enabled and not implicit_executed:
+            raise RuntimeError(
+                "implicit fluid execution requires an active non-empty fluid Verlet list"
+            )
+        if implicit_executed:
+            # The projection advances every connected fluid particle on the
+            # common implicit step. Existing multirate levels are deliberately
+            # bypassed until a separate asynchronous projection is validated.
+            pass
+        elif self.multirate_enabled:
             classify_every = max(4, int(self.multirate_cfg.get("classify_every_substeps", 256)))
             if self.multirate_tick % classify_every == 0 and self.multirate_tick % 4 == 0:
                 wp.launch(
@@ -1751,16 +2389,40 @@ class HybridDelugeSolver(DelugeSolver):
                 inputs=[self.time_level[:self.count], a["kind"][:self.count], self.multirate_tick,
                         self.time_active[:self.count]], device=self.device,
             )
-            wp.launch(
-                compute_density_multirate, dim=self.count,
-                inputs=[self.grid.id, view, a["radius"][:self.count], a["mass"][:self.count],
-                        a["volume"][:self.count], a["kind"][:self.count],
-                        a["water_phase"][:self.count], self.time_active[:self.count],
-                        a["rho"][:self.count], a["rho_reference"][:self.count],
+            if self.fluid_verlet_enabled and self.fluid_verlet_entries > 0:
+                wp.launch(
+                    compute_density_multirate_verlet, dim=self.fluid_particle_count,
+                    inputs=[
+                        view, self.fluid_particle, a["radius"][:self.count],
+                        self.sph_kernel_support_squared[:self.count],
+                        self.sph_poly6_coefficient[:self.count],
+                        a["mass"][:self.count], a["volume"][:self.count],
+                        a["kind"][:self.count], a["water_phase"][:self.count],
+                        self.time_active[:self.count], a["rho"][:self.count],
+                        a["rho_reference"][:self.count],
+                        self.fluid_verlet_count[:self.count],
+                        self.fluid_verlet_offset[:self.count], self.fluid_verlet_index,
+                        self.fluid_verlet_capacity,
                         float(self.cfg["rest_density"]), float(self.cfg["sound_speed"]),
                         float(self.cfg["water_depth"]), float(self.cfg["wave_height"]),
-                        float(self.cfg["reservoir_z_max"]), self.max_support], device=self.device,
-            )
+                        float(self.cfg["reservoir_z_max"]), self.max_support,
+                    ], device=self.device,
+                )
+            else:
+                wp.launch(
+                    compute_density_multirate, dim=self.count,
+                    inputs=[self.grid.id, view, a["radius"][:self.count],
+                            self.sph_kernel_support_squared[:self.count],
+                            self.sph_poly6_coefficient[:self.count],
+                            a["mass"][:self.count], a["volume"][:self.count],
+                            a["kind"][:self.count],
+                            self.hydraulic_boundary[:self.count],
+                            a["water_phase"][:self.count], self.time_active[:self.count],
+                            a["rho"][:self.count], a["rho_reference"][:self.count],
+                            float(self.cfg["rest_density"]), float(self.cfg["sound_speed"]),
+                            float(self.cfg["water_depth"]), float(self.cfg["wave_height"]),
+                            float(self.cfg["reservoir_z_max"]), self.max_support], device=self.device,
+                )
             if self.precompute_fluid_pressure:
                 wp.launch(
                     compute_fluid_pressure_multirate, dim=self.count,
@@ -1774,21 +2436,46 @@ class HybridDelugeSolver(DelugeSolver):
                             float(self.cfg["sound_speed"]),
                             float(self.cfg.get("max_density_ratio", 1.08))], device=self.device,
                 )
-            wp.launch(
-                compute_fluid_forces_multirate, dim=self.count,
-                inputs=[self.grid.id, view, a["v"][:self.count], a["radius"][:self.count],
-                        a["mass"][:self.count], a["volume"][:self.count], a["kind"][:self.count],
+            fluid_force_prefix = [
+                self.grid.id, view, a["v"][:self.count], a["radius"][:self.count],
+                self.sph_kernel_support[:self.count],
+                self.sph_kernel_support_squared[:self.count],
+                self.sph_poly6_coefficient[:self.count],
+                self.sph_spiky_coefficient[:self.count],
+                self.sph_viscosity_coefficient[:self.count],
+                a["mass"][:self.count], a["volume"][:self.count], a["kind"][:self.count],
+            ]
+            fluid_force_state = [
+                a["water_phase"][:self.count], self.fluid_pressure[:self.count],
+                self.fluid_inverse_density[:self.count],
+                self.fluid_mass_over_density[:self.count],
+                self.fluid_pressure_over_density_squared[:self.count],
+                self.time_level[:self.count], self.time_active[:self.count],
+                self.deferred_fluid_impulse, a["acceleration"][:self.count],
+                a["solid_force"][:self.count],
+            ]
+            if self.fluid_verlet_enabled and self.fluid_verlet_entries > 0:
+                wp.launch(
+                    compute_fluid_forces_multirate_verlet, dim=self.fluid_particle_count,
+                    inputs=fluid_force_prefix[1:2] + [self.fluid_particle] + fluid_force_prefix[2:] + fluid_force_state + [
+                        self.fluid_verlet_count[:self.count],
+                        self.fluid_verlet_offset[:self.count], self.fluid_verlet_index,
+                        self.fluid_verlet_capacity,
+                        float(self.cfg["rest_density"]), float(self.cfg["viscosity"]),
+                        float(self.cfg.get("xsph_strength", 0.0)), self.max_support, dt,
+                    ], device=self.device,
+                )
+            else:
+                wp.launch(
+                    compute_fluid_forces_multirate, dim=self.count,
+                    inputs=fluid_force_prefix + [
+                        self.hydraulic_boundary[:self.count],
                         a["water_phase"][:self.count], a["rho"][:self.count],
-                        self.fluid_pressure[:self.count],
-                        self.fluid_inverse_density[:self.count],
-                        self.fluid_mass_over_density[:self.count],
-                        self.fluid_pressure_over_density_squared[:self.count],
-                        self.time_level[:self.count], self.time_active[:self.count],
-                        self.deferred_fluid_impulse, a["acceleration"][:self.count],
-                        a["solid_force"][:self.count], float(self.cfg["rest_density"]),
-                        float(self.cfg["viscosity"]), float(self.cfg.get("xsph_strength", 0.0)),
-                        self.max_support, dt], device=self.device,
-            )
+                    ] + fluid_force_state[1:] + [
+                        float(self.cfg["rest_density"]), float(self.cfg["viscosity"]),
+                        float(self.cfg.get("xsph_strength", 0.0)), self.max_support, dt,
+                    ], device=self.device,
+                )
             wp.launch(
                 consume_deferred_fluid_impulse, dim=self.count,
                 inputs=[a["mass"][:self.count], a["kind"][:self.count], self.time_level[:self.count],
@@ -1937,19 +2624,32 @@ class HybridDelugeSolver(DelugeSolver):
                     ], device=self.device,
                 )
             else:
-                wp.launch(
-                    accumulate_deformable_contacts_adjacency, dim=self.count,
-                    inputs=[
-                        self.contact_grid.id, view, a["rest_x"][:self.count],
-                        a["v"][:self.count], a["radius"][:self.count],
-                        a["mass"][:self.count], a["kind"][:self.count],
-                        a["building_id"][:self.count],
-                        self.fragment_id[:self.count], self.rigid_state,
-                        a["fixed"][:self.count], a["damage"][:self.count],
-                        a["acceleration"][:self.count],
-                        self.solid_contact_support,
-                    ], device=self.device,
-                )
+                contact_inputs = [
+                    self.contact_grid.id, view, a["rest_x"][:self.count],
+                    a["v"][:self.count], a["radius"][:self.count],
+                    a["mass"][:self.count], a["kind"][:self.count],
+                    a["building_id"][:self.count],
+                    self.fragment_id[:self.count], self.rigid_state,
+                    a["fixed"][:self.count], a["damage"][:self.count],
+                    self.deformable_fragment_contact_candidate,
+                    a["acceleration"][:self.count],
+                ]
+                if self.dynamic_solid_contact_list_enabled:
+                    wp.launch(
+                        accumulate_indexed_deformable_contacts_adjacency,
+                        dim=self.count,
+                        inputs=contact_inputs + [
+                            self.dynamic_solid_particle_index,
+                            self.dynamic_solid_particle_count,
+                            self.solid_contact_support,
+                        ], device=self.device,
+                    )
+                else:
+                    wp.launch(
+                        accumulate_deformable_contacts_adjacency, dim=self.count,
+                        inputs=contact_inputs + [self.solid_contact_support],
+                        device=self.device,
+                    )
         else:
             wp.launch(
                 compute_clustered_solid_forces, dim=self.count,
@@ -2156,6 +2856,29 @@ class HybridDelugeSolver(DelugeSolver):
                         float(rigid_policy.get("ground_tangential_retention", 0.985))],
                 device=self.device,
             )
+            sleep_policy = rigid_policy.get("sleeping", {})
+            if bool(sleep_policy.get("enabled", False)):
+                wp.launch(
+                    update_rigid_sleep_state,
+                    dim=max(1, self.fragment_count),
+                    inputs=[
+                        self.rigid_state, self.rigid_sleep_quiet_substeps,
+                        self.rigid_sample_bottom, self.body_linear_velocity,
+                        self.body_angular_velocity, self.rigid_proxy_half_extent,
+                        self.body_force, self.body_mass,
+                        self.rigid_contact_acceleration_peak,
+                        self.rigid_sleep_transition_counts,
+                        max(1, int(math.ceil(
+                            float(sleep_policy.get("quiet_seconds", 0.5)) / dt
+                        ))),
+                        float(sleep_policy.get("ground_margin", 0.05)),
+                        float(sleep_policy.get("maximum_linear_speed", 0.12)),
+                        float(sleep_policy.get("maximum_tip_speed", 0.18)),
+                        float(sleep_policy.get("wake_contact_acceleration", 18.0)),
+                        float(sleep_policy.get("wake_external_acceleration", 18.0)),
+                    ],
+                    device=self.device,
+                )
             wp.launch(
                 scatter_rigid_particles, dim=self.count,
                 inputs=[view, a["v"][:self.count], a["kind"][:self.count], self.fragment_id[:self.count],
@@ -2168,7 +2891,7 @@ class HybridDelugeSolver(DelugeSolver):
                 inputs=[a["kind"][:self.count], self.fragment_id[:self.count], self.rigid_state,
                         a["fixed"][:self.count]], device=self.device,
             )
-        if self.multirate_enabled:
+        if self.multirate_enabled and not implicit_executed:
             wp.launch(
                 integrate_multirate, dim=self.count,
                 inputs=[view, a["v"][:self.count], a["acceleration"][:self.count], a["kind"][:self.count],
@@ -2242,6 +2965,7 @@ class HybridDelugeSolver(DelugeSolver):
                     self.arrays["fixed"][:self.count]],
             device=self.device,
         )
+        self._append_dynamic_solid_particles()
 
     def refine(self):
         # Water keeps V2's conservative 1->8 volume refinement. Structural
@@ -2254,6 +2978,9 @@ class HybridDelugeSolver(DelugeSolver):
                          "water_phase", "water_phase_candidate", "water_phase_candidate_age",
                          "water_connected_mask", "water_sheet_mask", "water_droplet_mask"):
                 self.arrays[name][water_count_before_refine:self.count].zero_()
+            self.hydraulic_boundary_base[water_count_before_refine:self.count].zero_()
+            self.hydraulic_boundary[water_count_before_refine:self.count].zero_()
+        self._update_sph_kernel_coefficients()
         # Water refinement appends particles with fragment_id=-1.  Keep the
         # host mirror aligned even on frames where no structural child is
         # created; support diagnostics and later compaction use full-length
@@ -2291,6 +3018,7 @@ class HybridDelugeSolver(DelugeSolver):
                     self.arrays["building_id"], self.arrays["fixed"], self.base_fixed, self.arrays["damage"],
                     self.arrays["rho_reference"], self.arrays["solid_force"],
                     self.arrays["material_impact_impulse"], self.arrays["local_impact_active"],
+                    self.hydraulic_boundary_base, self.hydraulic_boundary,
                     self.fragment_id, self.normal_axis,
                     self.rigid_state, self.preimpact_building, self.refinement_counters,
                     count_device, old_count, self.capacity,
@@ -2305,6 +3033,7 @@ class HybridDelugeSolver(DelugeSolver):
         self.count = min(int(count_device.numpy()[0]), self.capacity)
         added = self.count - old_count
         if added > 0:
+            self._update_sph_kernel_coefficients()
             self.solid_count += added
             self.structural_adjacency_dirty = self.structural_adjacency_enabled
             self.fragment_host = self.fragment_id[:self.count].numpy()
@@ -2313,6 +3042,7 @@ class HybridDelugeSolver(DelugeSolver):
                 valid_fragments, minlength=self.fragment_count
             ).astype(np.int32)
             self._rebaseline_fragment_support_after_refinement()
+            self._append_dynamic_solid_particles()
             refined_by_role = self.refinement_counters.numpy()
             print(
                 f"  V3 structural refinement: {old_count:,} -> {self.count:,} particles "
@@ -2335,7 +3065,54 @@ class HybridDelugeSolver(DelugeSolver):
         result["deformable_contact_candidates"] = int(
             self.deformable_contact_candidate_count.numpy()[0]
         ) if self.compact_contact_candidates_enabled else self.count
+        if self.deformable_fragment_bvh_enabled:
+            active_fragment_host = self.deformable_fragment_active.numpy()
+            fragment_candidate_host = self.deformable_fragment_contact_candidate.numpy()
+            result["deformable_fragment_bvh_active"] = int(
+                np.count_nonzero(active_fragment_host)
+            )
+            result["deformable_fragment_bvh_candidates"] = int(
+                np.count_nonzero(fragment_candidate_host)
+            )
+            result["deformable_fragment_bvh_refits"] = int(
+                self.deformable_fragment_bvh_refit_count
+            )
+        if self.fluid_verlet_enabled:
+            device_entries = int(self.fluid_verlet_entries_device.numpy()[0])
+            overflow = int(self.fluid_verlet_overflow.numpy()[0])
+            self.fluid_verlet_entries = device_entries
+            if overflow:
+                # The current kernel clamps its reads to capacity, preventing
+                # OOB access. Force a synchronous, larger rebuild before the
+                # next frame instead of silently keeping a truncated list.
+                self.fluid_verlet_particle_count = -1
+                print(
+                    "WARNING: fluid Verlet headroom exhausted; scheduling "
+                    "a capacity-growing rebuild."
+                )
+        result["fluid_verlet_enabled"] = int(self.fluid_verlet_enabled)
+        result["fluid_verlet_entries"] = int(self.fluid_verlet_entries)
+        result["fluid_verlet_fluid_particles"] = int(
+            max(self.fluid_particle_count, 0)
+        )
+        result["fluid_verlet_rebuilds"] = int(self.fluid_verlet_rebuild_count)
+        result["fluid_verlet_rebuild_ms"] = float(
+            self.fluid_verlet_last_rebuild_ms
+        )
+        result["fluid_verlet_memory_mib"] = float(
+            self.fluid_verlet_capacity * 4.0 / (1024.0 * 1024.0)
+        )
+        result["dynamic_solid_contact_list_enabled"] = int(
+            self.dynamic_solid_contact_list_enabled
+        )
+        result["dynamic_solid_contact_particles"] = int(
+            self.dynamic_solid_particle_count.numpy()[0]
+        ) if self.dynamic_solid_contact_list_enabled else 0
         kind_host = self.arrays["kind"][:self.count].numpy()
+        hydraulic_host = self.hydraulic_boundary[:self.count].numpy()
+        result["hydraulic_boundary_particles"] = int(np.count_nonzero(
+            (kind_host != 0) & (hydraulic_host != 0)
+        ))
         building_host = self.arrays["building_id"][:self.count].numpy()
         fluid_mask = kind_host == 0
         volume_host = self.arrays["volume"][:self.count].numpy()
@@ -2357,6 +3134,13 @@ class HybridDelugeSolver(DelugeSolver):
         result["adaptive_merged_groups"] = self.adaptive_merged_groups_total
         result["adaptive_merged_particles"] = self.adaptive_merged_particles_total
         velocity_host = self.arrays["v"][:self.count].numpy()
+        if self.implicit_fluid_preparation.enabled:
+            acceleration_host = self.arrays["acceleration"][:self.count].numpy()
+            result.update(self.implicit_fluid_preparation.analyze(
+                radius_host, velocity_host, acceleration_host, kind_host,
+                float(self.cfg["dt"]), float(self.cfg["output_fps"]),
+            ))
+            result.update(self.implicit_fluid_preparation.execution_diagnostics())
         position_host = self.arrays["x"][:self.count].numpy()
         fixed_host = self.arrays["fixed"][:self.count].numpy()
         result["fluid_momentum_z_kg_m_s"] = float(
@@ -2498,13 +3282,21 @@ class HybridDelugeSolver(DelugeSolver):
             )
         rigid_count = int(np.count_nonzero(self.rigid_state_host))
         rigid_particles = int(np.count_nonzero(
-            (self.fragment_host >= 0) & self.rigid_state_host[np.maximum(self.fragment_host, 0)]
+            (self.fragment_host >= 0)
+            & (self.rigid_state_host[np.maximum(self.fragment_host, 0)] != 0)
         )) if self.fragment_count else 0
         if rigid_count != self.last_rigid_count:
             print(f"  V3 active rigid clusters: {self.last_rigid_count} -> {rigid_count}")
             self.last_rigid_count = rigid_count
         result["rigid_clusters"] = rigid_count
         result["rigid_particles"] = rigid_particles
+        result["early_rigidified_fragments"] = int(self.early_rigidified_total)
+        result["sleeping_rigid_clusters"] = int(np.count_nonzero(
+            self.rigid_state_host == 2
+        ))
+        sleep_transitions = self.rigid_sleep_transition_counts.numpy()
+        result["rigid_sleep_transitions"] = int(sleep_transitions[0])
+        result["rigid_wake_transitions"] = int(sleep_transitions[1])
         rigid_mask_host = self.rigid_state_host != 0
         result["rigid_supported_fragments"] = int(np.count_nonzero(
             rigid_mask_host & (self.fragment_support_host > 0.5)
@@ -2567,6 +3359,17 @@ class HybridDelugeSolver(DelugeSolver):
                     np.count_nonzero(fluid_mask & (levels == level))
                 )
         self.update_water_surface()
+        self.optimization_preparation_stats_calls += 1
+        if (
+            self.narrow_band_volume_preparation.enabled
+            and self.optimization_preparation_stats_calls
+            % self.narrow_band_volume_preparation.analyze_every_frames == 0
+        ):
+            self.narrow_band_volume_preparation.analyze(self.arrays, self.count)
+        if self.narrow_band_volume_preparation.enabled:
+            result.update(self.narrow_band_volume_preparation.diagnostics(
+                int(np.count_nonzero(fluid_mask))
+            ))
         if self.surface_enabled:
             surface_mask = self.arrays["water_surface_mask"][:self.count].numpy()
             result["surface_water_particles"] = int(np.count_nonzero(surface_mask))
@@ -2674,6 +3477,7 @@ class HybridDelugeSolver(DelugeSolver):
         self.count = min(int(counter.numpy()[0]), self.capacity)
         emitted = self.count - old_count
         if emitted > 0:
+            self._update_sph_kernel_coefficients(old_count)
             for name in ("water_surface_mask", "water_surface_normal", "water_foam_strength",
                          "water_phase", "water_phase_candidate", "water_phase_candidate_age",
                          "water_connected_mask", "water_sheet_mask", "water_droplet_mask"):
@@ -2682,6 +3486,8 @@ class HybridDelugeSolver(DelugeSolver):
             self.fluid_inverse_density[old_count:self.count].zero_()
             self.fluid_mass_over_density[old_count:self.count].zero_()
             self.fluid_pressure_over_density_squared[old_count:self.count].zero_()
+            self.hydraulic_boundary_base[old_count:self.count].zero_()
+            self.hydraulic_boundary[old_count:self.count].zero_()
             self.shallow_water.emitted_particles_total += emitted
             self.shallow_water.emitted_volume_total += emitted * spacing ** 3
             self.shallow_water.commit_exchange(float(self.cfg["rest_density"]))
@@ -2726,6 +3532,12 @@ class HybridDelugeSolver(DelugeSolver):
                 "fluid_pressure_over_density_squared": wp.zeros(
                     self.capacity, dtype=float, device=self.device
                 ),
+                "hydraulic_boundary_base": wp.zeros(
+                    self.capacity, dtype=wp.int32, device=self.device
+                ),
+                "hydraulic_boundary": wp.zeros(
+                    self.capacity, dtype=wp.int32, device=self.device
+                ),
             },
         }
 
@@ -2760,7 +3572,10 @@ class HybridDelugeSolver(DelugeSolver):
         for name in float_names + int_names + vec3_names:
             self.arrays[name], scratch["arrays"][name] = scratch["arrays"][name], self.arrays[name]
 
-        extra_int = ("base_fixed", "fragment_id", "normal_axis", "time_level", "time_active")
+        extra_int = (
+            "base_fixed", "fragment_id", "normal_axis", "time_level", "time_active",
+            "hydraulic_boundary_base", "hydraulic_boundary",
+        )
         for name in extra_int:
             source = getattr(self, name)
             target = scratch["extra"][name]
@@ -2829,6 +3644,8 @@ class HybridDelugeSolver(DelugeSolver):
             )
         if hasattr(self, "structural_adjacency_enabled"):
             self.structural_adjacency_dirty = self.structural_adjacency_enabled
+        if hasattr(self, "dynamic_solid_contact_list_enabled"):
+            self._rebuild_dynamic_solid_particles()
 
     def _merge_adaptive_fluid_groups(self):
         policy = self.v3_cfg.get("adaptive_water_merge", {})
@@ -2898,6 +3715,7 @@ class HybridDelugeSolver(DelugeSolver):
         wp.synchronize_device(self.device)
         removed_count = group_count * 7
         self.count = old_count - removed_count
+        self._update_sph_kernel_coefficients()
         self.fragment_host = self.fragment_id[:self.count].numpy()
         self.rigid_local_host.fill(0.0)
         self.rigid_local_host[:self.count] = self.rigid_local_position[:self.count].numpy()
@@ -2946,6 +3764,7 @@ class HybridDelugeSolver(DelugeSolver):
         self._compact_particle_arrays(old_count)
         wp.synchronize_device(self.device)
         self.count = new_count
+        self._update_sph_kernel_coefficients()
         self.fragment_host = self.fragment_id[:self.count].numpy()
         self.rigid_local_host.fill(0.0)
         self.rigid_local_host[:self.count] = self.rigid_local_position[:self.count].numpy()

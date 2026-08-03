@@ -205,3 +205,47 @@
 3. Разделить рендер связной воды, тонких листов, пены и баллистических капель; подавить одиночные сферы.
 4. Кэшировать adjacency неповреждённых фрагментов и пересобирать граф только у активного crack front.
 5. Выполнить полный восьмисекундный прогон V3.11 и проверить поздние контакты, объём разрушения и баланс воды.
+# Prepared high-impact optimization gates (2026-08-03)
+
+The following paths exist behind disabled flags and must satisfy these gates
+before they may replace production physics:
+
+1. **Implicit fluid / larger timestep** (`v3.implicit_fluid`): complete the
+   DFSPH density and divergence projections using the prepared buffers. Compare
+   2x and 3x `dt` against identical WCSPH checkpoints. Require finite state,
+   less than 0.5% local density drift, less than 0.2% water-volume drift, no
+   earlier structural activation, and at least 1.5x complete-substep speedup.
+2. **Early rigidification**
+   (`v3.rigid_clusters.early_rigidification`): require zero conversion of
+   foundation-supported fragments, preserved centre-of-mass linear/angular
+   momentum at transition, correct impact reactivation, no ground tunnelling,
+   and at least 20% late-stage contact-time reduction.
+   `v3.rigid_clusters.sleeping` must additionally keep quiet grounded proxies
+   in collision broad phases, wake on impacts/external load without first
+   expanding to deformable particles, and preserve its counters in checkpoints.
+3. **Narrow-band volume grid** (`v3.narrow_band_volume`): the diagnostic GPU
+   deposit must match selected-particle mass, volume, and all momentum axes to
+   float32 accumulation tolerance. Then implement grid advection/pressure and a
+   symmetric grid-to-SPH surface transfer. Require less than 0.2% combined
+   volume drift and visually unchanged surface/wake behaviour before removing
+   any interior SPH samples.
+
+## Gate status (2026-08-03)
+
+- **Implicit fluid:** unequal-mass density projection is executable behind the
+  disabled flag. Four iterations at 5x `dt` pass a 200-step finite-state stress
+  test and give 1.57--1.62x late-stage speedup. It is not ready to enable: an
+  equal-horizon test still observed a 30.9% worst local residual and meaningful
+  trajectory/damage differences. Next: add divergence projection, compact the
+  high-compression solve, and validate water volume plus solid reaction over at
+  least one full rendered second.
+- **Early rigidification:** transition, checkpoint, sleep and wake mechanics
+  are implemented, but converting 343 more clusters did not improve the late
+  substep. Do not enable it as a performance feature until rigid sample clouds
+  are removed from deformable contact work through an OBB/BVH narrowphase or a
+  contention-free segmented reduction.
+- **Narrow-band volume:** conservative deposit is validated and its neighbour
+  HashGrid sizing bug is fixed. A conservative 1.5 m band removes 21.6% early
+  but only 0.8% late water; the late stage has too little calm interior for the
+  original speed estimate. Next: implement grid advection/projection and
+  symmetric interface transfer, then target the calm approach phase first.

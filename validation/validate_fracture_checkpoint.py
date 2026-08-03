@@ -26,6 +26,7 @@ def fragment_maximum(solver: HybridDelugeSolver, edge_energy: np.ndarray) -> np.
 def main() -> None:
     with (ROOT / "config_v3_impact_validation.json").open("r", encoding="utf-8") as stream:
         cfg = json.load(stream)
+    cfg["v3"]["rigid_clusters"]["sleeping"] = {"enabled": True}
     with TemporaryDirectory(prefix="deluge_v3_fracture_checkpoint_") as temporary:
         output = Path(temporary) / "initial"
         solver = HybridDelugeSolver(cfg, output)
@@ -42,6 +43,14 @@ def main() -> None:
         solver.rigid_proxy_local_center_host[5] = (0.2, -0.1, 0.4)
         solver.rigid_proxy_half_extent_host[5] = (1.5, 0.7, 2.0)
         solver.rigid_proxy_material_host[5] = 3
+        solver.rigid_detached_scans_host[5:8] = np.asarray((2, 4, 7), dtype=np.int32)
+        solver.early_rigidified_total = 11
+        sleep_quiet_seed = solver.rigid_sleep_quiet_substeps.numpy()
+        sleep_quiet_seed[5:8] = np.asarray((13, 21, 34), dtype=np.int32)
+        solver.rigid_sleep_quiet_substeps.assign(sleep_quiet_seed)
+        solver.rigid_sleep_transition_counts.assign(
+            np.asarray((3, 2), dtype=np.int32)
+        )
         phase_seed = np.asarray((0, 1, 2, 2), dtype=np.int32)
         candidate_seed = np.asarray((0, 1, 2, 0), dtype=np.int32)
         age_seed = np.asarray((0, 0, 1, 1), dtype=np.int32)
@@ -71,6 +80,16 @@ def main() -> None:
             or resumed.rigid_proxy_material_host[5] != 3
         ):
             raise AssertionError("rigid collision proxy changed across checkpoint restore")
+        if (
+            resumed.rigid_detached_scans_host[5:8].tolist() != [2, 4, 7]
+            or resumed.early_rigidified_total != 11
+        ):
+            raise AssertionError("early-rigid detached history changed across checkpoint restore")
+        if (
+            resumed.rigid_sleep_quiet_substeps.numpy()[5:8].tolist() != [13, 21, 34]
+            or resumed.rigid_sleep_transition_counts.numpy().tolist() != [3, 2]
+        ):
+            raise AssertionError("rigid sleep state changed across checkpoint restore")
         for name, expected_seed in (
             ("water_phase", phase_seed),
             ("water_phase_candidate", candidate_seed),

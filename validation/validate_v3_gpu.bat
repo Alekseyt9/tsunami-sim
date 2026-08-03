@@ -33,5 +33,7 @@ if not exist "%PYTHON_EXE%" (
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_city_styles.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_crack_rendering.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_progressive_video.py" || exit /b 1
+"%PYTHON_EXE%" "%VALIDATION_DIR%validate_neighbor_optimizations.py" || exit /b 1
+"%PYTHON_EXE%" "%VALIDATION_DIR%validate_optimization_preparation.py" || exit /b 1
 echo All DELUGE V3 CUDA validations passed.
 endlocal

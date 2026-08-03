@@ -75,6 +75,28 @@
       "maximum_velocity_rms": 0.6,
       "maximum_span": 0.9
     },
+    "implicit_fluid": {
+      "enabled": false,
+      "mode": "diagnostic",
+      "target_dt_multiplier": 5.0,
+      "maximum_dt": 0.0006,
+      "advection_cfl": 0.40,
+      "acceleration_cfl": 0.25,
+      "minimum_pressure_iterations": 4,
+      "maximum_pressure_iterations": 4,
+      "pressure_relaxation": 0.25,
+      "warmstart_blend": 0.5,
+      "bootstrap_ratio_minimum": 0.80,
+      "bootstrap_ratio_maximum": 1.20
+    },
+    "narrow_band_volume": {
+      "enabled": false,
+      "mode": "diagnostic",
+      "cell_size": 4.0,
+      "detail_distance": 2.0,
+      "maximum_velocity_rms": 3.0,
+      "analyze_every_frames": 24
+    },
     "debris_skin": {
       "enabled": true,
       "cache": true,
@@ -164,6 +186,30 @@
       "contact_grid_radius_scale": 2.05,
       "maximum_entries": 80000000
     },
+    "dynamic_solid_contact_list": {
+      "enabled": false,
+      "mode": "spatial_compact"
+    },
+    "deformable_fragment_bvh": {
+      "enabled": false,
+      "refit_every_substeps": 8,
+      "base_margin": 0.05,
+      "fracture_energy_threshold": 0.03
+    },
+    "hydraulic_boundary_layer": {
+      "enabled": true,
+      "exterior_margin_scale": 0.82,
+      "exposure_damage": 0.18
+    },
+    "fluid_verlet": {
+      "enabled": true,
+      "skin": 0.30,
+      "rebuild_every_substeps": 12,
+      "maximum_entries": 80000000
+    },
+    "sph_kernel_coefficients": {
+      "enabled": false
+    },
     "fragment_clustering": {
       "schema_version": 2,
       "enabled": true,
@@ -196,6 +242,23 @@
       "maximum_internal_velocity_rms": 2.5,
       "plastic_rigidize_position_rms": 0.75,
       "plastic_rigidize_release_fraction": 0.35,
+      "early_rigidification": {
+        "enabled": false,
+        "scan_every_frames": 2,
+        "minimum_detached_scans": 2,
+        "required_quiet_scans": 1,
+        "release_damage_fraction": 0.30,
+        "maximum_internal_velocity_rms": 3.0
+      },
+      "sleeping": {
+        "enabled": false,
+        "quiet_seconds": 0.5,
+        "ground_margin": 0.05,
+        "maximum_linear_speed": 0.12,
+        "maximum_tip_speed": 0.18,
+        "wake_contact_acceleration": 18.0,
+        "wake_external_acceleration": 18.0
+      },
       "linear_damping": 0.12,
       "angular_damping": 0.20,
       "maximum_angular_speed": 3.0,

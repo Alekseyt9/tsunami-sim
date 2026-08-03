@@ -7,7 +7,10 @@ from _bootstrap import ROOT  # noqa: F401
 import numpy as np
 import warp as wp
 
-from hybrid_kernels import compute_fluid_forces_multirate  # noqa: E402
+from hybrid_kernels import (  # noqa: E402
+    compute_fluid_forces_multirate,
+    precompute_sph_kernel_coefficients,
+)
 from surface_kernels import classify_water_surface  # noqa: E402
 
 
@@ -81,15 +84,37 @@ def main() -> None:
     volume = wp.array(np.full(count, 0.125, dtype=np.float32), dtype=float, device=device)
     rho = wp.array(np.full(count, 1000.0, dtype=np.float32), dtype=float, device=device)
     pressure = wp.zeros(count, dtype=float, device=device)
+    inverse_density = wp.array(
+        np.full(count, 1.0 / 1000.0, dtype=np.float32), dtype=float, device=device
+    )
+    mass_over_density = wp.array(
+        mass_before / 1000.0, dtype=float, device=device
+    )
+    pressure_over_density_squared = wp.zeros(count, dtype=float, device=device)
     level = wp.zeros(count, dtype=wp.int32, device=device)
     active = wp.ones(count, dtype=wp.int32, device=device)
     deferred = wp.zeros((count, 3), dtype=float, device=device)
     acceleration = wp.zeros(count, dtype=wp.vec3, device=device)
     solid_force = wp.zeros(count, dtype=wp.vec3, device=device)
+    hydraulic_boundary = wp.zeros(count, dtype=wp.int32, device=device)
+    support = wp.zeros(count, dtype=float, device=device)
+    support_squared = wp.zeros(count, dtype=float, device=device)
+    poly6_coefficient = wp.zeros(count, dtype=float, device=device)
+    spiky_coefficient = wp.zeros(count, dtype=float, device=device)
+    viscosity_coefficient = wp.zeros(count, dtype=float, device=device)
+    wp.launch(
+        precompute_sph_kernel_coefficients, dim=count,
+        inputs=[radius, support, support_squared, poly6_coefficient,
+                spiky_coefficient, viscosity_coefficient], device=device,
+    )
     grid.build(x, 2.6)
     wp.launch(
         compute_fluid_forces_multirate, dim=count,
-        inputs=[grid.id, x, v, radius, mass, volume, kind, phase, rho, pressure,
+        inputs=[grid.id, x, v, radius, support, support_squared,
+                poly6_coefficient, spiky_coefficient, viscosity_coefficient,
+                mass, volume, kind, hydraulic_boundary,
+                phase, rho, pressure,
+                inverse_density, mass_over_density, pressure_over_density_squared,
                 level, active,
                 deferred, acceleration, solid_force, 1000.0, 0.1, 0.02,
                 2.6, 1.0e-4], device=device,

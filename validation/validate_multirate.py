@@ -9,6 +9,7 @@ import warp as wp
 
 from hybrid_kernels import (  # noqa: E402
     compute_fluid_forces_multirate,
+    precompute_sph_kernel_coefficients,
     consume_deferred_fluid_impulse,
     integrate_multirate,
     select_active_time_level,
@@ -20,6 +21,16 @@ def simulate(levels_host: np.ndarray, steps: int = 4):
     position = wp.array(np.asarray([[-0.32, 10.0, 0.0], [0.32, 10.0, 0.0]], dtype=np.float32), dtype=wp.vec3, device=device)
     velocity = wp.zeros(2, dtype=wp.vec3, device=device)
     radius = wp.array(np.full(2, 0.5, dtype=np.float32), dtype=float, device=device)
+    support = wp.zeros(2, dtype=float, device=device)
+    support_squared = wp.zeros(2, dtype=float, device=device)
+    poly6_coefficient = wp.zeros(2, dtype=float, device=device)
+    spiky_coefficient = wp.zeros(2, dtype=float, device=device)
+    viscosity_coefficient = wp.zeros(2, dtype=float, device=device)
+    wp.launch(
+        precompute_sph_kernel_coefficients, dim=2,
+        inputs=[radius, support, support_squared, poly6_coefficient,
+                spiky_coefficient, viscosity_coefficient], device=device,
+    )
     mass = wp.array(np.full(2, 1000.0, dtype=np.float32), dtype=float, device=device)
     volume = wp.array(np.ones(2, dtype=np.float32), dtype=float, device=device)
     kind = wp.array(np.zeros(2, dtype=np.int32), dtype=wp.int32, device=device)
@@ -30,12 +41,23 @@ def simulate(levels_host: np.ndarray, steps: int = 4):
     pressure = wp.array(
         np.full(2, pressure_value, dtype=np.float32), dtype=float, device=device
     )
+    inverse_density = wp.array(
+        np.full(2, 1.0 / 1012.0, dtype=np.float32), dtype=float, device=device
+    )
+    mass_over_density = wp.array(
+        np.full(2, 1000.0 / 1012.0, dtype=np.float32), dtype=float, device=device
+    )
+    pressure_over_density_squared = wp.array(
+        np.full(2, pressure_value / (1012.0 * 1012.0), dtype=np.float32),
+        dtype=float, device=device,
+    )
     levels = wp.array(levels_host.astype(np.int32), dtype=wp.int32, device=device)
     active = wp.ones(2, dtype=wp.int32, device=device)
     deferred = wp.zeros((2, 3), dtype=float, device=device)
     acceleration = wp.zeros(2, dtype=wp.vec3, device=device)
     solid_force = wp.zeros(2, dtype=wp.vec3, device=device)
     fixed = wp.zeros(2, dtype=wp.int32, device=device)
+    hydraulic_boundary = wp.zeros(2, dtype=wp.int32, device=device)
     grid = wp.HashGrid(16, 16, 16, device=device)
     dt = 1.0e-4
     for tick in range(steps):
@@ -45,7 +67,11 @@ def simulate(levels_host: np.ndarray, steps: int = 4):
             compute_fluid_forces_multirate,
             dim=2,
             inputs=[
-                grid.id, position, velocity, radius, mass, volume, kind, phase, rho, pressure,
+                grid.id, position, velocity, radius, support, support_squared,
+                poly6_coefficient, spiky_coefficient, viscosity_coefficient,
+                mass, volume, kind,
+                hydraulic_boundary, phase, rho, pressure,
+                inverse_density, mass_over_density, pressure_over_density_squared,
                 levels, active,
                 deferred, acceleration, solid_force, 1000.0, 0.0, 0.0, 2.0, dt,
             ],

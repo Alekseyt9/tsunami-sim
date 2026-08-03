@@ -105,6 +105,116 @@ The V3.4 wide-scene validation used a 420 m domain and 45 buildings:
 
 The shallow-water regression measured 0.249% volume drift after one simulated second. Both the SPH↔2D exchange impulse and the shallow-to-SPH emission volume/momentum tests have zero float32 residual.
 
+## GPU neighbour optimizations
+
+The production solver caches the SPH equation-of-state pressure, inverse
+density, `mass / density`, and `pressure / density^2` once per active particle.
+The force pass therefore avoids repeating divisions for every neighbour.
+
+Fluid neighbours are stored in a GPU CSR Verlet list. A 0.30 m halo makes the
+list safe for twelve substeps at the configured velocity limits. Rebuilding is
+performed with GPU count, prefix-scan, and fill passes. Periodic rebuilds keep
+their final entry count on the GPU, so only a particle-topology change requires
+a CPU readback. A 35% allocation reserve absorbs ordinary neighbour-count
+variation; overflow is bounds-safe and schedules a larger rebuild at the next
+frame boundary. The density and force passes launch over a spatially sorted
+fluid-only list rather than all city particles.
+
+Radius-dependent SPH support, squared support, Poly6, Spiky, and viscosity
+coefficient precomputation is implemented under `v3.sph_kernel_coefficients`.
+It is disabled on the RTX 5070: the extra irregular VRAM reads cost more than
+recomputing the small kernels. The 763,784-particle late checkpoint's Verlet
+list contains about 22.5 million live indices for 92,905 fluid particles; the
+current reserved capacity is about 30.4 million indices (116 MiB).
+
+An experimental deformable-fragment BVH is available under
+`v3.deformable_fragment_bvh`, but is disabled in the production configuration.
+An initial fast gate incorrectly culled isolated released fragments, which still
+require non-bonded self-contact when folding; the first-substep trajectory A/B
+caught a 0.72 m/s velocity error. The corrected conservative gate agrees within
+9.6e-7 m/s, but 2,057 of 2,058 active fragments remain candidates and the BVH
+raises the late-checkpoint substep from 16.48 to 17.01 ms. The correct slower
+variant is retained for future pair-list work, while production uses HashGrid.
+
+With the two positive changes enabled (asynchronous repeated rebuilds and the
+spatial fluid-only launch), a 100-substep run from the 763,784-particle late
+checkpoint averages 15.78 ms/substep versus 16.03 ms before this pass (1.6%
+faster). All tracked state remains finite, and the 22.49-million-entry list does
+not overflow its reserve.
+
+## Prepared high-impact solver paths
+
+Three larger changes are now isolated behind disabled production flags so they
+can be audited from identical checkpoints before changing the established
+physics.
+
+- `v3.implicit_fluid` now contains an executable constant-density projection in
+  addition to its CFL diagnostic. The constraint denominator and symmetric
+  pressure correction use each particle's real mass and density reference, so
+  the adaptive 1:8 mass ratio is not treated as equal-volume SPH. Execution is
+  selected explicitly with `mode: density_projection`; the checked-in
+  `mode: diagnostic` never changes the WCSPH integrator.
+- `v3.rigid_clusters.early_rigidification` is a complete switchable transition
+  path. It scans detached fragments more frequently, requires independent
+  detached and quiet histories, keeps foundation-supported fragments
+  deformable, preserves the fitted centre-of-mass/angular motion and existing
+  impact reactivation, and checkpoints both histories and conversion totals.
+- `v3.rigid_clusters.sleeping` adds a second rigid state for grounded quiet
+  proxies. Sleeping bodies remain in collision broad phases but skip rigid
+  integration; impacts or strong external loading wake them as rigid bodies,
+  while the higher existing threshold still expands an active proxy back to
+  deformable particles. Sleep counters and transition totals are checkpointed.
+- `v3.narrow_band_volume` prepares a conservative 3D coarse-volume grid. Its
+  GPU audit keeps every particle close to a free surface, solid boundary, or
+  local velocity shear in detailed SPH and deposits only coherently moving
+  calm connected interior samples. Deposited
+  mass, volume, three-axis momentum, active cells, and removable-particle ratio
+  are measured without deleting SPH. This diagnostic transfer must balance
+  exactly before a grid pressure/advection solve replaces the interior.
+
+The preparation code lives in `experimental_optimizations.py`; all prepared flags
+remain false in `config_v3_rtx5070.json`, so current production runs are
+bit-for-bit unaffected by merely adding these paths.
+
+### Optimization checkpoint results (2026-08-03)
+
+`benchmark_implicit_projection.py` compares equal physical horizons from the
+same early and late production checkpoints. With four pressure iterations and
+`dt=0.0006` (5x the WCSPH step), a 0.06 s late-checkpoint test is 1.57x faster
+per simulated second. The final density p99 is 1.0017 and all tracked state is
+finite. The early checkpoint is approximately performance-neutral (1.02x).
+The solver remains disabled because one late local projection residual reached
+30.9%, trajectories differ materially from WCSPH, and solid-reaction/damage
+equivalence has not passed a production-length run.
+
+`benchmark_early_rigidification.py` converts 343 additional detached clusters
+(159,684 particles) in the late checkpoint, but does not reduce total substep
+time. Most of those fragments were already rejected by the contact-candidate
+gate. A direct equal-and-opposite atomic reaction prototype was also rejected:
+contention on a small number of rigid bodies increased the deformable-contact
+kernel from about 4.8 ms to about 41 ms. The next viable implementation is a
+particle-to-OBB BVH narrowphase or a block-local force reduction.
+
+`benchmark_narrow_band_sweep.py` also caught and fixed an undersized diagnostic
+HashGrid. With the corrected grid, a 1.5 m detail band and 3 m/s local RMS limit
+classify 21.6% of early water but only 0.8% of late turbulent water as safe
+interior. A 1.0 m band classifies 38.6% early and 4.2% late. Deposited mass and
+volume match exactly; aggregate momentum differs only by float32 atomic
+rounding. Consequently the volume-grid path can help calm approach water, but
+cannot yet deliver a 1.3--1.8x late-stage speedup on its own.
+
+Intact city buildings expose only their exterior facades, perimeter frame,
+roofs, and terraces to the fluid solver. Interior apartment walls and floor
+plates become hydraulic boundaries after local damage or rigid-fragment
+release. This avoids paying for hidden solid neighbours without making broken
+buildings watertight. Checkpoint density references are renormalized so enabling
+the exterior layer cannot create a pressure impulse.
+
+An optional spatially compact dynamic-solid contact list is implemented under
+`v3.dynamic_solid_contact_list`. It remains disabled in the RTX 5070 production
+configuration: A/B profiling found that prefix-scan overhead canceled its small
+contact-kernel saving at the current active-solid fraction.
+
 ## Water representation
 
 The local impact region is simulated with 3D SPH particles. Only classified free-surface particles contribute to rendering. A compact GPU scalar field is smoothed and reconstructed with Warp Marching Cubes.
