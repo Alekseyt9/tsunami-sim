@@ -76,8 +76,10 @@ def main() -> None:
     wp.launch(clear_vec3, dim=solver.count, inputs=[a["solid_force"][:solver.count]], device=solver.device)
     timed("force_multirate", compute_fluid_forces_multirate, solver.count,
           force_common[:7] + [a["water_phase"][:solver.count]] + force_common[7:] +
+          [solver.fluid_pressure[:solver.count]] +
           [solver.time_level[:solver.count], solver.time_active[:solver.count],
-                          solver.deferred_fluid_impulse] + force_tail)
+                          solver.deferred_fluid_impulse] + force_tail[:3] +
+          force_tail[5:])
     timed("consume", consume_deferred_fluid_impulse, solver.count,
           [a["mass"][:solver.count], a["kind"][:solver.count], solver.time_level[:solver.count],
            solver.time_active[:solver.count], solver.deferred_fluid_impulse,

@@ -463,6 +463,517 @@ def apply_building_activity(
 
 
 @wp.kernel
+def count_structural_adjacency(
+    grid: wp.uint64,
+    rest_x: wp.array(dtype=wp.vec3),
+    radius: wp.array(dtype=float),
+    kind: wp.array(dtype=wp.int32),
+    building_id: wp.array(dtype=wp.int32),
+    neighbour_count: wp.array(dtype=wp.int32),
+    query_radius: float,
+):
+    """Count immutable rest-lattice neighbours for a GPU CSR graph."""
+    tid = wp.tid()
+    i = wp.hash_grid_point_id(grid, tid)
+    if kind[i] == 0:
+        neighbour_count[i] = 0
+        return
+    ri = rest_x[i]
+    count = int(0)
+    query = wp.hash_grid_query(grid, ri, query_radius)
+    for j in query:
+        if j == i or kind[j] == 0 or building_id[i] != building_id[j]:
+            continue
+        rest_distance = wp.length(rest_x[j] - ri)
+        bond_range = 3.2 * wp.max(radius[i], radius[j])
+        if rest_distance > 1.0e-5 and rest_distance < bond_range:
+            count += 1
+    neighbour_count[i] = count
+
+
+@wp.kernel
+def fill_structural_adjacency(
+    grid: wp.uint64,
+    rest_x: wp.array(dtype=wp.vec3),
+    radius: wp.array(dtype=float),
+    kind: wp.array(dtype=wp.int32),
+    building_id: wp.array(dtype=wp.int32),
+    neighbour_offset: wp.array(dtype=wp.int32),
+    neighbour_index: wp.array(dtype=wp.int32),
+    query_radius: float,
+):
+    """Fill the immutable directed CSR adjacency in the same order as count."""
+    tid = wp.tid()
+    i = wp.hash_grid_point_id(grid, tid)
+    if kind[i] == 0:
+        return
+    ri = rest_x[i]
+    cursor = neighbour_offset[i]
+    query = wp.hash_grid_query(grid, ri, query_radius)
+    for j in query:
+        if j == i or kind[j] == 0 or building_id[i] != building_id[j]:
+            continue
+        rest_distance = wp.length(rest_x[j] - ri)
+        bond_range = 3.2 * wp.max(radius[i], radius[j])
+        if rest_distance > 1.0e-5 and rest_distance < bond_range:
+            neighbour_index[cursor] = j
+            cursor += 1
+
+
+@wp.kernel
+def compute_clustered_solid_forces_adjacency(
+    x: wp.array(dtype=wp.vec3),
+    rest_x: wp.array(dtype=wp.vec3),
+    v: wp.array(dtype=wp.vec3),
+    radius: wp.array(dtype=float),
+    mass: wp.array(dtype=float),
+    kind: wp.array(dtype=wp.int32),
+    material: wp.array(dtype=wp.int32),
+    structural_class: wp.array(dtype=wp.int32),
+    building_id: wp.array(dtype=wp.int32),
+    building_damage_integral: wp.array(dtype=float),
+    building_structural_volume: wp.array(dtype=float),
+    fragment_id: wp.array(dtype=wp.int32),
+    rigid_state: wp.array(dtype=wp.int32),
+    fragment_support: wp.array(dtype=float),
+    impact_impulse: wp.array(dtype=float),
+    fixed: wp.array(dtype=wp.int32),
+    damage: wp.array(dtype=float),
+    solid_force: wp.array(dtype=wp.vec3),
+    acceleration: wp.array(dtype=wp.vec3),
+    neighbour_count: wp.array(dtype=wp.int32),
+    neighbour_offset: wp.array(dtype=wp.int32),
+    neighbour_index: wp.array(dtype=wp.int32),
+    query_radius: float,
+    dt: float,
+    internal_stiffness_multiplier: float,
+    damage_rate: float,
+    propagation_threshold: float,
+    max_damage_per_substep: float,
+    fracture_reference_radius: float,
+    collapse_gravity_damage_onset: float,
+    collapse_gravity_damage_full: float,
+    facade_support_loss_minimum_elevation: float,
+    facade_support_loss_collapse_threshold: float,
+    facade_support_loss_damage_rate: float,
+    facade_unsupported_damage_rate: float,
+    structural_unsupported_damage_rate: float,
+    elastic_force_cap_multiplier: float,
+    compression_force_cap_multiplier: float,
+):
+    """Structural springs/support over a persistent rest-lattice CSR graph."""
+    i = wp.tid()
+    if kind[i] == 0:
+        return
+    if fixed[i] != 0:
+        acceleration[i] = wp.vec3(0.0)
+        return
+
+    xi = x[i]
+    ri = rest_x[i]
+    fid = fragment_id[i]
+    body_rigid = fid >= 0 and rigid_state[fid] != 0
+    bid = building_id[i]
+    building_collapse = float(0.0)
+    if fid >= 0:
+        building_collapse = 1.0 - wp.clamp(fragment_support[fid], 0.0, 1.0)
+    elif bid >= 0:
+        building_collapse = collapse_gravity_fraction(
+            building_damage_integral[bid], building_structural_volume[bid],
+            collapse_gravity_damage_onset, collapse_gravity_damage_full,
+        )
+    local_damage = damage[i]
+    local_damage += dt * facade_support_loss_rate(
+        structural_class[i], ri[1], building_collapse,
+        facade_support_loss_minimum_elevation,
+        facade_support_loss_collapse_threshold,
+        facade_support_loss_damage_rate,
+    )
+    gravity_fraction = preloaded_structure_gravity_fraction(
+        bid, building_collapse, body_rigid
+    )
+    force = solid_force[i]
+    impact_drive = material_impact_damage_drive(
+        structural_class[i], impact_impulse[i]
+    )
+    facade_particle = (
+        structural_class[i] == STRUCT_WALL
+        or structural_class[i] == STRUCT_GLASS
+    )
+    has_local_support = int(0)
+    start = neighbour_offset[i]
+    end = start + neighbour_count[i]
+    cell_x = int(wp.floor(xi[0] / query_radius))
+    cell_y = int(wp.floor(xi[1] / query_radius))
+    cell_z = int(wp.floor(xi[2] / query_radius))
+    for edge in range(start, end):
+        j = neighbour_index[edge]
+        delta = x[j] - xi
+        # Match the legacy HashGrid candidate window.  Persistent rest bonds
+        # must not behave like infinitely long springs after two fragments
+        # have moved into non-neighbouring current-space cells.
+        neighbour_cell_x = int(wp.floor(x[j][0] / query_radius))
+        neighbour_cell_y = int(wp.floor(x[j][1] / query_radius))
+        neighbour_cell_z = int(wp.floor(x[j][2] / query_radius))
+        if (
+            wp.abs(neighbour_cell_x - cell_x) > 1
+            or wp.abs(neighbour_cell_y - cell_y) > 1
+            or wp.abs(neighbour_cell_z - cell_z) > 1
+        ):
+            continue
+        dist = wp.length(delta)
+        if dist <= 1.0e-5:
+            continue
+        rest_delta = rest_x[j] - ri
+        rest_dist = wp.length(rest_delta)
+        bond_range = 3.2 * wp.max(radius[i], radius[j])
+        same_fragment = fid >= 0 and fid == fragment_id[j]
+        neighbour_fid = fragment_id[j]
+        neighbour_rigid = neighbour_fid >= 0 and rigid_state[neighbour_fid] != 0
+        neighbour_has_foundation_path = (
+            neighbour_fid < 0 or fragment_support[neighbour_fid] > 0.5
+        )
+        if (
+            facade_particle and damage[j] < 0.90
+            and neighbour_has_foundation_path
+        ):
+            horizontal_rest2 = (
+                rest_delta[0] * rest_delta[0] + rest_delta[2] * rest_delta[2]
+            )
+            below = (
+                rest_delta[1] < -0.25 * bond_range
+                and horizontal_rest2 < 0.56 * bond_range * bond_range
+            )
+            neighbour_role = structural_class[j]
+            frame_member = (
+                neighbour_role == STRUCT_SLAB or neighbour_role == STRUCT_BEAM
+                or neighbour_role == STRUCT_COLUMN or neighbour_role == STRUCT_CORE
+            )
+            diaphragm = frame_member and wp.abs(rest_delta[1]) < 0.55 * bond_range
+            current_attachment_intact = dist < rest_dist * 1.55
+            if (below or diaphragm) and current_attachment_intact:
+                has_local_support = 1
+
+        if body_rigid and same_fragment:
+            continue
+        if same_fragment:
+            strain = (dist - rest_dist) / wp.max(rest_dist, 1.0e-4)
+            yield_strain = wp.min(
+                material_failure_strain(material[i]),
+                material_failure_strain(material[j]),
+            )
+            yield_strain *= wp.min(
+                structural_failure_strain_multiplier(structural_class[i]),
+                structural_failure_strain_multiplier(structural_class[j]),
+            )
+            yield_strain *= elastic_force_cap_multiplier
+            transmitted_strain = wp.clamp(
+                strain, -yield_strain * compression_force_cap_multiplier,
+                yield_strain,
+            )
+            stiffness = wp.min(
+                material_stiffness(material[i]), material_stiffness(material[j])
+            )
+            damping = 75000.0 * wp.dot(v[j] - v[i], delta / dist)
+            force += (
+                stiffness * internal_stiffness_multiplier * transmitted_strain
+                + damping
+            ) * (delta / dist) * radius[i] * radius[i]
+        elif local_damage < 1.0 and not body_rigid and not neighbour_rigid:
+            strain = (dist - rest_dist) / wp.max(rest_dist, 1.0e-4)
+            limit = wp.min(
+                material_failure_strain(material[i]),
+                material_failure_strain(material[j]),
+            )
+            limit *= wp.min(
+                structural_failure_strain_multiplier(structural_class[i]),
+                structural_failure_strain_multiplier(structural_class[j]),
+            )
+            bond_radius = wp.max(radius[i], radius[j])
+            resolution_scale = wp.sqrt(
+                fracture_reference_radius / wp.max(bond_radius, 1.0e-5)
+            )
+            resolution_scale = wp.clamp(resolution_scale, 0.65, 2.5)
+            limit *= resolution_scale
+            abs_strain = wp.abs(strain)
+            propagated_crack = (
+                damage[j] > propagation_threshold and abs_strain > limit * 2.5
+            )
+            crack_drive = impact_drive
+            if propagated_crack:
+                crack_drive = wp.max(
+                    crack_drive,
+                    wp.clamp(
+                        (damage[j] - propagation_threshold)
+                        / wp.max(1.0 - propagation_threshold, 1.0e-5),
+                        0.0, 1.0,
+                    ),
+                )
+            if abs_strain > limit and crack_drive > 0.0:
+                normalized = (abs_strain - limit) / wp.max(limit, 1.0e-4)
+                role_rate = wp.max(
+                    structural_damage_rate_multiplier(structural_class[i]),
+                    structural_damage_rate_multiplier(structural_class[j]),
+                )
+                increment = wp.min(
+                    normalized * dt * damage_rate * role_rate,
+                    max_damage_per_substep * role_rate,
+                ) * crack_drive
+                local_damage += increment
+            if local_damage < 1.0:
+                stiffness = wp.min(
+                    material_stiffness(material[i]), material_stiffness(material[j])
+                )
+                damping = 50000.0 * wp.dot(v[j] - v[i], delta / dist)
+                cohesion = (1.0 - local_damage) * (1.0 - local_damage)
+                transmitted_strain = wp.clamp(
+                    strain,
+                    -limit * elastic_force_cap_multiplier
+                    * compression_force_cap_multiplier,
+                    limit * elastic_force_cap_multiplier,
+                )
+                force += cohesion * (
+                    stiffness * transmitted_strain + damping
+                ) * (delta / dist) * radius[i] * radius[i]
+
+    if (
+        facade_particle and ri[1] > facade_support_loss_minimum_elevation
+        and has_local_support == 0 and not body_rigid
+    ):
+        gravity_fraction = 1.0
+        local_damage += dt * facade_unsupported_damage_rate
+    elif (
+        fid >= 0 and fragment_support[fid] < 0.5
+        and ri[1] > facade_support_loss_minimum_elevation and not body_rigid
+    ):
+        local_damage += (
+            dt * structural_unsupported_damage_rate
+            * structural_damage_rate_multiplier(structural_class[i])
+        )
+    if body_rigid:
+        gravity_fraction = 1.0
+    force += wp.vec3(0.0, -9.81 * mass[i] * gravity_fraction, 0.0)
+    damage[i] = wp.min(local_damage, 1.0)
+    # The legacy kernel clamps only after spring and dynamic contact forces
+    # have been combined.  The split CSR path therefore leaves this partial
+    # acceleration unclamped; accumulate_deformable_contacts_adjacency applies
+    # the single final cap after adding contact.
+    acceleration[i] = force / wp.max(mass[i], 1.0)
+
+
+@wp.kernel
+def accumulate_deformable_contacts_adjacency(
+    grid: wp.uint64,
+    x: wp.array(dtype=wp.vec3),
+    rest_x: wp.array(dtype=wp.vec3),
+    v: wp.array(dtype=wp.vec3),
+    radius: wp.array(dtype=float),
+    mass: wp.array(dtype=float),
+    kind: wp.array(dtype=wp.int32),
+    building_id: wp.array(dtype=wp.int32),
+    fragment_id: wp.array(dtype=wp.int32),
+    rigid_state: wp.array(dtype=wp.int32),
+    fixed: wp.array(dtype=wp.int32),
+    damage: wp.array(dtype=float),
+    acceleration: wp.array(dtype=wp.vec3),
+    query_radius: float,
+):
+    """Dynamic contact pass separated from immutable structural springs."""
+    tid = wp.tid()
+    i = wp.hash_grid_point_id(grid, tid)
+    if kind[i] == 0 or fixed[i] != 0:
+        return
+    xi = x[i]
+    ri = rest_x[i]
+    fid = fragment_id[i]
+    body_rigid = fid >= 0 and rigid_state[fid] != 0
+    contact_force = wp.vec3(0.0)
+    query = wp.hash_grid_query(grid, xi, query_radius)
+    for j in query:
+        if j == i or kind[j] == 0:
+            continue
+        delta = x[j] - xi
+        dist_sq = wp.dot(delta, delta)
+        contact_distance = radius[i] + radius[j]
+        if dist_sq <= 1.0e-10 or dist_sq >= contact_distance * contact_distance:
+            continue
+        dist = wp.sqrt(dist_sq)
+        neighbour_fid = fragment_id[j]
+        neighbour_rigid = neighbour_fid >= 0 and rigid_state[neighbour_fid] != 0
+        same_fragment = fid >= 0 and fid == neighbour_fid
+        rest_delta = rest_x[j] - ri
+        rest_dist_sq = wp.dot(rest_delta, rest_delta)
+        bond_range = 3.2 * wp.max(radius[i], radius[j])
+        bonded = (
+            building_id[i] == building_id[j]
+            and rest_dist_sq < bond_range * bond_range
+        )
+        spring_active = (
+            (bonded and same_fragment)
+            or (
+                bonded and damage[i] < 1.0
+                and not body_rigid and not neighbour_rigid
+            )
+        )
+        if spring_active or (body_rigid and neighbour_rigid):
+            continue
+        normal = delta / dist
+        closing = wp.dot(v[j] - v[i], normal)
+        contact_force -= normal * deformable_contact_magnitude(
+            contact_distance - dist, closing, 3.0e6, 9000.0
+        )
+    ai = acceleration[i] + contact_force / wp.max(mass[i], 1.0)
+    a_len = wp.length(ai)
+    if a_len > 6000.0:
+        ai *= 6000.0 / a_len
+    acceleration[i] = ai
+
+
+@wp.kernel
+def collect_deformable_contact_candidates(
+    grid: wp.uint64,
+    x: wp.array(dtype=wp.vec3),
+    rest_x: wp.array(dtype=wp.vec3),
+    radius: wp.array(dtype=float),
+    kind: wp.array(dtype=wp.int32),
+    building_id: wp.array(dtype=wp.int32),
+    fragment_id: wp.array(dtype=wp.int32),
+    rigid_state: wp.array(dtype=wp.int32),
+    fixed: wp.array(dtype=wp.int32),
+    damage: wp.array(dtype=float),
+    candidate_index: wp.array(dtype=wp.int32),
+    candidate_count: wp.array(dtype=wp.int32),
+    query_radius: float,
+):
+    """Compact particles with at least one exact active solid contact on GPU."""
+    tid = wp.tid()
+    i = wp.hash_grid_point_id(grid, tid)
+    if kind[i] == 0 or fixed[i] != 0:
+        return
+    xi = x[i]
+    ri = rest_x[i]
+    fid = fragment_id[i]
+    body_rigid = fid >= 0 and rigid_state[fid] != 0
+    query = wp.hash_grid_query(grid, xi, query_radius)
+    for j in query:
+        if j == i or kind[j] == 0:
+            continue
+        delta = x[j] - xi
+        dist_sq = wp.dot(delta, delta)
+        contact_distance = radius[i] + radius[j]
+        if dist_sq <= 1.0e-10 or dist_sq >= contact_distance * contact_distance:
+            continue
+        neighbour_fid = fragment_id[j]
+        neighbour_rigid = neighbour_fid >= 0 and rigid_state[neighbour_fid] != 0
+        same_fragment = fid >= 0 and fid == neighbour_fid
+        rest_delta = rest_x[j] - ri
+        rest_dist_sq = wp.dot(rest_delta, rest_delta)
+        bond_range = 3.2 * wp.max(radius[i], radius[j])
+        bonded = (
+            building_id[i] == building_id[j]
+            and rest_dist_sq < bond_range * bond_range
+        )
+        spring_active = (
+            (bonded and same_fragment)
+            or (
+                bonded and damage[i] < 1.0
+                and not body_rigid and not neighbour_rigid
+            )
+        )
+        if spring_active or (body_rigid and neighbour_rigid):
+            continue
+        slot = wp.atomic_add(candidate_count, 0, 1)
+        candidate_index[slot] = i
+        return
+
+
+@wp.kernel
+def accumulate_compact_deformable_contacts(
+    grid: wp.uint64,
+    x: wp.array(dtype=wp.vec3),
+    rest_x: wp.array(dtype=wp.vec3),
+    v: wp.array(dtype=wp.vec3),
+    radius: wp.array(dtype=float),
+    mass: wp.array(dtype=float),
+    kind: wp.array(dtype=wp.int32),
+    building_id: wp.array(dtype=wp.int32),
+    fragment_id: wp.array(dtype=wp.int32),
+    rigid_state: wp.array(dtype=wp.int32),
+    damage: wp.array(dtype=float),
+    acceleration: wp.array(dtype=wp.vec3),
+    candidate_index: wp.array(dtype=wp.int32),
+    candidate_count: wp.array(dtype=wp.int32),
+    query_radius: float,
+):
+    """Resolve contacts for the compact list without a CPU count readback."""
+    slot = wp.tid()
+    if slot >= candidate_count[0]:
+        return
+    i = candidate_index[slot]
+    xi = x[i]
+    ri = rest_x[i]
+    fid = fragment_id[i]
+    body_rigid = fid >= 0 and rigid_state[fid] != 0
+    contact_force = wp.vec3(0.0)
+    query = wp.hash_grid_query(grid, xi, query_radius)
+    for j in query:
+        if j == i or kind[j] == 0:
+            continue
+        delta = x[j] - xi
+        dist_sq = wp.dot(delta, delta)
+        contact_distance = radius[i] + radius[j]
+        if dist_sq <= 1.0e-10 or dist_sq >= contact_distance * contact_distance:
+            continue
+        dist = wp.sqrt(dist_sq)
+        neighbour_fid = fragment_id[j]
+        neighbour_rigid = neighbour_fid >= 0 and rigid_state[neighbour_fid] != 0
+        same_fragment = fid >= 0 and fid == neighbour_fid
+        rest_delta = rest_x[j] - ri
+        rest_dist_sq = wp.dot(rest_delta, rest_delta)
+        bond_range = 3.2 * wp.max(radius[i], radius[j])
+        bonded = (
+            building_id[i] == building_id[j]
+            and rest_dist_sq < bond_range * bond_range
+        )
+        spring_active = (
+            (bonded and same_fragment)
+            or (
+                bonded and damage[i] < 1.0
+                and not body_rigid and not neighbour_rigid
+            )
+        )
+        if spring_active or (body_rigid and neighbour_rigid):
+            continue
+        normal = delta / dist
+        closing = wp.dot(v[j] - v[i], normal)
+        contact_force -= normal * deformable_contact_magnitude(
+            contact_distance - dist, closing, 3.0e6, 9000.0
+        )
+    ai = acceleration[i] + contact_force / wp.max(mass[i], 1.0)
+    a_len = wp.length(ai)
+    if a_len > 6000.0:
+        ai *= 6000.0 / a_len
+    acceleration[i] = ai
+
+
+@wp.kernel
+def finalize_deformable_acceleration(
+    kind: wp.array(dtype=wp.int32),
+    fixed: wp.array(dtype=wp.int32),
+    acceleration: wp.array(dtype=wp.vec3),
+    maximum_acceleration: float,
+):
+    """Apply the legacy combined spring/contact cap to every dynamic solid."""
+    i = wp.tid()
+    if kind[i] == 0 or fixed[i] != 0:
+        return
+    value = acceleration[i]
+    magnitude = wp.length(value)
+    if magnitude > maximum_acceleration:
+        acceleration[i] = value * (maximum_acceleration / magnitude)
+
+
+@wp.kernel
 def compute_clustered_solid_forces(
     grid: wp.uint64,
     x: wp.array(dtype=wp.vec3),
@@ -922,8 +1433,11 @@ def accumulate_rigid_proxy_contacts(
     body_torque: wp.array2d(dtype=float),
     contact_acceleration_peak: wp.array(dtype=float),
     normal_damping: float,
+    normal_damping_ratio: float,
     tangential_damping: float,
     maximum_penetration: float,
+    maximum_contact_acceleration: float,
+    minimum_reactivation_closing_speed: float,
 ):
     pair = wp.tid()
     left = pair_left[pair]
@@ -965,7 +1479,35 @@ def accumulate_rigid_proxy_contacts(
         contact_stiffness(proxy_material[left]), contact_stiffness(proxy_material[right])
     )
     penetration = wp.min(contact[3], maximum_penetration)
-    normal_magnitude = stiffness * penetration + normal_damping * wp.max(-normal_speed, 0.0)
+    # A fixed damping coefficient is far too small for facade and slab bodies
+    # weighing tens of tonnes.  It made the penalty spring almost perfectly
+    # elastic, so an overlapping OBB could throw a complete building section
+    # back into the air.  Scale the damper from the pair's effective mass and
+    # expose the old coefficient only as a numerical floor.
+    mass_left = wp.max(body_mass[left], 1.0)
+    mass_right = wp.max(body_mass[right], 1.0)
+    effective_mass = (mass_left * mass_right) / (mass_left + mass_right)
+    critical_damping = 2.0 * wp.sqrt(stiffness * effective_mass)
+    damping = wp.max(normal_damping, normal_damping_ratio * critical_damping)
+    closing_speed = wp.max(-normal_speed, 0.0)
+    impact_magnitude = damping * closing_speed
+    reactivation_magnitude = impact_magnitude
+    if closing_speed < minimum_reactivation_closing_speed:
+        reactivation_magnitude = 0.0
+    normal_magnitude = stiffness * penetration + impact_magnitude
+    # Newly fitted convex proxies can overlap through empty regions of sparse
+    # facade frames.  Bound the relative acceleration so that resolving that
+    # numerical overlap cannot cause an instantaneous trajectory reversal.
+    if maximum_contact_acceleration > 0.0:
+        normal_magnitude = wp.min(
+            normal_magnitude, maximum_contact_acceleration * effective_mass
+        )
+        impact_magnitude = wp.min(
+            impact_magnitude, maximum_contact_acceleration * effective_mass
+        )
+        reactivation_magnitude = wp.min(
+            reactivation_magnitude, maximum_contact_acceleration * effective_mass
+        )
     normal_magnitude = wp.max(normal_magnitude, 0.0)
     tangent_velocity = relative - normal * normal_speed
     tangent_speed = wp.length(tangent_velocity)
@@ -987,12 +1529,185 @@ def accumulate_rigid_proxy_contacts(
         wp.atomic_add(body_force, right, axis, force_right[axis])
         wp.atomic_add(body_torque, left, axis, torque_left[axis])
         wp.atomic_add(body_torque, right, axis, torque_right[axis])
-    wp.atomic_max(
-        contact_acceleration_peak, left, normal_magnitude / wp.max(body_mass[left], 1.0)
+    # Use only the velocity-dependent impact term for reactivation. Persistent
+    # overlap in a settled rubble pile carries spring support force but is not
+    # a new collision and must not repeatedly dissolve quiet rigid bodies.
+    # Relative acceleration is independent of which body is lighter and gives
+    # the reactivation gate a stable physical meaning across fragment sizes.
+    relative_contact_acceleration = reactivation_magnitude / effective_mass
+    wp.atomic_max(contact_acceleration_peak, left, relative_contact_acceleration)
+    wp.atomic_max(contact_acceleration_peak, right, relative_contact_acceleration)
+
+
+@wp.kernel
+def update_rigid_proxy_bounds(
+    rigid_state: wp.array(dtype=wp.int32),
+    proxy_enabled: wp.array(dtype=wp.int32),
+    proxy_local_center: wp.array(dtype=wp.vec3),
+    proxy_half_extent: wp.array(dtype=wp.vec3),
+    body_center: wp.array(dtype=wp.vec3),
+    body_orientation: wp.array(dtype=wp.quat),
+    bounds_lower: wp.array(dtype=wp.vec3),
+    bounds_upper: wp.array(dtype=wp.vec3),
+    margin: float,
+):
+    """Update conservative world-space AABBs for the GPU rigid-proxy BVH."""
+    body = wp.tid()
+    if rigid_state[body] == 0 or proxy_enabled[body] == 0:
+        # Disabled leaves remain in the fixed-capacity BVH but are moved well
+        # outside the simulation domain.  This keeps leaf ids identical to
+        # fragment ids and avoids rebuilding CPU pair arrays after fractures.
+        far = 1.0e6 + float(body) * 2.0
+        bounds_lower[body] = wp.vec3(far, far, far)
+        bounds_upper[body] = wp.vec3(far + 0.01, far + 0.01, far + 0.01)
+        return
+    orientation = body_orientation[body]
+    center = body_center[body] + wp.quat_rotate(
+        orientation, proxy_local_center[body]
     )
-    wp.atomic_max(
-        contact_acceleration_peak, right, normal_magnitude / wp.max(body_mass[right], 1.0)
-    )
+    half_extent = proxy_half_extent[body]
+    axis_x = proxy_axis(orientation, 0)
+    axis_y = proxy_axis(orientation, 1)
+    axis_z = proxy_axis(orientation, 2)
+    extent = wp.vec3(
+        wp.abs(axis_x[0]) * half_extent[0]
+        + wp.abs(axis_y[0]) * half_extent[1]
+        + wp.abs(axis_z[0]) * half_extent[2],
+        wp.abs(axis_x[1]) * half_extent[0]
+        + wp.abs(axis_y[1]) * half_extent[1]
+        + wp.abs(axis_z[1]) * half_extent[2],
+        wp.abs(axis_x[2]) * half_extent[0]
+        + wp.abs(axis_y[2]) * half_extent[1]
+        + wp.abs(axis_z[2]) * half_extent[2],
+    ) + wp.vec3(margin)
+    bounds_lower[body] = center - extent
+    bounds_upper[body] = center + extent
+
+
+@wp.kernel
+def accumulate_rigid_proxy_contacts_bvh(
+    bvh_id: wp.uint64,
+    bounds_lower: wp.array(dtype=wp.vec3),
+    bounds_upper: wp.array(dtype=wp.vec3),
+    rigid_state: wp.array(dtype=wp.int32),
+    proxy_enabled: wp.array(dtype=wp.int32),
+    proxy_local_center: wp.array(dtype=wp.vec3),
+    proxy_half_extent: wp.array(dtype=wp.vec3),
+    proxy_material: wp.array(dtype=wp.int32),
+    body_center: wp.array(dtype=wp.vec3),
+    body_orientation: wp.array(dtype=wp.quat),
+    body_linear_velocity: wp.array(dtype=wp.vec3),
+    body_angular_velocity: wp.array(dtype=wp.vec3),
+    body_mass: wp.array(dtype=float),
+    body_force: wp.array2d(dtype=float),
+    body_torque: wp.array2d(dtype=float),
+    contact_acceleration_peak: wp.array(dtype=float),
+    candidate_count: wp.array(dtype=wp.int32),
+    contact_count: wp.array(dtype=wp.int32),
+    normal_damping: float,
+    normal_damping_ratio: float,
+    tangential_damping: float,
+    maximum_penetration: float,
+    maximum_contact_acceleration: float,
+    minimum_reactivation_closing_speed: float,
+):
+    """GPU broadphase and OBB narrowphase without an O(N^2) CPU pair list."""
+    left = wp.tid()
+    if rigid_state[left] == 0 or proxy_enabled[left] == 0:
+        return
+    query = wp.bvh_query_aabb(bvh_id, bounds_lower[left], bounds_upper[left])
+    right = int(0)
+    while wp.bvh_query_next(query, right):
+        # Each unordered pair is evaluated exactly once.  The BVH also returns
+        # the querying leaf itself.
+        if right <= left or rigid_state[right] == 0 or proxy_enabled[right] == 0:
+            continue
+        wp.atomic_add(candidate_count, 0, 1)
+        orientation_left = body_orientation[left]
+        orientation_right = body_orientation[right]
+        center_left = body_center[left] + wp.quat_rotate(
+            orientation_left, proxy_local_center[left]
+        )
+        center_right = body_center[right] + wp.quat_rotate(
+            orientation_right, proxy_local_center[right]
+        )
+        contact = proxy_sat_contact(
+            center_left, orientation_left, proxy_half_extent[left],
+            center_right, orientation_right, proxy_half_extent[right],
+        )
+        if contact[3] <= 0.0:
+            continue
+        wp.atomic_add(contact_count, 0, 1)
+        normal = wp.vec3(contact[0], contact[1], contact[2])
+        point_left = proxy_support_point(
+            center_left, orientation_left, proxy_half_extent[left], normal
+        )
+        point_right = proxy_support_point(
+            center_right, orientation_right, proxy_half_extent[right], -normal
+        )
+        point = (point_left + point_right) * 0.5
+        arm_left = point - body_center[left]
+        arm_right = point - body_center[right]
+        velocity_left = body_linear_velocity[left] + wp.cross(
+            body_angular_velocity[left], arm_left
+        )
+        velocity_right = body_linear_velocity[right] + wp.cross(
+            body_angular_velocity[right], arm_right
+        )
+        relative = velocity_right - velocity_left
+        normal_speed = wp.dot(relative, normal)
+        stiffness = wp.min(
+            contact_stiffness(proxy_material[left]),
+            contact_stiffness(proxy_material[right]),
+        )
+        penetration = wp.min(contact[3], maximum_penetration)
+        mass_left = wp.max(body_mass[left], 1.0)
+        mass_right = wp.max(body_mass[right], 1.0)
+        effective_mass = (mass_left * mass_right) / (mass_left + mass_right)
+        critical_damping = 2.0 * wp.sqrt(stiffness * effective_mass)
+        damping = wp.max(normal_damping, normal_damping_ratio * critical_damping)
+        closing_speed = wp.max(-normal_speed, 0.0)
+        impact_magnitude = damping * closing_speed
+        reactivation_magnitude = impact_magnitude
+        if closing_speed < minimum_reactivation_closing_speed:
+            reactivation_magnitude = 0.0
+        normal_magnitude = stiffness * penetration + impact_magnitude
+        if maximum_contact_acceleration > 0.0:
+            normal_magnitude = wp.min(
+                normal_magnitude, maximum_contact_acceleration * effective_mass
+            )
+            reactivation_magnitude = wp.min(
+                reactivation_magnitude, maximum_contact_acceleration * effective_mass
+            )
+        normal_magnitude = wp.max(normal_magnitude, 0.0)
+        tangent_velocity = relative - normal * normal_speed
+        tangent_speed = wp.length(tangent_velocity)
+        friction_force = wp.vec3(0.0)
+        if tangent_speed > 1.0e-5:
+            friction = wp.min(
+                contact_friction(proxy_material[left]),
+                contact_friction(proxy_material[right]),
+            )
+            friction_magnitude = wp.min(
+                friction * normal_magnitude, tangential_damping * tangent_speed
+            )
+            friction_force = tangent_velocity * (friction_magnitude / tangent_speed)
+        force_left = -normal * normal_magnitude + friction_force
+        force_right = -force_left
+        torque_left = wp.cross(arm_left, force_left)
+        torque_right = wp.cross(arm_right, force_right)
+        for axis in range(3):
+            wp.atomic_add(body_force, left, axis, force_left[axis])
+            wp.atomic_add(body_force, right, axis, force_right[axis])
+            wp.atomic_add(body_torque, left, axis, torque_left[axis])
+            wp.atomic_add(body_torque, right, axis, torque_right[axis])
+        relative_contact_acceleration = reactivation_magnitude / effective_mass
+        wp.atomic_max(
+            contact_acceleration_peak, left, relative_contact_acceleration
+        )
+        wp.atomic_max(
+            contact_acceleration_peak, right, relative_contact_acceleration
+        )
 
 
 @wp.kernel
@@ -1006,6 +1721,7 @@ def accumulate_rigid_proxy_boundaries(
     body_orientation: wp.array(dtype=wp.quat),
     body_linear_velocity: wp.array(dtype=wp.vec3),
     body_angular_velocity: wp.array(dtype=wp.vec3),
+    body_mass: wp.array(dtype=float),
     body_force: wp.array2d(dtype=float),
     body_torque: wp.array2d(dtype=float),
     x_bound: float,
@@ -1014,8 +1730,10 @@ def accumulate_rigid_proxy_boundaries(
     y_max: float,
     stiffness: float,
     normal_damping: float,
+    normal_damping_ratio: float,
     tangential_damping: float,
     maximum_penetration: float,
+    maximum_contact_acceleration: float,
 ):
     body = wp.tid()
     if rigid_state[body] == 0 or proxy_enabled[body] == 0:
@@ -1047,10 +1765,17 @@ def accumulate_rigid_proxy_boundaries(
                 body_angular_velocity[body], arm
             )
             normal_speed = wp.dot(point_velocity, normal)
+            mass = wp.max(body_mass[body], 1.0)
+            critical_damping = 2.0 * wp.sqrt(stiffness * mass)
+            damping = wp.max(normal_damping, normal_damping_ratio * critical_damping)
             normal_magnitude = (
                 stiffness * wp.min(penetration, maximum_penetration)
-                + normal_damping * wp.max(-normal_speed, 0.0)
+                + damping * wp.max(-normal_speed, 0.0)
             )
+            if maximum_contact_acceleration > 0.0:
+                normal_magnitude = wp.min(
+                    normal_magnitude, maximum_contact_acceleration * mass
+                )
             tangent_velocity = point_velocity - normal * normal_speed
             tangent_speed = wp.length(tangent_velocity)
             friction_force = wp.vec3(0.0)
@@ -1087,19 +1812,30 @@ def accumulate_rigid_contacts(
     normal_damping: float,
     tangential_damping: float,
 ):
-    """Pairwise rubble contact using rigid surface samples as the broadphase."""
+    """Sample contacts for rigid bodies which have no convex proxy.
+
+    Proxy/proxy pairs are handled once by the OBB narrowphase.  A mixed pair
+    is owned by the non-proxy body, so hundreds of thousands of proxy samples
+    no longer perform redundant hash-grid queries merely to reject each other.
+    """
     tid = wp.tid()
     i = wp.hash_grid_point_id(grid, tid)
     fid = fragment_id[i]
-    if kind[i] == 0 or fid < 0 or rigid_state[fid] == 0:
+    if (
+        kind[i] == 0 or fid < 0 or rigid_state[fid] == 0
+        or proxy_enabled[fid] != 0
+    ):
         return
     xi = x[i]
     query = wp.hash_grid_query(grid, xi, query_radius)
     for j in query:
         other = fragment_id[j]
-        if j <= i or kind[j] == 0 or other < 0 or other == fid or rigid_state[other] == 0:
+        if kind[j] == 0 or other < 0 or other == fid or rigid_state[other] == 0:
             continue
-        if proxy_enabled[fid] != 0 and proxy_enabled[other] != 0:
+        # Non-proxy/non-proxy contacts still use particle-id ordering.  Mixed
+        # contacts are evaluated only here, from the non-proxy side, so they
+        # remain unique regardless of the two samples' global ids.
+        if proxy_enabled[other] == 0 and j <= i:
             continue
         delta = x[j] - xi
         distance = wp.length(delta)
@@ -1164,6 +1900,8 @@ def integrate_rigid_bodies(
     maximum_angular_speed: float,
     maximum_linear_speed: float,
     maximum_upward_speed: float,
+    upward_speed_reference_mass: float,
+    minimum_mass_upward_speed: float,
     maximum_tip_speed: float,
 ):
     body = wp.tid()
@@ -1178,9 +1916,16 @@ def integrate_rigid_bodies(
     angular_velocity = body_angular_velocity[body] + wp.quat_rotate(orientation, local_alpha) * dt
     linear_velocity *= wp.exp(-linear_damping * dt)
     angular_velocity *= wp.exp(-angular_damping * dt)
-    if maximum_upward_speed > 0.0 and linear_velocity[1] > maximum_upward_speed:
+    upward_limit = maximum_upward_speed
+    if upward_limit > 0.0 and upward_speed_reference_mass > 0.0:
+        mass_scale = wp.sqrt(
+            upward_speed_reference_mass
+            / wp.max(body_mass[body], upward_speed_reference_mass)
+        )
+        upward_limit = wp.max(minimum_mass_upward_speed, upward_limit * mass_scale)
+    if upward_limit > 0.0 and linear_velocity[1] > upward_limit:
         linear_velocity = wp.vec3(
-            linear_velocity[0], maximum_upward_speed, linear_velocity[2]
+            linear_velocity[0], upward_limit, linear_velocity[2]
         )
     linear_speed = wp.length(linear_velocity)
     if maximum_linear_speed > 0.0 and linear_speed > maximum_linear_speed:
@@ -1400,6 +2145,44 @@ def compute_density_multirate(
 
 
 @wp.kernel
+def compute_fluid_pressure_multirate(
+    kind: wp.array(dtype=wp.int32),
+    water_phase: wp.array(dtype=wp.int32),
+    time_active: wp.array(dtype=wp.int32),
+    rho: wp.array(dtype=float),
+    mass: wp.array(dtype=float),
+    pressure: wp.array(dtype=float),
+    inverse_density: wp.array(dtype=float),
+    mass_over_density: wp.array(dtype=float),
+    pressure_over_density_squared: wp.array(dtype=float),
+    rest_density: float,
+    sound_speed: float,
+    max_density_ratio: float,
+):
+    """Cache the equation-of-state pressure once per active fluid particle."""
+    i = wp.tid()
+    if kind[i] != 0 or time_active[i] == 0:
+        return
+    local_inverse_density = 1.0 / wp.max(rho[i], rest_density * 0.15)
+    inverse_density[i] = local_inverse_density
+    mass_over_density[i] = mass[i] * local_inverse_density
+    if water_phase[i] == 2:
+        pressure[i] = 0.0
+        pressure_over_density_squared[i] = 0.0
+        return
+    gamma = 7.0
+    stiffness = rest_density * sound_speed * sound_speed / gamma
+    ratio = wp.min(rho[i] / rest_density, max_density_ratio)
+    local_pressure = wp.max(
+        stiffness * (wp.pow(ratio, gamma) - 1.0), -0.02 * stiffness
+    )
+    pressure[i] = local_pressure
+    pressure_over_density_squared[i] = (
+        local_pressure * local_inverse_density * local_inverse_density
+    )
+
+
+@wp.kernel
 def compute_fluid_forces_multirate(
     grid: wp.uint64,
     x: wp.array(dtype=wp.vec3),
@@ -1410,14 +2193,16 @@ def compute_fluid_forces_multirate(
     kind: wp.array(dtype=wp.int32),
     water_phase: wp.array(dtype=wp.int32),
     rho: wp.array(dtype=float),
+    pressure: wp.array(dtype=float),
+    inverse_density: wp.array(dtype=float),
+    mass_over_density: wp.array(dtype=float),
+    pressure_over_density_squared: wp.array(dtype=float),
     time_level: wp.array(dtype=wp.int32),
     time_active: wp.array(dtype=wp.int32),
     deferred_impulse: wp.array2d(dtype=float),
     acceleration: wp.array(dtype=wp.vec3),
     solid_force: wp.array(dtype=wp.vec3),
     rest_density: float,
-    sound_speed: float,
-    max_density_ratio: float,
     viscosity: float,
     xsph_strength: float,
     max_support: float,
@@ -1459,11 +2244,9 @@ def compute_fluid_forces_multirate(
             wp.atomic_add(solid_force, j, -contact_acceleration * mass[i] * float(stride_i))
         acceleration[i] = ballistic_acceleration
         return
-    rhoi = rho[i]
-    gamma = 7.0
-    stiffness = rest_density * sound_speed * sound_speed / gamma
-    pi = stiffness * (wp.pow(wp.min(rhoi / rest_density, max_density_ratio), gamma) - 1.0)
-    pi = wp.max(pi, -0.02 * stiffness)
+    pi = pressure[i]
+    inverse_rhoi = inverse_density[i]
+    pressure_term_i = pressure_over_density_squared[i]
     ai = wp.vec3(0.0, -9.81, 0.0)
     xsph = wp.vec3(0.0)
     query = wp.hash_grid_query(grid, xi, max_support)
@@ -1477,22 +2260,27 @@ def compute_fluid_forces_multirate(
         support = 4.0 * wp.max(radius[i], radius[j])
         if dist >= support or dist <= 1.0e-5:
             continue
-        rhoj = rho[j]
-        pj = pi
+        pressure_term_j = pi / (rest_density * rest_density)
+        inverse_rhoj = 1.0 / rest_density
         if kind[j] == 0:
-            pj = stiffness * (wp.pow(wp.min(rhoj / rest_density, max_density_ratio), gamma) - 1.0)
-            pj = wp.max(pj, -0.02 * stiffness)
+            pressure_term_j = pressure_over_density_squared[j]
+            inverse_rhoj = inverse_density[j]
         else:
             rhoj = rest_density
         grad = spiky_grad(r, dist, support)
         neighbour_mass = mass[j]
         if kind[j] != 0:
             neighbour_mass = rest_density * volume[j]
-        pair_acc = -neighbour_mass * (pi / (rhoi * rhoi) + pj / (rhoj * rhoj)) * grad
-        pair_acc += viscosity * neighbour_mass * (v[j] - vi) / rhoj * viscosity_laplacian(dist, support) / rhoi
+        pair_acc = -neighbour_mass * (pressure_term_i + pressure_term_j) * grad
+        pair_acc += (
+            viscosity * neighbour_mass * (v[j] - vi)
+            * inverse_rhoj * viscosity_laplacian(dist, support) * inverse_rhoi
+        )
         ai += pair_acc
         if kind[j] == 0:
-            xsph += mass[j] / rhoj * (v[j] - vi) * poly6(wp.dot(r, r), support)
+            xsph += mass_over_density[j] * (v[j] - vi) * poly6(
+                wp.dot(r, r), support
+            )
         else:
             # The slow particle represents several base ticks, so its boundary
             # reaction must carry the same integrated impulse.

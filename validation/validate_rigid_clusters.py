@@ -103,7 +103,7 @@ def main() -> None:
             rigid_state, body_center, body_orientation, body_linear, body_angular,
             body_mass, body_inverse_inertia, body_half_extent,
             body_force, body_torque, dt,
-            0.0, 0.0, 100.0, 100.0, 100.0, 100.0,
+            0.0, 0.0, 100.0, 100.0, 100.0, 0.0, 0.0, 100.0,
         ],
         device=device,
     )
@@ -149,6 +149,10 @@ def main() -> None:
         body_half_extent,
         wp.array(np.asarray([[10.0, 1.0, 1.0]], dtype=np.float32), dtype=wp.vec3, device=device),
     )
+    wp.copy(
+        body_mass,
+        wp.array(np.asarray([500000.0], dtype=np.float32), dtype=float, device=device),
+    )
     wp.launch(clear_body_accumulators, dim=1, inputs=[body_force, body_torque], device=device)
     wp.launch(
         integrate_rigid_bodies,
@@ -156,14 +160,18 @@ def main() -> None:
         inputs=[
             rigid_state, body_center, body_orientation, body_linear, body_angular,
             body_mass, body_inverse_inertia, body_half_extent, body_force, body_torque, dt,
-            0.0, 0.0, 3.0, 22.0, 6.0, 10.0,
+            0.0, 0.0, 3.0, 22.0, 6.0, 50000.0, 1.5, 10.0,
         ],
         device=device,
     )
     wp.synchronize_device(device)
     capped_linear = body_linear.numpy()[0]
     capped_angular = body_angular.numpy()[0]
-    if np.linalg.norm(capped_linear) > 22.0001 or capped_linear[1] > 6.0001:
+    expected_heavy_upward_limit = 6.0 * np.sqrt(50000.0 / 500000.0)
+    if (
+        np.linalg.norm(capped_linear) > 22.0001
+        or capped_linear[1] > expected_heavy_upward_limit + 1.0e-4
+    ):
         raise AssertionError(f"rigid linear speed cap failed: {capped_linear}")
     expected_angular_limit = 10.0 / np.linalg.norm([10.0, 1.0, 1.0])
     if np.linalg.norm(capped_angular) > expected_angular_limit + 1.0e-4:

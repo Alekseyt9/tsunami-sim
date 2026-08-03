@@ -11,10 +11,12 @@ from hybrid_kernels import (
     accumulate_rigid_sample_bottom,
     accumulate_rigid_proxy_boundaries,
     accumulate_rigid_proxy_contacts,
+    accumulate_rigid_proxy_contacts_bvh,
     clear_body_accumulators,
     clear_rigid_sample_bottom,
     project_rigid_samples_above_ground,
     reactivate_rigid_after_impact,
+    update_rigid_proxy_bounds,
 )
 from rigid_clusters import fit_rigid_collision_proxy
 
@@ -43,7 +45,7 @@ def main() -> None:
     orientation = wp.array(
         [[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]], dtype=wp.quat, device=device
     )
-    linear = wp.array([[0.0, 0.0, 0.0], [-1.0, 0.0, 2.0]], dtype=wp.vec3, device=device)
+    linear = wp.array([[0.0, 0.0, 0.0], [-8.0, 0.0, 2.0]], dtype=wp.vec3, device=device)
     angular = wp.zeros(2, dtype=wp.vec3, device=device)
     mass = wp.array([1000.0, 1000.0], dtype=float, device=device)
     force = wp.zeros((2, 3), dtype=float, device=device)
@@ -56,7 +58,7 @@ def main() -> None:
         accumulate_rigid_proxy_contacts, dim=1,
         inputs=[pair_left, pair_right, rigid, enabled, local_center, extent, material,
                 center, orientation, linear, angular, mass, force, torque, peak,
-                3200.0, 1800.0, 0.10], device=device,
+                3200.0, 0.9, 1800.0, 0.10, 45.0, 6.0], device=device,
     )
     wp.synchronize_device(device)
     force_host = force.numpy()
@@ -70,8 +72,41 @@ def main() -> None:
     np.testing.assert_allclose(world_torque, 0.0, atol=2.0e-3)
     if force_host[0, 0] >= 0.0 or force_host[0, 2] <= 0.0:
         raise AssertionError(f"proxy normal/friction direction is wrong: {force_host[0]}")
-    if not np.all(peak.numpy() > 120.0):
+    if not np.all((peak.numpy() > 30.0) & (peak.numpy() <= 45.0001)):
         raise AssertionError("proxy impact did not reach the deformable-reactivation threshold")
+
+    # The GPU BVH broadphase must produce the same narrowphase forces as the
+    # legacy all-pairs path while visiting only overlapping AABBs.
+    legacy_force = force_host.copy()
+    legacy_torque = torque_host.copy()
+    legacy_peak = peak.numpy().copy()
+    force.zero_()
+    torque.zero_()
+    peak.zero_()
+    bounds_lower = wp.zeros(2, dtype=wp.vec3, device=device)
+    bounds_upper = wp.zeros(2, dtype=wp.vec3, device=device)
+    candidate_count = wp.zeros(1, dtype=wp.int32, device=device)
+    contact_count = wp.zeros(1, dtype=wp.int32, device=device)
+    wp.launch(
+        update_rigid_proxy_bounds, dim=2,
+        inputs=[rigid, enabled, local_center, extent, center, orientation,
+                bounds_lower, bounds_upper, 0.03], device=device,
+    )
+    wp.synchronize_device(device)
+    bvh = wp.Bvh(bounds_lower, bounds_upper, constructor="lbvh")
+    wp.launch(
+        accumulate_rigid_proxy_contacts_bvh, dim=2,
+        inputs=[bvh.id, bounds_lower, bounds_upper, rigid, enabled, local_center,
+                extent, material, center, orientation, linear, angular, mass,
+                force, torque, peak, candidate_count, contact_count,
+                3200.0, 0.9, 1800.0, 0.10, 45.0, 6.0], device=device,
+    )
+    wp.synchronize_device(device)
+    np.testing.assert_allclose(force.numpy(), legacy_force, rtol=2.0e-5, atol=1.0e-3)
+    np.testing.assert_allclose(torque.numpy(), legacy_torque, rtol=2.0e-5, atol=1.0e-3)
+    np.testing.assert_allclose(peak.numpy(), legacy_peak, rtol=2.0e-5, atol=1.0e-5)
+    if int(candidate_count.numpy()[0]) != 1 or int(contact_count.numpy()[0]) != 1:
+        raise AssertionError("BVH did not emit exactly one overlapping proxy pair")
 
     # A separate body crosses the ground only through its proxy. The body-level
     # contact must push it upward without requiring any particle boundary splats.
@@ -81,8 +116,9 @@ def main() -> None:
     wp.launch(
         accumulate_rigid_proxy_boundaries, dim=1,
         inputs=[rigid, enabled, local_center, extent, material, ground_center, orientation,
-                linear, angular, ground_force, ground_torque, 100.0, -100.0, 100.0, 100.0,
-                4.0e6, 1.8e4, 1800.0, 0.10], device=device,
+                linear, angular, mass, ground_force, ground_torque,
+                100.0, -100.0, 100.0, 100.0,
+                4.0e6, 1.8e4, 0.9, 1800.0, 0.10, 45.0], device=device,
     )
     wp.synchronize_device(device)
     if ground_force.numpy()[0, 1] <= 0.0:
@@ -126,7 +162,7 @@ def main() -> None:
     reactivated = wp.zeros(1, dtype=wp.int32, device=device)
     wp.launch(
         reactivate_rigid_after_impact, dim=2,
-        inputs=[rigid, peak, reactivated, 120.0], device=device,
+        inputs=[rigid, peak, reactivated, 32.0], device=device,
     )
     wp.synchronize_device(device)
     if np.any(rigid.numpy() != 0) or int(reactivated.numpy()[0]) != 2:

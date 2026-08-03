@@ -120,8 +120,15 @@ def inject_wave_train_pulse(
     if dh <= 0.0:
         return
     previous = state[ix, iz]
-    velocity = background_current + pulse_speed * dh / wp.max(previous[0] + dh, 1.0e-5)
-    added_momentum = dh * velocity
+    # ``dh`` is only the tiny increment added during this solver substep.  The
+    # previous expression multiplied the requested pulse speed by dh / h, so
+    # as dt became smaller the second wave lost essentially all of its forward
+    # impulse and degenerated into a slow water-level rise.  Treat the injected
+    # layer as a finite incoming bore: its conserved volume enters at the
+    # background current plus the configured pulse speed.  Existing cell
+    # momentum is retained and the shallow-water solver then spreads the bore.
+    injection_velocity = background_current + pulse_speed
+    added_momentum = dh * injection_velocity
     state[ix, iz] = wp.vec3(previous[0] + dh, previous[1], previous[2] + added_momentum)
     area = cell_size * cell_size
     wp.atomic_add(injected_volume, 0, dh * area)

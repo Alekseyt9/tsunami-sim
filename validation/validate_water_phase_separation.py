@@ -80,6 +80,7 @@ def main() -> None:
     mass = wp.array(mass_before, dtype=float, device=device)
     volume = wp.array(np.full(count, 0.125, dtype=np.float32), dtype=float, device=device)
     rho = wp.array(np.full(count, 1000.0, dtype=np.float32), dtype=float, device=device)
+    pressure = wp.zeros(count, dtype=float, device=device)
     level = wp.zeros(count, dtype=wp.int32, device=device)
     active = wp.ones(count, dtype=wp.int32, device=device)
     deferred = wp.zeros((count, 3), dtype=float, device=device)
@@ -88,8 +89,9 @@ def main() -> None:
     grid.build(x, 2.6)
     wp.launch(
         compute_fluid_forces_multirate, dim=count,
-        inputs=[grid.id, x, v, radius, mass, volume, kind, phase, rho, level, active,
-                deferred, acceleration, solid_force, 1000.0, 140.0, 1.08, 0.1, 0.02,
+        inputs=[grid.id, x, v, radius, mass, volume, kind, phase, rho, pressure,
+                level, active,
+                deferred, acceleration, solid_force, 1000.0, 0.1, 0.02,
                 2.6, 1.0e-4], device=device,
     )
     wp.synchronize_device(device)

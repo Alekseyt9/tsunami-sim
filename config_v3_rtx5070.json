@@ -110,12 +110,12 @@
       "forced_capture_depth": 0.75,
       "wave_train": {
         "enabled": true,
-        "start_seconds": 7.0,
-        "duration_seconds": 3.0,
-        "height": 4.5,
+        "start_seconds": 10.0,
+        "duration_seconds": 2.0,
+        "height": 6.0,
         "speed": 14.0,
         "background_current": 5.0,
-        "length_m": 30.0
+        "length_m": 24.0
       }
     },
     "activation_force_per_mass": 8.0,
@@ -158,6 +158,12 @@
       "impact_acceleration_trigger": 25.0,
       "preimpact_margin": 6.0
     },
+    "structural_adjacency": {
+      "enabled": true,
+      "compact_contact_candidates": false,
+      "contact_grid_radius_scale": 2.05,
+      "maximum_entries": 80000000
+    },
     "fragment_clustering": {
       "schema_version": 2,
       "enabled": true,
@@ -188,27 +194,39 @@
       "fully_damaged_threshold": 0.95,
       "release_damage_fraction": 0.50,
       "maximum_internal_velocity_rms": 2.5,
+      "plastic_rigidize_position_rms": 0.75,
+      "plastic_rigidize_release_fraction": 0.35,
       "linear_damping": 0.12,
       "angular_damping": 0.20,
       "maximum_angular_speed": 3.0,
       "maximum_linear_speed": 22.0,
       "maximum_upward_speed": 6.0,
+      "upward_speed_reference_mass": 50000.0,
+      "minimum_mass_upward_speed": 1.5,
       "maximum_tip_speed": 10.0,
       "ground_tangential_retention": 0.985,
       "boundary_stiffness": 4000000.0,
       "boundary_damping": 18000.0,
       "contact_normal_damping": 3200.0,
       "contact_tangential_damping": 1800.0,
-      "reactivate_acceleration": 120.0,
+      "reactivate_acceleration": 32.0,
       "collision_proxy": {
         "enabled": true,
+        "broadphase": "auto",
+        "bvh_minimum_proxies": 2048,
+        "bvh_margin": 0.03,
+        "bvh_refit_every_substeps": 16,
         "minimum_particles": 12,
         "padding_scale": 0.7,
-        "maximum_penetration": 0.35
+        "maximum_penetration": 0.12,
+        "normal_damping_ratio": 0.9,
+        "maximum_contact_acceleration": 45.0,
+        "minimum_reactivation_closing_speed": 6.0
       }
     },
     "multirate": {
       "enabled": true,
+      "precompute_pressure": true,
       "fine_radius": 0.3,
       "active_speed": 8.0,
       "active_damage": 0.02,

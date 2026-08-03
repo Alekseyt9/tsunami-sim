@@ -25,6 +25,11 @@ def simulate(levels_host: np.ndarray, steps: int = 4):
     kind = wp.array(np.zeros(2, dtype=np.int32), dtype=wp.int32, device=device)
     phase = wp.zeros(2, dtype=wp.int32, device=device)
     rho = wp.array(np.full(2, 1012.0, dtype=np.float32), dtype=float, device=device)
+    stiffness = 1000.0 * 140.0 * 140.0 / 7.0
+    pressure_value = stiffness * ((1012.0 / 1000.0) ** 7.0 - 1.0)
+    pressure = wp.array(
+        np.full(2, pressure_value, dtype=np.float32), dtype=float, device=device
+    )
     levels = wp.array(levels_host.astype(np.int32), dtype=wp.int32, device=device)
     active = wp.ones(2, dtype=wp.int32, device=device)
     deferred = wp.zeros((2, 3), dtype=float, device=device)
@@ -40,8 +45,9 @@ def simulate(levels_host: np.ndarray, steps: int = 4):
             compute_fluid_forces_multirate,
             dim=2,
             inputs=[
-                grid.id, position, velocity, radius, mass, volume, kind, phase, rho, levels, active,
-                deferred, acceleration, solid_force, 1000.0, 140.0, 1.08, 0.0, 0.0, 2.0, dt,
+                grid.id, position, velocity, radius, mass, volume, kind, phase, rho, pressure,
+                levels, active,
+                deferred, acceleration, solid_force, 1000.0, 0.0, 0.0, 2.0, dt,
             ],
             device=device,
         )
