@@ -311,6 +311,7 @@ def compute_clustered_solid_forces(
     material: wp.array(dtype=wp.int32),
     structural_class: wp.array(dtype=wp.int32),
     building_id: wp.array(dtype=wp.int32),
+    building_activation_exposure: wp.array(dtype=float),
     building_damage_integral: wp.array(dtype=float),
     building_structural_volume: wp.array(dtype=float),
     fragment_id: wp.array(dtype=wp.int32),
@@ -323,6 +324,7 @@ def compute_clustered_solid_forces(
     acceleration: wp.array(dtype=wp.vec3),
     max_support: float,
     dt: float,
+    activation_required_seconds: float,
     internal_stiffness_multiplier: float,
     damage_rate: float,
     propagation_threshold: float,
@@ -334,6 +336,7 @@ def compute_clustered_solid_forces(
     facade_support_loss_collapse_threshold: float,
     facade_support_loss_damage_rate: float,
     facade_unsupported_damage_rate: float,
+    structural_unsupported_damage_rate: float,
     elastic_force_cap_multiplier: float,
     compression_force_cap_multiplier: float,
 ):
@@ -372,9 +375,27 @@ def compute_clustered_solid_forces(
         facade_support_loss_collapse_threshold,
         facade_support_loss_damage_rate,
     )
-    gravity_fraction = wp.max(local_damage * local_damage, building_collapse)
+    # Dormant buildings returned above through fixed[i] != 0.  Every movable
+    # structural particle therefore belongs to an activated building (or is
+    # locally released glass) and must carry its real self-weight.  The former
+    # damage^2 ramp made intact upper storeys effectively massless, so they
+    # could remain vertical above a destroyed base instead of loading the
+    # remaining columns and initiating progressive collapse.
+    # The authored rest lattice represents a statically preloaded building.
+    # Do not apply gravity a second time merely because a validation/debug
+    # configuration unlocks a dry building. A real hydrodynamic activation,
+    # local impact, or load-path loss removes that rest-state compensation.
+    gravity_fraction = float(0.0)
+    if (
+        bid < 0
+        or building_activation_exposure[bid] >= activation_required_seconds
+        or building_collapse > 0.0
+    ):
+        gravity_fraction = 1.0
     force = solid_force[i]
     hydro_loaded = impact_impulse[i] >= material_impact_impulse_threshold(structural_class[i])
+    if hydro_loaded:
+        gravity_fraction = 1.0
     facade_particle = structural_class[i] == STRUCT_WALL or structural_class[i] == STRUCT_GLASS
     has_local_support = int(0)
     query = wp.hash_grid_query(grid, xi, max_support)
@@ -399,7 +420,13 @@ def compute_clustered_solid_forces(
         # it or by a nearby intact diaphragm/frame member.  This is evaluated
         # in the deformed configuration: once the lower wall has moved away,
         # lateral springs can no longer suspend the upper panel indefinitely.
-        if facade_particle and bonded and damage[j] < 0.90:
+        neighbour_has_foundation_path = (
+            neighbour_fid < 0 or fragment_support[neighbour_fid] > 0.5
+        )
+        if (
+            facade_particle and bonded and damage[j] < 0.90
+            and neighbour_has_foundation_path
+        ):
             horizontal_rest2 = rest_delta[0] * rest_delta[0] + rest_delta[2] * rest_delta[2]
             below = (
                 rest_delta[1] < -0.25 * bond_range
@@ -513,6 +540,18 @@ def compute_clustered_solid_forces(
         # collide instead of disappearing into dust.
         gravity_fraction = 1.0
         local_damage += dt * facade_unsupported_damage_rate
+    elif (
+        fid >= 0 and fragment_support[fid] < 0.5
+        and ri[1] > facade_support_loss_minimum_elevation and not body_rigid
+    ):
+        # Once a beam/column/core fragment has no capacity-rated route to the
+        # foundation, the few residual joints carry the whole unsupported
+        # mass. Let those joints progressively fail according to their role;
+        # otherwise a single numerical spring can suspend an upper tower.
+        local_damage += (
+            dt * structural_unsupported_damage_rate
+            * structural_damage_rate_multiplier(structural_class[i])
+        )
     if body_rigid:
         gravity_fraction = 1.0
     force += wp.vec3(0.0, -9.81 * mass[i] * gravity_fraction, 0.0)
@@ -955,12 +994,16 @@ def integrate_rigid_bodies(
     body_angular_velocity: wp.array(dtype=wp.vec3),
     body_mass: wp.array(dtype=float),
     body_inverse_inertia: wp.array(dtype=wp.mat33),
+    body_half_extent: wp.array(dtype=wp.vec3),
     body_force: wp.array2d(dtype=float),
     body_torque: wp.array2d(dtype=float),
     dt: float,
     linear_damping: float,
     angular_damping: float,
     maximum_angular_speed: float,
+    maximum_linear_speed: float,
+    maximum_upward_speed: float,
+    maximum_tip_speed: float,
 ):
     body = wp.tid()
     if rigid_state[body] == 0 or body_mass[body] <= 0.0:
@@ -974,10 +1017,25 @@ def integrate_rigid_bodies(
     angular_velocity = body_angular_velocity[body] + wp.quat_rotate(orientation, local_alpha) * dt
     linear_velocity *= wp.exp(-linear_damping * dt)
     angular_velocity *= wp.exp(-angular_damping * dt)
+    if maximum_upward_speed > 0.0 and linear_velocity[1] > maximum_upward_speed:
+        linear_velocity = wp.vec3(
+            linear_velocity[0], maximum_upward_speed, linear_velocity[2]
+        )
+    linear_speed = wp.length(linear_velocity)
+    if maximum_linear_speed > 0.0 and linear_speed > maximum_linear_speed:
+        linear_velocity *= maximum_linear_speed / linear_speed
     angular_speed = wp.length(angular_velocity)
-    if angular_speed > maximum_angular_speed:
-        angular_velocity *= maximum_angular_speed / angular_speed
-        angular_speed = maximum_angular_speed
+    angular_limit = maximum_angular_speed
+    if maximum_tip_speed > 0.0:
+        body_radius = wp.max(wp.length(body_half_extent[body]), 0.25)
+        size_limit = maximum_tip_speed / body_radius
+        if angular_limit <= 0.0:
+            angular_limit = size_limit
+        else:
+            angular_limit = wp.min(angular_limit, size_limit)
+    if angular_limit > 0.0 and angular_speed > angular_limit:
+        angular_velocity *= angular_limit / angular_speed
+        angular_speed = angular_limit
     if angular_speed * dt > 1.0e-8:
         delta = wp.quat_from_axis_angle(angular_velocity / angular_speed, angular_speed * dt)
         orientation = wp.normalize(delta * orientation)
@@ -985,6 +1043,67 @@ def integrate_rigid_bodies(
     body_orientation[body] = orientation
     body_linear_velocity[body] = linear_velocity
     body_angular_velocity[body] = angular_velocity
+
+
+@wp.kernel
+def clear_rigid_sample_bottom(sample_bottom: wp.array(dtype=float)):
+    body = wp.tid()
+    sample_bottom[body] = 1.0e9
+
+
+@wp.kernel
+def accumulate_rigid_sample_bottom(
+    radius: wp.array(dtype=float),
+    kind: wp.array(dtype=wp.int32),
+    fragment_id: wp.array(dtype=wp.int32),
+    rigid_state: wp.array(dtype=wp.int32),
+    rigid_local_position: wp.array(dtype=wp.vec3),
+    body_center: wp.array(dtype=wp.vec3),
+    body_orientation: wp.array(dtype=wp.quat),
+    sample_bottom: wp.array(dtype=float),
+):
+    """Find the real sample-union floor, not the bottom of one giant OBB."""
+    particle = wp.tid()
+    body = fragment_id[particle]
+    if kind[particle] == 0 or body < 0 or rigid_state[body] == 0:
+        return
+    world = body_center[body] + wp.quat_rotate(
+        body_orientation[body], rigid_local_position[particle]
+    )
+    wp.atomic_min(sample_bottom, body, world[1] - radius[particle])
+
+
+@wp.kernel
+def project_rigid_samples_above_ground(
+    rigid_state: wp.array(dtype=wp.int32),
+    sample_bottom: wp.array(dtype=float),
+    body_center: wp.array(dtype=wp.vec3),
+    body_linear_velocity: wp.array(dtype=wp.vec3),
+    body_angular_velocity: wp.array(dtype=wp.vec3),
+    tangential_retention: float,
+):
+    """Non-penetration safety projection after compliant ground contact.
+
+    Penalty forces provide weight, friction and torque. This final projection
+    only removes numerical tunnelling, which previously accumulated whenever
+    a massive fragment's weight exceeded the capped penalty force.
+    """
+    body = wp.tid()
+    if rigid_state[body] == 0:
+        return
+    bottom = sample_bottom[body]
+    if bottom < 0.0:
+        center = body_center[body]
+        center = wp.vec3(center[0], center[1] - bottom, center[2])
+        linear = body_linear_velocity[body]
+        linear = wp.vec3(
+            linear[0] * tangential_retention,
+            wp.max(linear[1], 0.0),
+            linear[2] * tangential_retention,
+        )
+        body_center[body] = center
+        body_linear_velocity[body] = linear
+        body_angular_velocity[body] *= tangential_retention
 
 
 @wp.kernel
@@ -1527,6 +1646,7 @@ def raster_facade_color(
     fragment_support: wp.array(dtype=float),
     particle_damage: wp.array(dtype=float),
     fragment_fracture_energy: wp.array(dtype=float),
+    triangle_order: wp.array(dtype=wp.int32),
     depth: wp.array(dtype=float),
     color: wp.array(dtype=wp.vec3),
     cam: wp.vec3,
@@ -1538,8 +1658,9 @@ def raster_facade_color(
     height: int,
     maximum_stretch: float,
     crack_strength: float,
+    architectural_overlay_tolerance: float,
 ):
-    triangle = wp.tid()
+    triangle = triangle_order[wp.tid()]
     panel = triangle // 2
     if panel_mode[panel] != 0:
         owner = owner_fragment[panel]
@@ -1602,7 +1723,14 @@ def raster_facade_color(
             if w0 >= 0.0 and w1 >= 0.0 and w2 >= 0.0:
                 z = w0 * a[2] + w1 * b[2] + w2 * c[2]
                 index = py * width + px
-                if z <= depth[index] + 0.02:
+                depth_tolerance = 0.02
+                if panel_mode[panel] == 0:
+                    # The conservative collision/cut-cell surface may sit up
+                    # to one particle radius in front of the authored facade.
+                    # Draw the original architectural panel last within that
+                    # narrow shell so windows and palettes survive rigid LOD.
+                    depth_tolerance = architectural_overlay_tolerance
+                if z <= depth[index] + depth_tolerance:
                     pixel_color = base
                     if panel_mode[panel] == 0 and crack_strength > 0.0:
                         rest_point = rest_a * w0 + rest_b * w1 + rest_c * w2

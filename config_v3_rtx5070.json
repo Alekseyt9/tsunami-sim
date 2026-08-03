@@ -70,7 +70,8 @@
     },
     "debris_skin": {
       "enabled": true,
-      "cache": true
+      "cache": true,
+      "architectural_overlay_tolerance": 0.9
     },
     "crack_rendering": {
       "enabled": true,
@@ -112,7 +113,12 @@
       "maximum_samples_per_edge": 12,
       "intact_damage_threshold": 0.95,
       "maximum_bond_stretch": 1.6,
-      "minimum_intact_sample_fraction": 0.25
+      "minimum_intact_sample_fraction": 0.50,
+      "directed_gravity_paths": true,
+      "maximum_downward_step": 0.75,
+      "same_level_tolerance": 0.75,
+      "maximum_lateral_transfer": 6.0,
+      "minimum_load_capacity_fraction": 0.55
     },
     "solid_refinement": {
       "enabled": true,
@@ -145,6 +151,7 @@
         "facade_support_loss_collapse_threshold": 0.75,
         "facade_support_loss_damage_rate": 1.0,
         "facade_unsupported_damage_rate": 0.75,
+        "structural_unsupported_damage_rate": 1.5,
         "elastic_force_cap_multiplier": 1.25,
         "compression_force_cap_multiplier": 2.0
     },
@@ -156,9 +163,13 @@
       "fully_damaged_threshold": 0.95,
       "release_damage_fraction": 0.20,
       "maximum_internal_velocity_rms": 2.5,
-      "linear_damping": 0.015,
-      "angular_damping": 0.03,
-      "maximum_angular_speed": 18.0,
+      "linear_damping": 0.12,
+      "angular_damping": 0.20,
+      "maximum_angular_speed": 3.0,
+      "maximum_linear_speed": 22.0,
+      "maximum_upward_speed": 6.0,
+      "maximum_tip_speed": 10.0,
+      "ground_tangential_retention": 0.985,
       "boundary_stiffness": 4000000.0,
       "boundary_damping": 18000.0,
       "contact_normal_damping": 3200.0,

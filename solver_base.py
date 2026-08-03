@@ -321,6 +321,7 @@ class DelugeSolver:
                 "gpu_memory_used_mib": gpu_used_mib,
             }
             for optional_stat in ("active_buildings", "released_fragments", "rigid_clusters", "rigid_particles",
+                                  "rigid_supported_fragments",
                                   "rigid_reactivated_fragments", "rigid_collision_proxies", "rigid_proxy_pairs",
                                   "unsupported_fragments", "support_graph_edges", "support_graph_intact_edges",
                                   "fracture_energy_edges_visible",
@@ -371,6 +372,9 @@ class DelugeSolver:
                 "fluid_vertical_speed_max_m_s",
                 "solid_speed_p99_m_s", "solid_speed_max_m_s",
                 "solid_upward_speed_max_m_s", "solid_mass_upward_above_10m_s_percent",
+                "rigid_linear_speed_max_m_s", "rigid_upward_speed_max_m_s",
+                "rigid_angular_speed_max_rad_s", "rigid_tip_speed_max_m_s",
+                "rigid_fragment_extent_max_m",
                 "structural_slab_volume_m3", "structural_wall_volume_m3",
                 "structural_beam_volume_m3", "structural_column_volume_m3",
                 "structural_core_volume_m3", "structural_glass_volume_m3",
@@ -440,6 +444,7 @@ class DelugeSolver:
                 "peak_gpu_memory_used_mib": max(row["gpu_memory_used_mib"] for row in benchmark_rows),
             }
             for optional_stat in ("active_buildings", "released_fragments", "rigid_clusters", "rigid_particles",
+                                  "rigid_supported_fragments",
                                   "rigid_reactivated_fragments", "rigid_collision_proxies", "rigid_proxy_pairs",
                                   "unsupported_fragments", "support_graph_edges", "support_graph_intact_edges",
                                   "fracture_energy_edges_visible",

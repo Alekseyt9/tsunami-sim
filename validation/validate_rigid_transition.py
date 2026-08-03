@@ -46,8 +46,15 @@ def main() -> None:
     before_distances = np.linalg.norm(before[:, None, :] - before[None, :, :], axis=2)
 
     solver.update_rigid_clusters()
+    if solver.rigid_state_host[chosen] != 0:
+        raise AssertionError("supported fragment converted to rigid rubble prematurely")
+    solver.fragment_support_host[chosen] = 0.0
+    solver.fragment_support = wp.array(
+        solver.fragment_support_host, dtype=float, device=solver.device
+    )
+    solver.update_rigid_clusters()
     if solver.rigid_state_host[chosen] != 1:
-        raise AssertionError("eligible fragment was not converted to a rigid cluster")
+        raise AssertionError("detached eligible fragment was not converted to a rigid cluster")
     if solver.rigid_proxy_enabled_host[chosen] != 1:
         raise AssertionError("eligible rigid fragment did not receive a collision proxy")
     proxy_extent = solver.rigid_proxy_half_extent_host[chosen]

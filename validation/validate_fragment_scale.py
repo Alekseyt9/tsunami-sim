@@ -44,8 +44,20 @@ def main() -> None:
             raise AssertionError(f"fragment {fid} mixes structural families: {families}")
     if int(counts.max()) > 80:
         raise AssertionError(f"one structural-family fragment grew too large: {counts.max()}")
+    maximum_extent = 0.0
+    for fid in range(len(counts)):
+        points = arrays["rest_x"][fragment_id == fid]
+        maximum_extent = max(
+            maximum_extent, float(np.max(np.max(points, axis=0) - np.min(points, axis=0)))
+        )
+    if maximum_extent > 18.1:
+        raise AssertionError(
+            f"architectural fragment exceeds the restored apartment-scale bound: "
+            f"{maximum_extent:.3f} m"
+        )
     print(
-        f"PASS: {len(counts):,} apartment-scale fragments; "
+        f"PASS: {len(counts):,} restored apartment-scale fragments "
+        f"(max rest extent {maximum_extent:.2f} m); "
         f"coarse count min/median/p90/max={counts.min()}/{np.median(counts):.0f}/"
         f"{np.quantile(counts, 0.9):.0f}/{counts.max()}"
     )

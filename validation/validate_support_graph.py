@@ -63,9 +63,83 @@ def main() -> None:
     )
     if failed_edge[1] < 0.99:
         raise AssertionError("fully damaged boundary did not retain full fracture energy")
+
+    # An undirected graph can falsely support fragment 3 by travelling from
+    # the foundation up to fragment 2, back down to 3, then upward again.
+    # Directed gravity paths must stop at that downward edge.
+    detour_graph = type(graph)(
+        edge_fragments=np.asarray(((0, 1), (1, 2), (2, 3), (3, 4)), dtype=np.int32),
+        sample_offsets=np.arange(5, dtype=np.int32),
+        sample_pairs=np.asarray(((0, 1), (1, 2), (2, 3), (3, 4)), dtype=np.int32),
+        sample_rest_length=np.full(4, 3.0, dtype=np.float32),
+        anchored_fragments=np.asarray((True, False, False, False, False)),
+    )
+    detour_position = np.asarray(
+        ((0.0, 0.0, 0.0), (0.0, 3.0, 0.0), (0.0, 6.0, 0.0),
+         (1.0, 3.0, 0.0), (1.0, 6.0, 0.0)), dtype=np.float32,
+    )
+    detour_center = detour_position.copy()
+    detour_role = np.full(5, 2, dtype=np.int32)
+    directed, _ = evaluate_fragment_support(
+        detour_graph, detour_position, np.zeros(5, dtype=np.float32),
+        maximum_stretch=2.0,
+        fragment_rest_center=detour_center,
+        fragment_role=detour_role,
+    )
+    if directed.tolist() != [True, True, True, False, False]:
+        raise AssertionError(f"directed support admitted an up-down detour: {directed}")
+
+    # A horizontal diaphragm cannot transfer load across an unlimited chain,
+    # while many slightly offset vertical storeys must not consume that budget.
+    lateral_graph = type(graph)(
+        edge_fragments=np.asarray(((0, 1), (1, 2), (2, 3), (3, 4)), dtype=np.int32),
+        sample_offsets=np.arange(5, dtype=np.int32),
+        sample_pairs=np.asarray(((0, 1), (1, 2), (2, 3), (3, 4)), dtype=np.int32),
+        sample_rest_length=np.full(4, 4.0, dtype=np.float32),
+        anchored_fragments=np.asarray((True, False, False, False, False)),
+    )
+    lateral_position = np.asarray(
+        ((0.0, 0.0, 0.0), (0.2, 3.0, 0.0), (0.4, 6.0, 0.0),
+         (4.4, 6.0, 0.0), (8.4, 6.0, 0.0)), dtype=np.float32,
+    )
+    lateral_role = np.full(5, 1, dtype=np.int32)
+    limited, _ = evaluate_fragment_support(
+        lateral_graph, lateral_position, np.zeros(5, dtype=np.float32),
+        maximum_stretch=2.0,
+        fragment_rest_center=lateral_position,
+        fragment_role=lateral_role,
+        maximum_lateral_transfer=6.0,
+    )
+    if limited.tolist() != [True, True, True, True, False]:
+        raise AssertionError(f"lateral load-transfer budget failed: {limited}")
+
+    capacity_graph = type(graph)(
+        edge_fragments=np.asarray(((0, 1),), dtype=np.int32),
+        sample_offsets=np.asarray((0, 4), dtype=np.int32),
+        sample_pairs=np.asarray(((0, 1), (2, 3), (4, 5), (6, 7)), dtype=np.int32),
+        sample_rest_length=np.ones(4, dtype=np.float32),
+        anchored_fragments=np.asarray((True, False)),
+    )
+    capacity_position = np.asarray(
+        ((0, 0, 0), (0, 1, 0), (1, 0, 0), (1, 1, 0),
+         (2, 0, 0), (2, 1, 0), (3, 0, 0), (3, 1, 0)), dtype=np.float32,
+    )
+    capacity_damage = np.zeros(8, dtype=np.float32)
+    capacity_damage[[5, 7]] = 1.0
+    capacity_support, capacity_edges = evaluate_fragment_support(
+        capacity_graph, capacity_position, capacity_damage,
+        minimum_intact_sample_fraction=0.25,
+        fragment_rest_center=np.asarray(((1.5, 0.0, 0.0), (1.5, 1.0, 0.0)), dtype=np.float32),
+        fragment_role=np.asarray((4, 4), dtype=np.int32),
+        minimum_load_capacity_fraction=0.75,
+    )
+    if not bool(capacity_edges[0]) or capacity_support.tolist() != [True, False]:
+        raise AssertionError(
+            f"a half-destroyed boundary retained full load capacity: {capacity_support}"
+        )
     print(
-        "PASS: support is causal; subcritical tensile energy opens an irreversible crack "
-        "and failed boundaries retain full fracture energy"
+        "PASS: support is causal and directed upward; subcritical tensile energy opens "
+        "an irreversible crack and failed boundaries retain full fracture energy"
     )
 
 

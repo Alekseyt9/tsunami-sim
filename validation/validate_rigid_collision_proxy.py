@@ -8,9 +8,12 @@ import numpy as np
 import warp as wp
 
 from hybrid_kernels import (
+    accumulate_rigid_sample_bottom,
     accumulate_rigid_proxy_boundaries,
     accumulate_rigid_proxy_contacts,
     clear_body_accumulators,
+    clear_rigid_sample_bottom,
+    project_rigid_samples_above_ground,
     reactivate_rigid_after_impact,
 )
 from rigid_clusters import fit_rigid_collision_proxy
@@ -85,6 +88,41 @@ def main() -> None:
     if ground_force.numpy()[0, 1] <= 0.0:
         raise AssertionError("ground proxy did not generate an upward support force")
 
+    # Penalty contact alone used to let a very massive body keep tunnelling
+    # once its capped spring force fell below its weight. The post-contact
+    # sample-union projection must place the actual lowest sample on y=0.
+    penetrating_center = wp.array([[0.0, -1.0, 0.0]], dtype=wp.vec3, device=device)
+    penetrating_linear = wp.array([[2.0, -5.0, 1.0]], dtype=wp.vec3, device=device)
+    penetrating_angular = wp.array([[0.0, 1.0, 0.0]], dtype=wp.vec3, device=device)
+    sample_bottom = wp.zeros(1, dtype=float, device=device)
+    sample_radius = wp.array([0.2], dtype=float, device=device)
+    sample_kind = wp.ones(1, dtype=wp.int32, device=device)
+    sample_fragment = wp.zeros(1, dtype=wp.int32, device=device)
+    sample_local = wp.zeros(1, dtype=wp.vec3, device=device)
+    one_rigid = wp.ones(1, dtype=wp.int32, device=device)
+    one_orientation = wp.array(
+        [[0.0, 0.0, 0.0, 1.0]], dtype=wp.quat, device=device
+    )
+    wp.launch(clear_rigid_sample_bottom, dim=1, inputs=[sample_bottom], device=device)
+    wp.launch(
+        accumulate_rigid_sample_bottom, dim=1,
+        inputs=[sample_radius, sample_kind, sample_fragment, one_rigid, sample_local,
+                penetrating_center, one_orientation, sample_bottom], device=device,
+    )
+    wp.launch(
+        project_rigid_samples_above_ground, dim=1,
+        inputs=[one_rigid, sample_bottom, penetrating_center, penetrating_linear,
+                penetrating_angular, 0.985], device=device,
+    )
+    wp.synchronize_device(device)
+    projected_center = penetrating_center.numpy()[0]
+    projected_velocity = penetrating_linear.numpy()[0]
+    if projected_center[1] < 0.19999 or projected_velocity[1] < -1.0e-6:
+        raise AssertionError(
+            f"rigid sample ground projection failed: center={projected_center}, "
+            f"velocity={projected_velocity}"
+        )
+
     reactivated = wp.zeros(1, dtype=wp.int32, device=device)
     wp.launch(
         reactivate_rigid_after_impact, dim=2,
@@ -95,7 +133,7 @@ def main() -> None:
         raise AssertionError("strong proxy contact did not restore deformable fragments")
     print(
         "PASS: fitted convex OBB encloses its samples; SAT contact conserves force, "
-        "applies friction/ground support, and reactivates both fragments"
+        "applies friction/ground support, projects tunnelling samples, and reactivates both fragments"
     )
 
 

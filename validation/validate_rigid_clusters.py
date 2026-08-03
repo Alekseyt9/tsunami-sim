@@ -13,7 +13,7 @@ from hybrid_kernels import (  # noqa: E402
     integrate_rigid_bodies,
     scatter_rigid_particles,
 )
-from rigid_clusters import fit_rigid_cluster  # noqa: E402
+from rigid_clusters import fit_rigid_cluster, fit_rigid_cluster_to_reference  # noqa: E402
 
 
 def main() -> None:
@@ -39,6 +39,26 @@ def main() -> None:
     if not np.allclose(fit.angular_velocity, omega, atol=2.0e-6):
         raise AssertionError("angular momentum was not preserved by the fit")
 
+    # A deformed cloud must recover the small undeformed collision shape while
+    # keeping its current centre. This guards against multi-storey proxies
+    # fitted from stretched particles late in a collapse.
+    angle = np.deg2rad(27.0)
+    rotation = np.asarray(
+        [[np.cos(angle), 0.0, np.sin(angle)], [0.0, 1.0, 0.0],
+         [-np.sin(angle), 0.0, np.cos(angle)]], dtype=np.float32
+    )
+    distorted = center + (rotation @ local.T).T
+    distorted[0] += np.asarray([12.0, 0.0, 0.0], dtype=np.float32)
+    reference_fit = fit_rigid_cluster_to_reference(distorted, center + local, velocity, mass)
+    reference_extent = np.ptp(reference_fit.local_positions, axis=0)
+    if float(np.max(reference_extent)) > 2.001:
+        raise AssertionError(f"reference fit retained a stretched extent: {reference_extent}")
+    if not np.all(np.isfinite(reference_fit.orientation)):
+        raise AssertionError("reference fit produced an invalid orientation")
+    expected_center = (mass[:, None] * distorted).sum(axis=0) / mass.sum()
+    if not np.allclose(reference_fit.center, expected_center, atol=2.0e-6):
+        raise AssertionError("reference fit did not preserve the current mass centre")
+
     count = len(local)
     acceleration_value = np.asarray([0.8, -1.5, 0.35], dtype=np.float32)
     acceleration = np.repeat(acceleration_value[None, :], count, axis=0)
@@ -58,6 +78,9 @@ def main() -> None:
     body_angular = wp.array(fit.angular_velocity[None, :], dtype=wp.vec3, device=device)
     body_mass = wp.array(np.asarray([fit.mass], dtype=np.float32), dtype=float, device=device)
     body_inverse_inertia = wp.array(fit.inverse_inertia[None, :, :], dtype=wp.mat33, device=device)
+    body_half_extent = wp.array(
+        np.asarray([[1.0, 1.0, 1.0]], dtype=np.float32), dtype=wp.vec3, device=device
+    )
     body_force = wp.zeros((1, 3), dtype=float, device=device)
     body_torque = wp.zeros((1, 3), dtype=float, device=device)
 
@@ -78,8 +101,9 @@ def main() -> None:
         dim=1,
         inputs=[
             rigid_state, body_center, body_orientation, body_linear, body_angular,
-            body_mass, body_inverse_inertia, body_force, body_torque, dt,
-            0.0, 0.0, 100.0,
+            body_mass, body_inverse_inertia, body_half_extent,
+            body_force, body_torque, dt,
+            0.0, 0.0, 100.0, 100.0, 100.0, 100.0,
         ],
         device=device,
     )
@@ -110,8 +134,45 @@ def main() -> None:
     if shape_error > 3.0e-5:
         raise AssertionError(f"rigid shape drift is {shape_error}")
     momentum_error = float(np.max(np.abs(fit.mass * actual_velocity - fit.mass * expected_velocity)))
+
+    # A long fragment must use a size-dependent angular cap.  Otherwise even
+    # a nominal 18 rad/s limit launches a ten-metre tip at cinematic speeds.
+    wp.copy(
+        body_linear,
+        wp.array(np.asarray([[40.0, 20.0, 0.0]], dtype=np.float32), dtype=wp.vec3, device=device),
+    )
+    wp.copy(
+        body_angular,
+        wp.array(np.asarray([[10.0, 0.0, 0.0]], dtype=np.float32), dtype=wp.vec3, device=device),
+    )
+    wp.copy(
+        body_half_extent,
+        wp.array(np.asarray([[10.0, 1.0, 1.0]], dtype=np.float32), dtype=wp.vec3, device=device),
+    )
+    wp.launch(clear_body_accumulators, dim=1, inputs=[body_force, body_torque], device=device)
+    wp.launch(
+        integrate_rigid_bodies,
+        dim=1,
+        inputs=[
+            rigid_state, body_center, body_orientation, body_linear, body_angular,
+            body_mass, body_inverse_inertia, body_half_extent, body_force, body_torque, dt,
+            0.0, 0.0, 3.0, 22.0, 6.0, 10.0,
+        ],
+        device=device,
+    )
+    wp.synchronize_device(device)
+    capped_linear = body_linear.numpy()[0]
+    capped_angular = body_angular.numpy()[0]
+    if np.linalg.norm(capped_linear) > 22.0001 or capped_linear[1] > 6.0001:
+        raise AssertionError(f"rigid linear speed cap failed: {capped_linear}")
+    expected_angular_limit = 10.0 / np.linalg.norm([10.0, 1.0, 1.0])
+    if np.linalg.norm(capped_angular) > expected_angular_limit + 1.0e-4:
+        raise AssertionError(f"size-dependent rigid tip-speed cap failed: {capped_angular}")
     print(f"PASS: CUDA rigid cluster kept 8-particle shape; max distance error={shape_error:.3e}")
-    print(f"linear momentum error={momentum_error:.3e}; fit residual={fit.internal_velocity_rms:.3e} m/s")
+    print(
+        f"linear momentum error={momentum_error:.3e}; fit residual={fit.internal_velocity_rms:.3e} m/s; "
+        f"capped |v|={np.linalg.norm(capped_linear):.2f}, |omega|={np.linalg.norm(capped_angular):.2f}"
+    )
 
 
 if __name__ == "__main__":

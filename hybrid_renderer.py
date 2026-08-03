@@ -24,10 +24,12 @@ class HybridRenderer(ParticleRenderer):
     def __init__(self, width: int, height: int, camera: dict, device: str, skin_path: Path,
                  view_name: str = "main", maximum_panel_stretch: float = 1.8,
                  water_tangent_scale: float = 2.8, water_normal_scale: float = 2.45,
-                 crack_strength: float = 1.0):
+                 crack_strength: float = 1.0,
+                 architectural_overlay_tolerance: float = 0.9):
         super().__init__(width, height, camera, device)
         self.view_name = view_name
         self.maximum_panel_stretch = float(maximum_panel_stretch)
+        self.architectural_overlay_tolerance = float(architectural_overlay_tolerance)
         self.water_tangent_scale = float(water_tangent_scale)
         self.water_normal_scale = float(water_normal_scale)
         self.crack_strength = max(0.0, float(crack_strength))
@@ -44,6 +46,22 @@ class HybridRenderer(ParticleRenderer):
         self.panel_material = wp.array(material, dtype=wp.int32, device=device)
         self.panel_mode = wp.array(panel_mode, dtype=wp.int32, device=device)
         self.owner_fragment = wp.array(owner_fragment, dtype=wp.int32, device=device)
+        material_family = material // 10
+
+        def triangle_order(mask: np.ndarray):
+            panels = np.flatnonzero(mask).astype(np.int32, copy=False)
+            order = np.empty(len(panels) * 2, dtype=np.int32)
+            order[0::2] = panels * 2
+            order[1::2] = panels * 2 + 1
+            return wp.array(order, dtype=wp.int32, device=device)
+
+        # Three compact index lists preserve material priority without making
+        # every launch scan and reject the complete (potentially 600k+) skin.
+        self.color_passes = (
+            ("debris", triangle_order(panel_mode != 0)),
+            ("opaque", triangle_order((panel_mode == 0) & (material_family != 2))),
+            ("glass", triangle_order((panel_mode == 0) & (material_family == 2))),
+        )
         fragment_count = int(owner_fragment[owner_fragment >= 0].max()) + 1 if np.any(owner_fragment >= 0) else 1
         self.fragment_support = wp.ones(fragment_count, dtype=float, device=device)
         self.fragment_fracture_energy = wp.zeros(fragment_count, dtype=float, device=device)
@@ -119,14 +137,23 @@ class HybridRenderer(ParticleRenderer):
             )
             smooth_source, smooth_target = smooth_target, smooth_source
 
-        wp.launch(
-            raster_facade_color, dim=self.panel_count * 2,
-            inputs=[self.current_vertex, self.rest_vertex, self.anchor, self.panel_material,
-                    self.panel_mode, self.owner_fragment, self.fragment_support, arrays["damage"],
-                    self.fragment_fracture_energy,
-                    self.depth, self.color, *common, self.maximum_panel_stretch,
-                    self.crack_strength], device=self.device,
-        )
+        # Interior/cut surfaces first, then authored opaque panels, with glass
+        # last.  Wall backing and its window are only 9 cm apart and both pass
+        # the conservative depth tolerance.  Drawing all authored materials in
+        # one launch therefore allowed the backing wall to race with and
+        # randomly overwrite the window.  Ordered family passes make facade
+        # layering deterministic without letting debris cover the windows.
+        for _pass_name, triangle_order in self.color_passes:
+            if len(triangle_order) == 0:
+                continue
+            wp.launch(
+                raster_facade_color, dim=len(triangle_order),
+                inputs=[self.current_vertex, self.rest_vertex, self.anchor, self.panel_material,
+                        self.panel_mode, self.owner_fragment, self.fragment_support, arrays["damage"],
+                        self.fragment_fracture_energy, triangle_order,
+                        self.depth, self.color, *common, self.maximum_panel_stretch,
+                        self.crack_strength, self.architectural_overlay_tolerance], device=self.device,
+            )
         wp.launch(
             shade_water_surface, dim=pixel_count,
             inputs=[smooth_source, self.water_foam, self.depth, self.color, self.width, self.height], device=self.device,

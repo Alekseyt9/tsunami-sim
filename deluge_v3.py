@@ -37,6 +37,7 @@ from hybrid_kernels import (  # noqa: E402
     activate_buildings_from_hits,
     apply_building_activity,
     clear_body_accumulators,
+    clear_rigid_sample_bottom,
     classify_time_levels,
     compute_clustered_solid_forces,
     compute_density_multirate,
@@ -47,6 +48,8 @@ from hybrid_kernels import (  # noqa: E402
     integrate_multirate,
     mask_rigid_particles_as_fixed,
     refine_impacted_solids,
+    accumulate_rigid_sample_bottom,
+    project_rigid_samples_above_ground,
     reactivate_rigid_after_impact,
     scatter_rigid_particles,
     select_active_time_level,
@@ -59,11 +62,15 @@ from hybrid_model import (  # noqa: E402
     build_refinement_axes,
     evaluate_fragment_fracture_energy,
     evaluate_fragment_support,
+    rebaseline_fragment_support_graph,
     select_conservative_fluid_merges,
     write_facade_skin,
 )
 from hybrid_renderer import HybridRenderer  # noqa: E402
-from rigid_clusters import fit_rigid_cluster, fit_rigid_collision_proxy  # noqa: E402
+from rigid_clusters import (  # noqa: E402
+    fit_rigid_cluster_to_reference,
+    fit_rigid_collision_proxy,
+)
 from shallow_water import (  # noqa: E402
     ShallowWaterFarField,
     compact_float_particles,
@@ -362,6 +369,28 @@ class HybridDelugeSolver(DelugeSolver):
             self.fragment_building_host[unique_fragment] = building_host[
                 valid_fragment_particles[first]
             ]
+        self.fragment_rest_center_host = np.zeros((self.fragment_count, 3), dtype=np.float32)
+        fragment_volume_host = self.arrays["volume"][:self.count].numpy().astype(
+            np.float64, copy=False
+        )
+        if len(valid_fragment_particles):
+            fragment_weight = np.bincount(
+                self.fragment_host[valid_fragment_particles],
+                weights=fragment_volume_host[valid_fragment_particles],
+                minlength=self.fragment_count,
+            )
+            weighted_rest = np.zeros((self.fragment_count, 3), dtype=np.float64)
+            np.add.at(
+                weighted_rest,
+                self.fragment_host[valid_fragment_particles],
+                rest_host[valid_fragment_particles].astype(np.float64, copy=False)
+                * fragment_volume_host[valid_fragment_particles, None],
+            )
+            nonempty_fragment = fragment_weight > 0.0
+            self.fragment_rest_center_host[nonempty_fragment] = (
+                weighted_rest[nonempty_fragment]
+                / fragment_weight[nonempty_fragment, None]
+            ).astype(np.float32)
         self.last_unsupported_fragment_count = 0
         volume_host = self.arrays["volume"][:self.count].numpy()
         solid_building_mask = (kind_host != 0) & (building_host >= 0)
@@ -429,6 +458,9 @@ class HybridDelugeSolver(DelugeSolver):
                 float(self.v3_cfg.get("water_surface", {}).get("normal_scale", 2.45)),
                 float(self.v3_cfg.get("crack_rendering", {}).get("strength", 1.0))
                 if bool(self.v3_cfg.get("crack_rendering", {}).get("enabled", True)) else 0.0,
+                float(self.v3_cfg.get("debris_skin", {}).get(
+                    "architectural_overlay_tolerance", 0.9
+                )),
             )
             for name, camera in configured_views.items()
         }
@@ -467,6 +499,14 @@ class HybridDelugeSolver(DelugeSolver):
             float(policy.get("intact_damage_threshold", 0.95)),
             float(policy.get("maximum_bond_stretch", 1.60)),
             float(policy.get("minimum_intact_sample_fraction", 0.25)),
+            self.fragment_rest_center_host
+            if bool(policy.get("directed_gravity_paths", True)) else None,
+            self.fragment_role_host
+            if bool(policy.get("directed_gravity_paths", True)) else None,
+            float(policy.get("maximum_downward_step", 0.75)),
+            float(policy.get("same_level_tolerance", 0.75)),
+            float(policy.get("maximum_lateral_transfer", 6.0)),
+            float(policy.get("minimum_load_capacity_fraction", 0.55)),
         )
         self.fragment_support_host = support.astype(np.float32, copy=False)
         self.fragment_edge_intact_host = intact_edges
@@ -474,16 +514,49 @@ class HybridDelugeSolver(DelugeSolver):
             material_host = self.arrays["material"][:self.count].numpy()
         if structural_class_host is None:
             structural_class_host = self.arrays["structural_class"][:self.count].numpy()
+        previous_edge_energy = self.fragment_edge_fracture_energy_host
+        if len(previous_edge_energy) != len(self.fragment_support_graph.edge_fragments):
+            previous_edge_energy = np.zeros(
+                len(self.fragment_support_graph.edge_fragments), dtype=np.float32
+            )
         edge_energy, fragment_energy = evaluate_fragment_fracture_energy(
             self.fragment_support_graph,
             position_host,
             damage_host,
             material_host,
             structural_class_host,
-            self.fragment_edge_fracture_energy_host,
+            previous_edge_energy,
             float(self.v3_cfg.get("crack_rendering", {}).get("fracture_energy_onset", 0.35)),
         )
-        edge_energy[~intact_edges] = 1.0
+        # Structural LOD changes are not physical impacts.  Dormant buildings
+        # may accumulate crack energy only after an actual local contact or
+        # particle damage; once a building is active, ordinary deformation is
+        # sufficient.  Keep prior energy irreversible instead of clearing it.
+        causal_edge = np.zeros(len(edge_energy), dtype=bool)
+        if len(edge_energy):
+            edge_fragments = self.fragment_support_graph.edge_fragments
+            active_buildings = self.building_active.numpy().astype(bool, copy=False)
+            left_building = self.fragment_building_host[edge_fragments[:, 0]]
+            right_building = self.fragment_building_host[edge_fragments[:, 1]]
+            valid_left = (left_building >= 0) & (left_building < len(active_buildings))
+            valid_right = (right_building >= 0) & (right_building < len(active_buildings))
+            causal_edge[valid_left] |= active_buildings[left_building[valid_left]]
+            causal_edge[valid_right] |= active_buildings[right_building[valid_right]]
+
+            pair = self.fragment_support_graph.sample_pairs
+            if len(pair):
+                local_impact = self.arrays["local_impact_active"][:self.count].numpy()
+                sample_evidence = (
+                    (local_impact[pair[:, 0]] != 0)
+                    | (local_impact[pair[:, 1]] != 0)
+                    | (damage_host[pair[:, 0]] > 1.0e-5)
+                    | (damage_host[pair[:, 1]] > 1.0e-5)
+                )
+                causal_edge |= np.logical_or.reduceat(
+                    sample_evidence, self.fragment_support_graph.sample_offsets[:-1]
+                )
+            edge_energy[~causal_edge] = previous_edge_energy[~causal_edge]
+        edge_energy[(~intact_edges) & causal_edge] = 1.0
         if len(edge_energy):
             fragment_energy.fill(0.0)
             np.maximum.at(
@@ -507,6 +580,22 @@ class HybridDelugeSolver(DelugeSolver):
                 "disconnected from foundations"
             )
             self.last_unsupported_fragment_count = unsupported
+
+    def _rebaseline_fragment_support_after_refinement(self) -> None:
+        """Keep sparse support samples in the refined rest-coordinate system.
+
+        Adaptive 1->N refinement retains the parent index for one child but
+        moves that index away from the former parent centre.  The sparse graph
+        deliberately keeps the same representative pairs and irreversible
+        fracture state; only their undeformed length must be recomputed from
+        the children's rest positions.  Otherwise the LOD offset itself looks
+        like a large tensile strain and paints entire dormant facades cracked.
+        """
+        graph = self.fragment_support_graph
+        if not len(graph.sample_pairs):
+            return
+        rest = self.arrays["rest_x"][:self.count].numpy()
+        self.fragment_support_graph = rebaseline_fragment_support_graph(graph, rest)
 
     def _build_fragment_roles(self) -> np.ndarray:
         """Return the dominant structural role of each cohesive fragment by volume.
@@ -1117,6 +1206,7 @@ class HybridDelugeSolver(DelugeSolver):
         self.last_rigid_count = int(np.count_nonzero(state))
         self.rigid_active_count = self.last_rigid_count
         self.rigid_contact_acceleration_peak = wp.zeros(body_capacity, dtype=float, device=self.device)
+        self.rigid_sample_bottom = wp.zeros(body_capacity, dtype=float, device=self.device)
         self.rigid_reactivated_counter = wp.zeros(1, dtype=wp.int32, device=self.device)
         self.last_rigid_reactivated_count = 0
         if checkpoint is not None and checkpoint.exists():
@@ -1168,6 +1258,7 @@ class HybridDelugeSolver(DelugeSolver):
         damage = self.arrays["damage"][:self.count].numpy()
         base_fixed = self.base_fixed[:self.count].numpy()
         position = self.arrays["x"][:self.count].numpy()
+        rest_position = self.arrays["rest_x"][:self.count].numpy()
         velocity = self.arrays["v"][:self.count].numpy()
         mass = self.arrays["mass"][:self.count].numpy()
         radius = self.arrays["radius"][:self.count].numpy()
@@ -1183,6 +1274,13 @@ class HybridDelugeSolver(DelugeSolver):
         for fid in range(self.fragment_count):
             if self.rigid_state_host[fid] != 0:
                 continue
+            # A cohesive fragment may become a rigid rubble body only after
+            # its directed load path to the foundation is actually gone.
+            # Damage alone is not detachment: converting a still-supported
+            # upper section made intact towers float as giant rigid pieces.
+            if self.fragment_support_host[fid] > 0.5:
+                self.rigid_quiet_scans_host[fid] = 0
+                continue
             indices = np.flatnonzero((fragment == fid) & (kind != 0))
             if len(indices) < minimum_particles or np.any(base_fixed[indices] != 0):
                 self.rigid_quiet_scans_host[fid] = 0
@@ -1191,7 +1289,9 @@ class HybridDelugeSolver(DelugeSolver):
             if released_fraction < release_fraction:
                 self.rigid_quiet_scans_host[fid] = 0
                 continue
-            fit = fit_rigid_cluster(position[indices], velocity[indices], mass[indices])
+            fit = fit_rigid_cluster_to_reference(
+                position[indices], rest_position[indices], velocity[indices], mass[indices]
+            )
             if fit.internal_velocity_rms > maximum_residual:
                 self.rigid_quiet_scans_host[fid] = 0
                 continue
@@ -1213,7 +1313,7 @@ class HybridDelugeSolver(DelugeSolver):
             self.rigid_state_host[fid] = 1
             self.rigid_local_host[indices] = fit.local_positions
             center[fid] = fit.center
-            orientation[fid] = (0.0, 0.0, 0.0, 1.0)
+            orientation[fid] = fit.orientation
             linear_velocity[fid] = fit.linear_velocity
             angular_velocity[fid] = fit.angular_velocity
             body_mass[fid] = fit.mass
@@ -1362,12 +1462,15 @@ class HybridDelugeSolver(DelugeSolver):
             inputs=[self.grid.id, view, a["rest_x"][:self.count], a["v"][:self.count], a["radius"][:self.count],
                     a["mass"][:self.count], a["kind"][:self.count], a["material"][:self.count],
                     a["structural_class"][:self.count], a["building_id"][:self.count],
+                    self.building_activation_exposure,
                     self.building_damage_integral, self.building_structural_volume,
                     self.fragment_id[:self.count], self.rigid_state, self.fragment_support,
                     a["material_impact_impulse"][:self.count],
                     a["fixed"][:self.count],
                     a["damage"][:self.count], a["solid_force"][:self.count], a["acceleration"][:self.count],
-                    self.max_support, dt, float(clustering.get("internal_stiffness_multiplier", 2.0)),
+                    self.max_support, dt,
+                    float(self.v3_cfg.get("activation_required_seconds", 0.02)),
+                    float(clustering.get("internal_stiffness_multiplier", 2.0)),
                     float(clustering.get("damage_rate", 1.5)),
                     float(clustering.get("propagation_threshold", 0.65)),
                     float(clustering.get("max_damage_per_substep", 0.0004)),
@@ -1378,6 +1481,7 @@ class HybridDelugeSolver(DelugeSolver):
                     float(clustering.get("facade_support_loss_collapse_threshold", 0.75)),
                     float(clustering.get("facade_support_loss_damage_rate", 1.0)),
                     float(clustering.get("facade_unsupported_damage_rate", 0.75)),
+                    float(clustering.get("structural_unsupported_damage_rate", 1.5)),
                     float(clustering.get("elastic_force_cap_multiplier", 1.25)),
                     float(clustering.get("compression_force_cap_multiplier", 2.0))],
             device=self.device,
@@ -1459,10 +1563,33 @@ class HybridDelugeSolver(DelugeSolver):
                 integrate_rigid_bodies, dim=max(1, self.fragment_count),
                 inputs=[self.rigid_state, self.body_center, self.body_orientation,
                         self.body_linear_velocity, self.body_angular_velocity, self.body_mass,
-                        self.body_inverse_inertia, self.body_force, self.body_torque, dt,
+                        self.body_inverse_inertia, self.rigid_proxy_half_extent,
+                        self.body_force, self.body_torque, dt,
                         float(rigid_policy.get("linear_damping", 0.015)),
                         float(rigid_policy.get("angular_damping", 0.03)),
-                        float(rigid_policy.get("maximum_angular_speed", 18.0))],
+                        float(rigid_policy.get("maximum_angular_speed", 18.0)),
+                        float(rigid_policy.get("maximum_linear_speed", 22.0)),
+                        float(rigid_policy.get("maximum_upward_speed", 6.0)),
+                        float(rigid_policy.get("maximum_tip_speed", 10.0))],
+                device=self.device,
+            )
+            wp.launch(
+                clear_rigid_sample_bottom, dim=max(1, self.fragment_count),
+                inputs=[self.rigid_sample_bottom], device=self.device,
+            )
+            wp.launch(
+                accumulate_rigid_sample_bottom, dim=self.count,
+                inputs=[a["radius"][:self.count], a["kind"][:self.count],
+                        self.fragment_id[:self.count], self.rigid_state,
+                        self.rigid_local_position, self.body_center,
+                        self.body_orientation, self.rigid_sample_bottom],
+                device=self.device,
+            )
+            wp.launch(
+                project_rigid_samples_above_ground, dim=max(1, self.fragment_count),
+                inputs=[self.rigid_state, self.rigid_sample_bottom, self.body_center,
+                        self.body_linear_velocity, self.body_angular_velocity,
+                        float(rigid_policy.get("ground_tangential_retention", 0.985))],
                 device=self.device,
             )
             wp.launch(
@@ -1604,6 +1731,7 @@ class HybridDelugeSolver(DelugeSolver):
             self.fragment_counts_host = np.bincount(
                 valid_fragments, minlength=self.fragment_count
             ).astype(np.int32)
+            self._rebaseline_fragment_support_after_refinement()
             refined_by_role = self.refinement_counters.numpy()
             print(
                 f"  V3 structural refinement: {old_count:,} -> {self.count:,} particles "
@@ -1773,6 +1901,28 @@ class HybridDelugeSolver(DelugeSolver):
             self.last_rigid_count = rigid_count
         result["rigid_clusters"] = rigid_count
         result["rigid_particles"] = rigid_particles
+        rigid_mask_host = self.rigid_state_host != 0
+        result["rigid_supported_fragments"] = int(np.count_nonzero(
+            rigid_mask_host & (self.fragment_support_host > 0.5)
+        ))
+        if rigid_count:
+            body_linear_host = self.body_linear_velocity.numpy()[rigid_mask_host]
+            body_angular_host = self.body_angular_velocity.numpy()[rigid_mask_host]
+            body_extent_host = self.rigid_proxy_half_extent.numpy()[rigid_mask_host]
+            body_linear_speed = np.linalg.norm(body_linear_host, axis=1)
+            body_angular_speed = np.linalg.norm(body_angular_host, axis=1)
+            body_radius = np.linalg.norm(body_extent_host, axis=1)
+            result["rigid_linear_speed_max_m_s"] = float(np.max(body_linear_speed))
+            result["rigid_upward_speed_max_m_s"] = float(
+                np.max(body_linear_host[:, 1])
+            )
+            result["rigid_angular_speed_max_rad_s"] = float(np.max(body_angular_speed))
+            result["rigid_tip_speed_max_m_s"] = float(
+                np.max(body_angular_speed * body_radius)
+            )
+            result["rigid_fragment_extent_max_m"] = float(
+                np.max(2.0 * np.max(body_extent_host, axis=1))
+            )
         result["rigid_collision_proxies"] = int(np.count_nonzero(
             (self.rigid_proxy_enabled_host != 0) & (self.rigid_state_host != 0)
         ))
@@ -2157,9 +2307,14 @@ def main():
     parser.add_argument("--no-video", action="store_true")
     parser.add_argument("--duration", type=float, help="Override simulated duration for validation runs")
     parser.add_argument("--frames", type=int, help="Override output frame count")
+    parser.add_argument("--fps", type=float, help="Override output and progressive-video frame rate")
     args = parser.parse_args()
 
     cfg = json.loads(args.config.read_text(encoding="utf-8"))
+    if args.fps is not None:
+        if args.fps <= 0.0:
+            raise ValueError("--fps must be positive")
+        cfg["output_fps"] = float(args.fps)
     if args.duration is not None:
         if args.duration <= 0.0:
             raise ValueError("--duration must be positive")

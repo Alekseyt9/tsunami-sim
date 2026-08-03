@@ -13,7 +13,13 @@ import numpy as np
 HERE = Path(__file__).resolve().parent.parent
 
 from scene import ParticleScene, building_profile  # noqa: E402
-from hybrid_model import build_facade_skin, build_fragment_debris_skin, build_fragment_ids  # noqa: E402
+from hybrid_model import (  # noqa: E402
+    build_facade_skin,
+    build_fragment_cell_faces,
+    build_fragment_debris_skin,
+    build_fragment_ids,
+)
+from scene import STRUCT_WALL  # noqa: E402
 
 
 def main() -> None:
@@ -48,31 +54,30 @@ def main() -> None:
         state["radius"], state["structural_class"],
     )
     if not np.all(debris["panel_mode"] == 1) or set(debris["owner_fragment"]) != set(range(len(fragment_counts))):
-        raise AssertionError("debris hulls are not bound to every cohesive fragment")
+        raise AssertionError("debris cell surfaces are not bound to every cohesive fragment")
     if not np.isfinite(debris["vertex"]).all():
-        raise AssertionError("fragment debris skin contains invalid vertices")
+        raise AssertionError("fragment debris cell surface contains invalid vertices")
     debris_face_count = np.bincount(debris["owner_fragment"], minlength=len(fragment_counts))
     if np.any(debris_face_count < 4):
-        raise AssertionError("one or more fragment debris hulls is not a closed volume")
-    convex_mask = np.all(
-        np.isclose(debris["vertex"][:, 2], debris["vertex"][:, 3], atol=1.0e-6), axis=1
+        raise AssertionError("one or more fragment cell union is not a closed volume")
+    if np.any(np.all(np.isclose(debris["vertex"][:, 2], debris["vertex"][:, 3]), axis=1)):
+        raise AssertionError("legacy convex-hull triangles remain in the debris skin")
+
+    # An L-shaped set must retain its empty fourth cell. A global ConvexHull
+    # incorrectly covers that void with one solid polygon.
+    l_shape = np.asarray(((0, 0, 0), (1, 0, 0), (0, 1, 0)), dtype=np.float32)
+    l_faces = build_fragment_cell_faces(
+        l_shape, np.full(3, 0.48, dtype=np.float32),
+        np.full(3, STRUCT_WALL, dtype=np.int32), 0, 1.0,
     )
-    convex_fragments = np.unique(debris["owner_fragment"][convex_mask])
-    if len(convex_fragments) < int(0.98 * len(fragment_counts)):
-        raise AssertionError("too many fragment hulls fell back to axis-aligned boxes")
-    # Qhull triangles form a watertight surface: every undirected edge must
-    # belong to exactly two faces. Check representative fragments across the city.
-    sample_fragments = np.linspace(0, len(fragment_counts) - 1, 32, dtype=np.int32)
-    for fragment in sample_fragments:
-        triangles = debris["vertex"][(debris["owner_fragment"] == fragment) & convex_mask, :3]
-        edge_count: dict[tuple[tuple[float, ...], tuple[float, ...]], int] = {}
-        for triangle in triangles:
-            keys = [tuple(np.round(point, 5)) for point in triangle]
-            for edge in ((keys[0], keys[1]), (keys[1], keys[2]), (keys[2], keys[0])):
-                canonical = tuple(sorted(edge))
-                edge_count[canonical] = edge_count.get(canonical, 0) + 1
-        if edge_count and any(count != 2 for count in edge_count.values()):
-            raise AssertionError(f"fragment {fragment} convex debris hull is not watertight")
+    missing_center = np.asarray((1.0, 1.0), dtype=np.float32)
+    for center, size, normal, _material in l_faces:
+        if normal[2] < 0.5:
+            continue
+        lower = center[:2] - size[:2] * 0.5
+        upper = center[:2] + size[:2] * 0.5
+        if np.all(missing_center > lower + 1.0e-4) and np.all(missing_center < upper - 1.0e-4):
+            raise AssertionError("cell-union debris surface filled an L-shaped void")
 
     skin = build_facade_skin(cfg)
     material = skin["material"]
@@ -85,8 +90,8 @@ def main() -> None:
         raise AssertionError("styled facade contains invalid vertices")
     print(
         f"PASS: {len(signatures)} physical silhouettes, {sum(counts):,} coarse structural particles, "
-        f"{len(material):,} facade panels, {len(debris['material']):,} hidden convex debris triangles "
-        f"({len(convex_fragments):,}/{len(fragment_counts):,} convex fragments) "
+        f"{len(material):,} facade panels, {len(debris['material']):,} hidden cell-union faces "
+        f"for {len(fragment_counts):,} cohesive fragments "
         "and six wall/glass/roof palettes"
     )
 

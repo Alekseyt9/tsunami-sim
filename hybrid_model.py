@@ -58,6 +58,34 @@ class FragmentSupportGraph:
     anchored_fragments: np.ndarray
 
 
+def rebaseline_fragment_support_graph(
+    graph: FragmentSupportGraph,
+    rest_x: np.ndarray,
+) -> FragmentSupportGraph:
+    """Return ``graph`` with sample lengths measured in the current rest LOD.
+
+    Refinement keeps one child at the parent's particle index, so sparse sample
+    indices remain valid while their rest positions change.  Recomputing only
+    the undeformed lengths preserves edge topology and irreversible fracture
+    state without mistaking the refinement offset for elastic strain.
+    """
+    if not len(graph.sample_pairs):
+        return graph
+    pair = graph.sample_pairs
+    rest_length = np.linalg.norm(
+        rest_x[pair[:, 1]] - rest_x[pair[:, 0]], axis=1
+    ).astype(np.float32)
+    if not np.all(np.isfinite(rest_length)) or np.any(rest_length <= 1.0e-6):
+        raise ValueError("invalid support-graph rest length after structural refinement")
+    return FragmentSupportGraph(
+        graph.edge_fragments,
+        graph.sample_offsets,
+        graph.sample_pairs,
+        rest_length,
+        graph.anchored_fragments,
+    )
+
+
 def build_fragment_support_graph(
     rest_x: np.ndarray,
     radius: np.ndarray,
@@ -146,8 +174,23 @@ def evaluate_fragment_support(
     damage_threshold: float = 0.95,
     maximum_stretch: float = 1.60,
     minimum_intact_sample_fraction: float = 0.25,
+    fragment_rest_center: np.ndarray | None = None,
+    fragment_role: np.ndarray | None = None,
+    maximum_downward_step: float = 0.75,
+    same_level_tolerance: float = 0.75,
+    maximum_lateral_transfer: float = 0.0,
+    minimum_load_capacity_fraction: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return foundation-connected fragments and currently intact graph edges."""
+    """Return fragments with a physically directed path to the foundation.
+
+    Without rest centers this retains the legacy undirected reachability used
+    by small unit fixtures.  Production passes fragment centers and roles: a
+    load path may then propagate upward or approximately level, but cannot
+    travel up a facade, back down through another fragment and thereby suspend
+    an upper storey above a destroyed base.  Same-level transfer requires a
+    diaphragm or frame member, so wall/glass chains cannot support each other
+    cyclically in mid-air.
+    """
     edge_count = len(graph.edge_fragments)
     if edge_count == 0:
         return graph.anchored_fragments.copy(), np.empty(0, dtype=bool)
@@ -166,13 +209,157 @@ def evaluate_fragment_support(
 
     supported = graph.anchored_fragments.copy()
     live = graph.edge_fragments[edge_intact]
+    if fragment_rest_center is None or fragment_role is None:
+        for _ in range(len(supported)):
+            before = int(np.count_nonzero(supported))
+            if len(live):
+                from_left = supported[live[:, 0]]
+                from_right = supported[live[:, 1]]
+                supported[live[from_left, 1]] = True
+                supported[live[from_right, 0]] = True
+            if int(np.count_nonzero(supported)) == before:
+                break
+        return supported, edge_intact
+
+    center = np.asarray(fragment_rest_center, dtype=np.float32)
+    role = np.asarray(fragment_role, dtype=np.int32)
+    all_left, all_right = graph.edge_fragments[:, 0], graph.edge_fragments[:, 1]
+    all_dy = center[all_right, 1] - center[all_left, 1]
+    frame_roles = np.asarray((1, 3, 4, 5), dtype=np.int32)  # slab, beam, column, core
+    all_left_frame = np.isin(role[all_left], frame_roles)
+    all_right_frame = np.isin(role[all_right], frame_roles)
+    all_level = np.abs(all_dy) <= max(float(same_level_tolerance), 0.0)
+    all_frame_transfer = all_left_frame | all_right_frame
+    all_allow_left_to_right = (
+        (all_dy >= -float(maximum_downward_step))
+        & ((~all_level) | all_frame_transfer)
+        & (role[all_left] != 6)  # glass never carries a storey above it
+    )
+    all_allow_right_to_left = (
+        (-all_dy >= -float(maximum_downward_step))
+        & ((~all_level) | all_frame_transfer)
+        & (role[all_right] != 6)
+    )
+    left, right = live[:, 0], live[:, 1]
+    allow_left_to_right = all_allow_left_to_right[edge_intact]
+    allow_right_to_left = all_allow_right_to_left[edge_intact]
+    level = all_level[edge_intact]
+
+    minimum_capacity = max(float(minimum_load_capacity_fraction), 0.0)
+    local_capacity = np.ones(len(supported), dtype=np.float32)
+    live_edge_capacity = np.ones(len(live), dtype=np.float32)
+    if minimum_capacity > 0.0:
+        # Boolean reachability lets one surviving joint carry an arbitrarily
+        # large upper section. Approximate load capacity from the fraction of
+        # each fragment's originally available incoming boundary samples.
+        # This preserves redundancy but makes loss of most columns/diaphragms
+        # trigger a real progressive collapse.
+        baseline_incoming = np.zeros(len(supported), dtype=np.float32)
+        intact_incoming = np.zeros(len(supported), dtype=np.float32)
+        np.add.at(
+            baseline_incoming,
+            all_right[all_allow_left_to_right],
+            sample_count[all_allow_left_to_right],
+        )
+        np.add.at(
+            intact_incoming,
+            all_right[all_allow_left_to_right],
+            intact_count[all_allow_left_to_right],
+        )
+        np.add.at(
+            baseline_incoming,
+            all_left[all_allow_right_to_left],
+            sample_count[all_allow_right_to_left],
+        )
+        np.add.at(
+            intact_incoming,
+            all_left[all_allow_right_to_left],
+            intact_count[all_allow_right_to_left],
+        )
+        local_capacity = np.divide(
+            intact_incoming,
+            np.maximum(baseline_incoming, 1.0),
+            out=np.zeros_like(intact_incoming),
+        )
+        local_capacity[graph.anchored_fragments] = 1.0
+        live_edge_capacity = np.divide(
+            intact_count[edge_intact],
+            np.maximum(sample_count[edge_intact], 1),
+        ).astype(np.float32)
+    if maximum_lateral_transfer > 0.0:
+        # Track the shortest accumulated horizontal transfer from any local
+        # foundation anchor. Vertical columns cost almost nothing, while a
+        # chain of diaphragms crossing the entire building exhausts the load-
+        # redistribution budget instead of suspending a remote upper tower.
+        cost = np.full(len(supported), np.inf, dtype=np.float32)
+        cost[graph.anchored_fragments] = 0.0
+        horizontal_cost = np.linalg.norm(
+            center[right][:, (0, 2)] - center[left][:, (0, 2)], axis=1
+        ).astype(np.float32)
+        # Small plan offsets between a column and the member above it must not
+        # accumulate over every storey. Only diaphragm/same-level travel is a
+        # lateral redistribution; vertical propagation carries the current
+        # support column upward at zero additional budget.
+        horizontal_cost[~level] = 0.0
+        limit = float(maximum_lateral_transfer)
+        for _ in range(len(supported)):
+            previous = cost.copy()
+            left_candidate = cost[left] + horizontal_cost
+            right_candidate = cost[right] + horizontal_cost
+            valid_left = allow_left_to_right & (left_candidate <= limit)
+            valid_right = allow_right_to_left & (right_candidate <= limit)
+            np.minimum.at(cost, right[valid_left], left_candidate[valid_left])
+            np.minimum.at(cost, left[valid_right], right_candidate[valid_right])
+            if np.array_equal(cost, previous):
+                break
+        if minimum_capacity <= 0.0:
+            return cost <= limit, edge_intact
+        capacity = np.zeros(len(supported), dtype=np.float32)
+        capacity[graph.anchored_fragments] = 1.0
+        for _ in range(len(supported)):
+            previous_capacity = capacity.copy()
+            left_candidate = np.minimum(
+                np.minimum(capacity[left], live_edge_capacity), local_capacity[right]
+            )
+            right_candidate = np.minimum(
+                np.minimum(capacity[right], live_edge_capacity), local_capacity[left]
+            )
+            valid_left = allow_left_to_right & (cost[left] + horizontal_cost <= limit)
+            valid_right = allow_right_to_left & (cost[right] + horizontal_cost <= limit)
+            np.maximum.at(capacity, right[valid_left], left_candidate[valid_left])
+            np.maximum.at(capacity, left[valid_right], right_candidate[valid_right])
+            if np.array_equal(capacity, previous_capacity):
+                break
+        return (cost <= limit) & (capacity >= minimum_capacity), edge_intact
+
+    if minimum_capacity > 0.0:
+        capacity = np.zeros(len(supported), dtype=np.float32)
+        capacity[graph.anchored_fragments] = 1.0
+        for _ in range(len(supported)):
+            previous_capacity = capacity.copy()
+            left_candidate = np.minimum(
+                np.minimum(capacity[left], live_edge_capacity), local_capacity[right]
+            )
+            right_candidate = np.minimum(
+                np.minimum(capacity[right], live_edge_capacity), local_capacity[left]
+            )
+            np.maximum.at(
+                capacity, right[allow_left_to_right], left_candidate[allow_left_to_right]
+            )
+            np.maximum.at(
+                capacity, left[allow_right_to_left], right_candidate[allow_right_to_left]
+            )
+            if np.array_equal(capacity, previous_capacity):
+                break
+        return capacity >= minimum_capacity, edge_intact
+
     for _ in range(len(supported)):
         before = int(np.count_nonzero(supported))
         if len(live):
-            from_left = supported[live[:, 0]]
-            from_right = supported[live[:, 1]]
-            supported[live[from_left, 1]] = True
-            supported[live[from_right, 0]] = True
+            from_left = supported[left] & allow_left_to_right
+            from_right = supported[right] & allow_right_to_left
+            supported[right[from_left]] = True
+            supported[left[from_right]] = True
         if int(np.count_nonzero(supported)) == before:
             break
     return supported, edge_intact
@@ -407,6 +594,102 @@ def build_convex_fragment_triangles(
     return np.asarray(triangles, dtype=np.float32)
 
 
+def build_fragment_cell_faces(
+    position: np.ndarray,
+    radius: np.ndarray,
+    structural_class: np.ndarray,
+    palette: int,
+    nominal_spacing: float,
+) -> list[tuple[np.ndarray, np.ndarray, tuple[float, float, float], int]]:
+    """Return a watertight, hole-preserving union of local particle cells.
+
+    A global convex hull fills courtyards, apartment voids and L-shaped frame
+    sections with giant triangles.  Here each occupied structural cell exposes
+    only faces that have no neighbour in the same rigid fragment. Coplanar
+    adjacent faces are greedily merged, so the mesh remains compact without
+    bridging an empty cell.
+    """
+    points = np.asarray(position, dtype=np.float64)
+    radii = np.asarray(radius, dtype=np.float64)
+    roles = np.asarray(structural_class, dtype=np.int32)
+    if len(points) == 0:
+        return []
+    inferred_spacing = float(np.median(radii)) / 0.48
+    spacing = max(min(float(nominal_spacing), inferred_spacing * 1.05), 1.0e-3)
+    origin = np.min(points, axis=0)
+    keys = np.rint((points - origin) / spacing).astype(np.int32)
+
+    # Refined checkpoints may contain coincident parent/child quantizations.
+    # Keep the largest physical sample as the surface representative.
+    occupied: dict[tuple[int, int, int], int] = {}
+    for index, key_array in enumerate(keys):
+        key = tuple(int(value) for value in key_array)
+        previous = occupied.get(key)
+        if previous is None or radii[index] > radii[previous]:
+            occupied[key] = index
+
+    def role_material(role: int) -> int:
+        if role == STRUCT_WALL:
+            return 10 + palette
+        if role == STRUCT_GLASS:
+            return 20 + palette
+        if role == STRUCT_SLAB:
+            return 30 + palette
+        return 40 + palette
+
+    # (axis, sign, plane, material) -> {(u, v): particle index}
+    groups: dict[tuple[int, int, int, int], dict[tuple[int, int], int]] = {}
+    transverse = ((1, 2), (0, 2), (0, 1))
+    for key, particle in occupied.items():
+        for axis in range(3):
+            for sign in (-1, 1):
+                neighbour = list(key)
+                neighbour[axis] += sign
+                if tuple(neighbour) in occupied:
+                    continue
+                u_axis, v_axis = transverse[axis]
+                # Twice-cell coordinates distinguish the two sides of one
+                # occupied voxel while keeping a stable integer plane key.
+                plane = key[axis] * 2 + sign
+                group_key = (
+                    axis, sign, plane, role_material(int(roles[particle]))
+                )
+                groups.setdefault(group_key, {})[(key[u_axis], key[v_axis])] = particle
+
+    faces: list[tuple[np.ndarray, np.ndarray, tuple[float, float, float], int]] = []
+    for (axis, sign, _plane, material), cells in groups.items():
+        remaining = set(cells)
+        u_axis, v_axis = transverse[axis]
+        while remaining:
+            u0, v0 = min(remaining, key=lambda value: (value[1], value[0]))
+            u1 = u0
+            while (u1 + 1, v0) in remaining:
+                u1 += 1
+            v1 = v0
+            while all((u, v1 + 1) in remaining for u in range(u0, u1 + 1)):
+                v1 += 1
+            rectangle = [
+                (u, v) for v in range(v0, v1 + 1) for u in range(u0, u1 + 1)
+            ]
+            remaining.difference_update(rectangle)
+            particle_indices = np.asarray([cells[cell] for cell in rectangle], dtype=np.int32)
+            lower = np.min(points[particle_indices] - radii[particle_indices, None], axis=0)
+            upper = np.max(points[particle_indices] + radii[particle_indices, None], axis=0)
+            face_coordinate = np.mean(
+                points[particle_indices, axis] + sign * radii[particle_indices]
+            )
+            center = 0.5 * (lower + upper)
+            center[axis] = face_coordinate
+            size = np.maximum(upper - lower, 0.08)
+            size[axis] = 0.08
+            normal = [0.0, 0.0, 0.0]
+            normal[axis] = float(sign)
+            faces.append(
+                (center.astype(np.float32), size.astype(np.float32), tuple(normal), material)
+            )
+    return faces
+
+
 def build_fragment_debris_skin(
     cfg: dict,
     rest_x: np.ndarray,
@@ -464,20 +747,23 @@ def build_fragment_debris_skin(
         fid = int(fid_value)
         bid = int(building_id[indices[0]])
         palette = int(palettes[bid]) % 6 if 0 <= bid < len(palettes) else max(bid, 0) % 6
-        roles, role_counts = np.unique(structural_class[indices], return_counts=True)
-        role = int(roles[int(np.argmax(role_counts))])
-        material = 40 + palette
-        if role == STRUCT_WALL:
-            material = 10 + palette
-        elif role == STRUCT_GLASS:
-            material = 20 + palette
-        elif role == STRUCT_SLAB:
-            material = 30 + palette
-        triangles = build_convex_fragment_triangles(rest_x[indices], radius[indices])
-        if len(triangles):
-            for triangle in triangles:
-                add_triangle(fid, bid, triangle, material)
+        faces = build_fragment_cell_faces(
+            rest_x[indices], radius[indices], structural_class[indices], palette,
+            float(cfg.get("solid_spacing", 1.3)),
+        )
+        if faces:
+            for face_center, face_size, face_normal, face_material in faces:
+                add_face(fid, bid, face_center, face_size, face_normal, face_material)
         else:
+            roles, role_counts = np.unique(structural_class[indices], return_counts=True)
+            role = int(roles[int(np.argmax(role_counts))])
+            material = 40 + palette
+            if role == STRUCT_WALL:
+                material = 10 + palette
+            elif role == STRUCT_GLASS:
+                material = 20 + palette
+            elif role == STRUCT_SLAB:
+                material = 30 + palette
             padding = max(0.18, float(np.median(radius[indices])) * 0.72)
             lower = np.min(rest_x[indices], axis=0).astype(np.float64) - padding
             upper = np.max(rest_x[indices], axis=0).astype(np.float64) + padding
@@ -654,7 +940,7 @@ def write_facade_skin(
     cache_path: Path | None = None
     if complete_geometry and bool(debris_policy.get("cache", True)):
         geometry_cfg = {
-            "schema": "convex-fragment-skin-v4-grouped-particles",
+            "schema": "cell-union-fragment-skin-v5-hole-preserving",
             "solid_spacing": cfg.get("solid_spacing"),
             "buildings": cfg.get("buildings"),
             "building_styles": cfg.get("building_styles"),
@@ -723,6 +1009,11 @@ def build_fragment_ids(
     # the same 0.65 m wall.
     area_scale = (reference_spacing / current_spacing) ** 2
     minimum = max(4, int(round(int(clustering.get("minimum_cluster_particles", 24)) * area_scale)))
+    merge_sparse_cells = bool(clustering.get("merge_sparse_cells", True))
+    maximum_merge_distance = float(
+        clustering.get("maximum_sparse_merge_cell_distance", np.inf)
+    )
+    maximum_span_cells = int(clustering.get("maximum_fragment_span_cells", 2**30))
     fragment_id = np.full(len(rest_x), -1, dtype=np.int32)
     next_fragment = 0
 
@@ -749,16 +1040,33 @@ def build_fragment_ids(
                 coordinates, axis=0, return_inverse=True, return_counts=True
             )
 
-            stable = np.flatnonzero(counts >= minimum)
-            if len(stable) == 0:
-                stable = np.asarray([int(np.argmax(counts))], dtype=np.int64)
             remap = np.arange(len(unique_cells), dtype=np.int64)
-            for source in np.flatnonzero(counts < minimum):
-                delta = (unique_cells[stable] - unique_cells[source]).astype(np.float32)
-                distance2 = np.sum(delta * delta, axis=1)
-                # Prefer a nearby massive cell when two candidates are equidistant.
-                score = distance2 - np.minimum(counts[stable], minimum * 4) * 1.0e-4
-                remap[source] = stable[int(np.argmin(score))]
+            if merge_sparse_cells:
+                stable = np.flatnonzero(counts >= minimum)
+                group_lower = unique_cells.copy()
+                group_upper = unique_cells.copy()
+                for source in np.flatnonzero(counts < minimum):
+                    if len(stable) == 0:
+                        continue
+                    delta = (unique_cells[stable] - unique_cells[source]).astype(np.float32)
+                    distance2 = np.sum(delta * delta, axis=1)
+                    score = distance2 - np.minimum(counts[stable], minimum * 4) * 1.0e-4
+                    for candidate_index in np.argsort(score):
+                        target = int(stable[int(candidate_index)])
+                        if distance2[int(candidate_index)] > maximum_merge_distance * maximum_merge_distance:
+                            break
+                        lower = np.minimum(group_lower[target], unique_cells[source])
+                        upper = np.maximum(group_upper[target], unique_cells[source])
+                        # A stable cell may absorb an adjacent sparse edge, but
+                        # never sparse cells from both far sides.  This hard
+                        # physical-span bound prevents a nearest-cell merge
+                        # from creating a multi-storey rigid shard.
+                        if np.any(upper - lower > maximum_span_cells):
+                            continue
+                        remap[source] = target
+                        group_lower[target] = lower
+                        group_upper[target] = upper
+                        break
 
             merged = remap[inverse]
             representatives = np.unique(merged)

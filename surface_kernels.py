@@ -163,7 +163,7 @@ def classify_water_surface(
                     wp.atomic_add(phase_transitions, 1, 1)
                 if candidate == 1:
                     wp.atomic_add(phase_transitions, 2, 1)
-                elif current == 1 and candidate == 0:
+                if current == 1 and candidate != 1:
                     wp.atomic_add(phase_transitions, 3, 1)
             water_phase[i] = candidate
             phase_candidate_age[i] = 0
@@ -176,7 +176,7 @@ def classify_water_surface(
         if current != candidate:
             if candidate == 1:
                 wp.atomic_add(phase_transitions, 2, 1)
-            elif current == 1 and candidate == 0:
+            if current == 1 and candidate != 1:
                 wp.atomic_add(phase_transitions, 3, 1)
         water_phase[i] = candidate
         phase_candidate[i] = candidate
