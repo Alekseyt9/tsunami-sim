@@ -13,7 +13,7 @@ import tempfile
 
 import warp as wp
 
-from deluge_v3 import HybridDelugeSolver
+from deluge_v3 import HybridDelugeSolver, load_run_config
 
 
 HERE = ROOT
@@ -32,11 +32,19 @@ def main() -> None:
         "--enable-deformable-bvh", action="store_true",
         help="Enable the experimental fragment BVH for an A/B profile.",
     )
+    parser.add_argument(
+        "--enable-dynamic-solid-list", action="store_true",
+        help="Profile the spatially compact active-solid contact list.",
+    )
+    parser.add_argument(
+        "--compact-contact-candidates", action="store_true",
+        help="Profile the explicit compact deformable-contact candidate path.",
+    )
     args = parser.parse_args()
     if args.iterations <= 0:
         raise ValueError("--iterations must be positive")
     wp.init()
-    cfg = json.loads(args.config.read_text(encoding="utf-8"))
+    cfg = load_run_config(args.config.resolve())
     if args.disable_deformable_bvh:
         cfg.setdefault("v3", {}).setdefault(
             "deformable_fragment_bvh", {}
@@ -45,6 +53,14 @@ def main() -> None:
         cfg.setdefault("v3", {}).setdefault(
             "deformable_fragment_bvh", {}
         )["enabled"] = True
+    if args.enable_dynamic_solid_list:
+        policy = cfg.setdefault("v3", {}).setdefault("dynamic_solid_contact_list", {})
+        policy["enabled"] = True
+        policy["mode"] = "spatial_compact"
+    if args.compact_contact_candidates:
+        cfg.setdefault("v3", {}).setdefault("structural_adjacency", {})[
+            "compact_contact_candidates"
+        ] = True
     substeps = int(math.ceil((1.0 / float(cfg["output_fps"])) / float(cfg["dt"])))
     dt = (1.0 / float(cfg["output_fps"])) / substeps
     with tempfile.TemporaryDirectory(prefix="deluge_profile_") as temporary:

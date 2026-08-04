@@ -89,10 +89,13 @@ def main() -> None:
     fragment = wp.array(np.asarray([-1, -1, -1, 0, 1], dtype=np.int32),
                         dtype=wp.int32, device=device)
     rigid = wp.zeros(2, dtype=wp.int32, device=device)
+    terminal = wp.zeros(2, dtype=wp.int32, device=device)
+    proxy = wp.ones(2, dtype=wp.int32, device=device)
     output = wp.zeros(count, dtype=wp.int32, device=device)
     wp.launch(
         update_hydraulic_boundary_mask, dim=count,
-        inputs=[kind, base, damage, fragment, rigid, output, 0.18], device=device,
+        inputs=[kind, base, damage, fragment, rigid, terminal, proxy,
+                output, 0.18, 0], device=device,
     )
     if tuple(output.numpy()[3:]) != (1, 0):
         raise AssertionError("intact interior particle was exposed")
@@ -100,10 +103,20 @@ def main() -> None:
                              dtype=float, device=device))
     wp.launch(
         update_hydraulic_boundary_mask, dim=count,
-        inputs=[kind, base, damage, fragment, rigid, output, 0.18], device=device,
+        inputs=[kind, base, damage, fragment, rigid, terminal, proxy,
+                output, 0.18, 0], device=device,
     )
     if tuple(output.numpy()[3:]) != (1, 1):
         raise AssertionError("damaged interior particle was not exposed")
+    rigid.assign(np.asarray([0, 1], dtype=np.int32))
+    terminal.assign(np.asarray([0, 1], dtype=np.int32))
+    wp.launch(
+        update_hydraulic_boundary_mask, dim=count,
+        inputs=[kind, base, damage, fragment, rigid, terminal, proxy,
+                output, 0.18, 1], device=device,
+    )
+    if tuple(output.numpy()[3:]) != (1, 0):
+        raise AssertionError("terminal OBB samples remained in the SPH boundary mask")
     print("PASS: fluid-only Verlet, async counters, SPH coefficient cache, and hydraulic masks")
 
 

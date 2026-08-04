@@ -76,6 +76,7 @@ def main():
         "fluid_group_id": wp.array(
             np.full(capacity, -1, dtype=np.int32), dtype=wp.int32, device=device
         ),
+        "wave_cohort": integer(),
     }
     emit_arrays["x"] = wp.array(
         np.asarray([[0.0, 0.0, 0.0]] * capacity, dtype=np.float32),
@@ -87,6 +88,9 @@ def main():
     exchange_x = wp.zeros((solver.nx, solver.nz), dtype=float, device=device)
     exchange_z = wp.zeros((solver.nx, solver.nz), dtype=float, device=device)
     counter = wp.array(np.asarray([old_count], dtype=np.int32), dtype=wp.int32, device=device)
+    emission_quota = wp.zeros(solver.nx, dtype=wp.int32, device=device)
+    cohort_emitted_volume = wp.zeros(1, dtype=float, device=device)
+    cohort_emitted_momentum = wp.zeros(1, dtype=float, device=device)
     grid = wp.HashGrid(8, 8, 8, device=device)
     grid.build(emit_arrays["x"][:old_count], 1.0)
     wp.launch(
@@ -103,10 +107,12 @@ def main():
             emit_arrays["normal_axis"], emit_arrays["time_level"], emit_arrays["time_active"],
             emit_arrays["surface_mask"], emit_arrays["surface_normal"],
             emit_arrays["foam_strength"], emit_arrays["fluid_group_id"],
+            emit_arrays["wave_cohort"],
             solver.state, exchange_volume, exchange_x, exchange_z,
             counter, old_count, capacity, 1, 1, solver.lower_x, solver.lower_z,
             solver.interface_z, solver.cell_size, solver.nx, solver.nz, 1.0,
-            float(cfg["rest_density"]), 0.25,
+            float(cfg["rest_density"]), 0.25, emission_quota, 0, 0,
+            cohort_emitted_volume, cohort_emitted_momentum,
         ],
         device=device,
     )
@@ -146,10 +152,12 @@ def main():
             emit_arrays["normal_axis"], emit_arrays["time_level"], emit_arrays["time_active"],
             emit_arrays["surface_mask"], emit_arrays["surface_normal"],
             emit_arrays["foam_strength"], emit_arrays["fluid_group_id"],
+            emit_arrays["wave_cohort"],
             solver.state, exchange_volume, exchange_x, exchange_z,
             rejected_counter, old_count, capacity, 1, 1, solver.lower_x, solver.lower_z,
             solver.interface_z, solver.cell_size, solver.nx, solver.nz, 1.0,
-            float(cfg["rest_density"]), 100.0,
+            float(cfg["rest_density"]), 100.0, emission_quota, 0, 0,
+            cohort_emitted_volume, cohort_emitted_momentum,
         ],
         device=device,
     )

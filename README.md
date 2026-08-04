@@ -182,13 +182,13 @@ physics.
   are measured without deleting SPH. This diagnostic transfer must balance
   exactly before a grid pressure/advection solve replaces the interior.
 
-The preparation code lives in `experimental_optimizations.py`; all prepared flags
+The preparation code lives in `simulation/experimental_optimizations.py`; all prepared flags
 remain false in `config_v3_rtx5070.json`, so current production runs are
 bit-for-bit unaffected by merely adding these paths.
 
 ### Optimization checkpoint results (2026-08-03)
 
-`benchmark_implicit_projection.py` compares equal physical horizons from the
+`benchmarks/benchmark_implicit_projection.py` compares equal physical horizons from the
 same early and late production checkpoints. With four pressure iterations and
 `dt=0.0006` (5x the WCSPH step), a 0.06 s late-checkpoint test is 1.57x faster
 per simulated second. The final density p99 is 1.0017 and all tracked state is
@@ -197,7 +197,7 @@ The solver remains disabled because one late local projection residual reached
 30.9%, trajectories differ materially from WCSPH, and solid-reaction/damage
 equivalence has not passed a production-length run.
 
-`benchmark_divergence_one_second.py` is the promotion gate for the combined
+`benchmarks/benchmark_divergence_one_second.py` is the promotion gate for the combined
 density/divergence solve. It recompiles on a disposable solver, reloads the
 checkpoint for measurement, advances both methods across identical output-frame
 boundaries without rendering, and records full-frame time, structural response,
@@ -217,7 +217,7 @@ late-stage speedup is only 0.99x and structural position RMS still differs by
 iterations, so the next fluid optimization target is the conservative
 narrow-band SPH/grid split rather than enabling this DFSPH path.
 
-`benchmark_early_rigidification.py` converts 343 additional detached clusters
+`benchmarks/benchmark_early_rigidification.py` converts 343 additional detached clusters
 (159,684 particles) in the late checkpoint, but does not reduce total substep
 time. Most of those fragments were already rejected by the contact-candidate
 gate. A direct equal-and-opposite atomic reaction prototype was also rejected:
@@ -225,7 +225,7 @@ contention on a small number of rigid bodies increased the deformable-contact
 kernel from about 4.8 ms to about 41 ms. The next viable implementation is a
 particle-to-OBB BVH narrowphase or a block-local force reduction.
 
-`benchmark_narrow_band_sweep.py` also caught and fixed an undersized diagnostic
+`benchmarks/benchmark_narrow_band_sweep.py` also caught and fixed an undersized diagnostic
 HashGrid. With the corrected grid, a 1.5 m detail band and 3 m/s local RMS limit
 classify 21.6% of early water but only 0.8% of late turbulent water as safe
 interior. A 1.0 m band classifies 38.6% early and 4.2% late. Deposited mass and
@@ -297,19 +297,13 @@ It covers:
 
 ## Important files
 
-- `deluge_v3.py` — V3 orchestration, checkpoints, surface reconstruction, and simulation loop integration.
-- `solver_base.py` — shared particle solver and output loop in the standalone repository.
-- `shallow_water.py` — GPU shallow-water solver and conservative SPH interface coupling.
-- `validation\validate_production_output.py` — MP4, water-balance, late-mesh, and metric validation.
-- `assemble_resumed_run.py` — lossless MP4 and metric assembly for checkpoint-resumed runs.
-- `validation\validate_shallow_return.py` — end-to-end return-flow, compaction, and facade-anchor validation.
-- `validation\validate_fragment_scale.py` — apartment-scale anti-dust fragment validation.
-- `validation\validate_structural_hierarchy.py` — CUDA fracture-resistance hierarchy validation.
-- `profile_v3_kernels.py` — per-kernel CUDA timing at a fresh scene or checkpoint.
-- `hybrid_kernels.py` — structural LOD, fracture, multirate, rigid-body, contact, and facade CUDA kernels.
-- `hybrid_model.py` — cohesive fragments, refinement axes, and facade generation.
-- `hybrid_renderer.py` — facade and reconstructed-water rendering.
-- `surface_kernels.py` — free-surface classification, sparse fields, temporal blending, and water rasterization.
+- `deluge_v3.py` — V3 entry point, orchestration, and checkpoints.
+- `simulation/` — scene construction, solver loop, shallow-water coupling, rigid fitting, and prepared experimental solvers.
+- `kernels/` — base SPH/integration, hybrid structural, and water-surface Warp kernels.
+- `rendering/` — particle/facade renderers and progressive video encoding.
+- `benchmarks/` — performance and numerical-equivalence A/B programs.
+- `tools/` — checkpoint rendering, profiling, audits, and resumed-run assembly.
+- `validation/` — CUDA validations and production-output checks.
 - `config_v3_rtx5070.json` — production RTX 5070 configuration.
 - `ROADMAP.md` — development stages and acceptance criteria.
 

@@ -69,6 +69,7 @@ def main() -> None:
     kind = wp.array(np.ones(count, dtype=np.int32), dtype=wp.int32, device=device)
     fragment = wp.array(np.zeros(count, dtype=np.int32), dtype=wp.int32, device=device)
     rigid_state = wp.array(np.ones(1, dtype=np.int32), dtype=wp.int32, device=device)
+    rigid_terminal = wp.zeros(1, dtype=wp.int32, device=device)
     proxy_enabled = wp.zeros(1, dtype=wp.int32, device=device)
     acceleration_gpu = wp.array(acceleration, dtype=wp.vec3, device=device)
     local_gpu = wp.array(fit.local_positions, dtype=wp.vec3, device=device)
@@ -90,9 +91,10 @@ def main() -> None:
         accumulate_rigid_body_loads,
         dim=count,
         inputs=[
-            x, v, radius, mass_gpu, kind, fragment, rigid_state, proxy_enabled, acceleration_gpu,
+            x, v, radius, mass_gpu, kind, fragment, rigid_state, rigid_terminal,
+            proxy_enabled, acceleration_gpu,
             body_center, body_force, body_torque, 100.0, -100.0, 100.0, 100.0,
-            4.0e6, 1.8e4,
+            4.0e6, 1.8e4, 0,
         ],
         device=device,
     )
@@ -111,8 +113,8 @@ def main() -> None:
         scatter_rigid_particles,
         dim=count,
         inputs=[
-            x, v, kind, fragment, rigid_state, local_gpu, body_center,
-            body_orientation, body_linear, body_angular,
+            x, v, kind, fragment, rigid_state, rigid_terminal, proxy_enabled,
+            local_gpu, body_center, body_orientation, body_linear, body_angular, 0,
         ],
         device=device,
     )

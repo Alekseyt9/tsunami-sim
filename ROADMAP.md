@@ -254,3 +254,43 @@ before they may replace production physics:
   but only 0.8% late water; the late stage has too little calm interior for the
   original speed estimate. Next: implement grid advection/projection and
   symmetric interface transfer, then target the calm approach phase first.
+
+## Next performance gate: proxy-only terminal rubble
+
+`terminal_plastic_collapse` is production-enabled after checkpoint-288 A/B.
+It prevents an already crushed and shape-fitted fragment from reopening its
+invalid stretched elastic graph. It reduced rigid-to-deformable churn by 72%,
+but improved complete no-render time by only 0.23%, because the original rigid
+particle samples are still present in global neighbour work.
+
+The next implementation must preserve two-way physics while removing those
+samples from hot paths:
+
+1. Build 6-face OBB quadrature samples with area, normal, material and body id.
+2. Accumulate SPH pressure and viscous drag on quadrature points, then apply
+   equal force/torque to the body and equal-and-opposite momentum to nearby water.
+3. Keep a fragment-owned render skin independent of live simulation indices.
+4. Shed particle samples only after terminal state and a short topology-safe
+   dwell; preserve body, quadrature and shed state in V3 checkpoints.
+5. A/B from the same late checkpoint. Require <0.2% water-volume drift,
+   <2% wall/core damage-integral change, no ground tunnelling, visually
+   matching wakes, and at least 15% complete-substep speedup before production.
+
+Current status: items 1-2 are implemented and CUDA-validated; item 4 has a
+reversible simulation-shedding implementation that retains render/checkpoint
+samples. A checkpoint-302 three-frame gate reached 1.099x over the old baseline
+and 1.112x over coupling with retained samples, with negligible short-window
+damage-integral drift. This is below the 1.15x acceptance gate. Before any
+production enablement, add analytical fluid/ballistic non-penetration against
+expanded OBBs through the rigid BVH, then complete item 3 and run at least one
+full second of coupled-vs-shed wake/trajectory validation.
+
+Update: analytical sphere/OBB non-penetration, ballistic-droplet contact,
+body-level gravity and exact impulse symmetry are implemented and validated.
+The body-centric fluid HashGrid broadphase was rejected; particle-to-terminal
+BVH remains the reference. A safe contact stride of eight base steps plus the
+exact sample-union floor produced a 1.048x two-frame speedup and reduced rigid
+centre RMS to 0.059 m, but rigid velocity RMS is still 1.19 m/s and the 1.15x
+speed target is not met. Next remove render-only terminal samples from the
+global/contact grids, cache the active fluid/OBB contact set between BVH
+refreshes, and only then run the required one-second wake/trajectory gate.

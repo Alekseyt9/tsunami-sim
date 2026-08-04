@@ -58,6 +58,11 @@ def advance_shallow_water(
     gravity: float,
     bed_drag: float,
     dry_depth: float,
+    sustained_inlet: int,
+    inlet_depth: float,
+    inlet_velocity_z: float,
+    inlet_volume: wp.array(dtype=float),
+    inlet_momentum_z: wp.array(dtype=float),
 ):
     ix, iz = wp.tid()
     center = current[ix, iz]
@@ -65,20 +70,25 @@ def advance_shallow_water(
     right = current[wp.min(ix + 1, nx - 1), iz]
     back = current[ix, wp.max(iz - 1, 0)]
     front = current[ix, wp.min(iz + 1, nz - 1)]
-    # Reflective ghost states match the particle solver's tank boundaries and
-    # prevent a copied non-zero boundary velocity from becoming an artificial
-    # infinite mass source.
+    # The legacy pulse uses a reflective offshore boundary.  A sustained
+    # tsunami surge instead prescribes the incoming far-field state through a
+    # Riemann ghost cell.  This supplies flux at the boundary rather than
+    # repeatedly raising every cell in an offshore strip.
     if ix == 0:
         left = wp.vec3(center[0], -center[1], center[2])
     if ix == nx - 1:
         right = wp.vec3(center[0], -center[1], center[2])
     if iz == 0:
-        back = wp.vec3(center[0], center[1], -center[2])
+        if sustained_inlet != 0:
+            back = wp.vec3(inlet_depth, 0.0, inlet_depth * inlet_velocity_z)
+        else:
+            back = wp.vec3(center[0], center[1], -center[2])
     if iz == nz - 1:
         front = wp.vec3(center[0], center[1], -center[2])
+    back_flux = _rusanov_z(back, center, gravity)
     next_value = center - (dt / cell_size) * (
         _rusanov_x(center, right, gravity) - _rusanov_x(left, center, gravity)
-        + _rusanov_z(center, front, gravity) - _rusanov_z(back, center, gravity)
+        + _rusanov_z(center, front, gravity) - back_flux
     )
     h = wp.max(next_value[0], 0.0)
     if h <= dry_depth:
@@ -86,6 +96,11 @@ def advance_shallow_water(
     else:
         damping = wp.max(0.0, 1.0 - bed_drag * dt)
         updated[ix, iz] = wp.vec3(h, next_value[1] * damping, next_value[2] * damping)
+    if iz == 0 and sustained_inlet != 0:
+        # Boundary flux is specific discharge (m2/s).  Multiplication by the
+        # cell width and dt gives the signed volume/momentum entering this row.
+        wp.atomic_add(inlet_volume, 0, back_flux[0] * cell_size * dt)
+        wp.atomic_add(inlet_momentum_z, 0, back_flux[2] * cell_size * dt)
 
 
 @wp.kernel
@@ -153,6 +168,10 @@ def couple_sph_interface(
     interface_z: float,
     coupling_width: float,
     relaxation_rate: float,
+    incoming_characteristic: int,
+    incoming_relaxation_rate: float,
+    minimum_incoming_velocity: float,
+    incoming_impulse: wp.array(dtype=float),
     dt: float,
 ):
     i = wp.tid()
@@ -169,10 +188,27 @@ def couple_sph_interface(
     target_z = state[2] / state[0]
     ax = (target_x - v[i][0]) * rate
     az = (target_z - v[i][2]) * rate
+    characteristic_impulse = float(0.0)
+    if incoming_characteristic != 0 and target_z >= minimum_incoming_velocity:
+        # An SPH inlet is an open boundary, not a closed overlap region.  Only
+        # the incoming shallow-water characteristic is prescribed here: slow
+        # or reflected particles are brought up to the incident bore speed,
+        # while particles already travelling faster are not braked into an
+        # artificial compression wall.  Returning particles are handled by
+        # the conservative SPH -> shallow capture kernel below.
+        az = wp.max(target_z - v[i][2], 0.0) * incoming_relaxation_rate * weight * weight
+        characteristic_impulse = mass[i] * az * dt
     acceleration[i] = acceleration[i] + wp.vec3(ax, 0.0, az)
-    # The equal and opposite horizontal impulse is returned to the 2D cell.
+    # Tangential relaxation remains a conservative two-way exchange.  In the
+    # legacy overlap mode the normal impulse is also returned to the shallow
+    # cell.  For an open incoming-characteristic boundary it is pressure work
+    # performed by the unresolved offshore reservoir and is recorded instead
+    # of immediately cancelling the incident wave in a single grid cell.
     wp.atomic_add(exchange_x, ix, iz, -mass[i] * ax * dt)
-    wp.atomic_add(exchange_z, ix, iz, -mass[i] * az * dt)
+    if incoming_characteristic != 0 and target_z >= minimum_incoming_velocity:
+        wp.atomic_add(incoming_impulse, 0, characteristic_impulse)
+    else:
+        wp.atomic_add(exchange_z, ix, iz, -mass[i] * az * dt)
 
 
 @wp.kernel
@@ -226,6 +262,7 @@ def emit_sph_interface_particles(
     surface_normal: wp.array(dtype=wp.vec3),
     foam_strength: wp.array(dtype=float),
     fluid_group_id: wp.array(dtype=wp.int32),
+    wave_cohort: wp.array(dtype=wp.int32),
     shallow: wp.array2d(dtype=wp.vec3),
     exchange_volume: wp.array2d(dtype=float),
     exchange_x: wp.array2d(dtype=float),
@@ -244,6 +281,11 @@ def emit_sph_interface_particles(
     particle_spacing: float,
     rest_density: float,
     minimum_emission_velocity: float,
+    emission_quota: wp.array(dtype=wp.int32),
+    use_flux_quota: int,
+    cohort_id: int,
+    cohort_emitted_volume: wp.array(dtype=float),
+    cohort_emitted_momentum_z: wp.array(dtype=float),
 ):
     emitter_x, emitter_y = wp.tid()
     if emitter_x >= emitter_nx or emitter_y >= emitter_ny:
@@ -270,8 +312,15 @@ def emit_sph_interface_particles(
     velocity_z = state[2] / wp.max(state[0], 1.0e-5)
     if velocity_z < minimum_emission_velocity:
         return
+    if use_flux_quota != 0:
+        previous_quota = wp.atomic_sub(emission_quota, sx, 1)
+        if previous_quota <= 0:
+            wp.atomic_add(emission_quota, sx, 1)
+            return
     target = wp.atomic_add(count, 0, 1)
     if target >= capacity:
+        if use_flux_quota != 0:
+            wp.atomic_add(emission_quota, sx, 1)
         return
     particle_volume = particle_spacing * particle_spacing * particle_spacing
     particle_mass = particle_volume * rest_density
@@ -303,6 +352,10 @@ def emit_sph_interface_particles(
     surface_normal[target] = wp.vec3(0.0)
     foam_strength[target] = 0.0
     fluid_group_id[target] = -1
+    wave_cohort[target] = cohort_id
+    if cohort_id > 0:
+        wp.atomic_add(cohort_emitted_volume, 0, particle_volume)
+        wp.atomic_add(cohort_emitted_momentum_z, 0, particle_mass * velocity_z)
     wp.atomic_add(exchange_volume, sx, sz, -particle_volume)
     wp.atomic_add(exchange_x, sx, sz, -particle_mass * velocity_x)
     wp.atomic_add(exchange_z, sx, sz, -particle_mass * velocity_z)
@@ -315,11 +368,14 @@ def mark_sph_return_particles(
     mass: wp.array(dtype=float),
     volume: wp.array(dtype=float),
     kind: wp.array(dtype=wp.int32),
+    wave_cohort: wp.array(dtype=wp.int32),
     keep: wp.array(dtype=wp.int32),
     exchange_volume: wp.array2d(dtype=float),
     exchange_x: wp.array2d(dtype=float),
     exchange_z: wp.array2d(dtype=float),
     merged_volume: wp.array(dtype=float),
+    cohort_returned_volume: wp.array(dtype=float),
+    cohort_returned_momentum_z: wp.array(dtype=float),
     lower_x: float,
     lower_z: float,
     interface_z: float,
@@ -328,18 +384,25 @@ def mark_sph_return_particles(
     shallow_nz: int,
     minimum_return_speed: float,
     forced_capture_depth: float,
+    reverse_capture_width: float,
 ):
     i = wp.tid()
     position = x[i]
     velocity = v[i]
-    returning = (
-        kind[i] == 0
-        and position[2] < interface_z
+    crossed_interface = (
+        position[2] < interface_z
         and (
             velocity[2] <= -minimum_return_speed
             or position[2] <= interface_z - forced_capture_depth
         )
     )
+    reflected_in_buffer = (
+        reverse_capture_width > 0.0
+        and position[2] >= interface_z
+        and position[2] < interface_z + reverse_capture_width
+        and velocity[2] <= -minimum_return_speed
+    )
+    returning = kind[i] == 0 and (crossed_interface or reflected_in_buffer)
     if not returning:
         keep[i] = 1
         return
@@ -350,6 +413,9 @@ def mark_sph_return_particles(
     wp.atomic_add(exchange_x, ix, iz, mass[i] * velocity[0])
     wp.atomic_add(exchange_z, ix, iz, mass[i] * velocity[2])
     wp.atomic_add(merged_volume, 0, volume[i])
+    if wave_cohort[i] > 0:
+        wp.atomic_add(cohort_returned_volume, 0, volume[i])
+        wp.atomic_add(cohort_returned_momentum_z, 0, mass[i] * velocity[2])
 
 
 @wp.kernel
@@ -432,12 +498,21 @@ class ShallowWaterFarField:
         self.nx = max(3, int(math.ceil(float(cfg["domain_width"]) / self.cell_size)))
         self.nz = max(3, int(math.ceil((self.upper_z - self.lower_z) / self.cell_size)))
         self.interface_z = float(policy.get("sph_z_min", cfg["reservoir_z_min"]))
+        self.probe_rows_m = tuple(
+            float(value) for value in policy.get("probe_rows_m", (16.0, 52.0, 91.0))
+        )
         self.update_interval = float(policy.get("update_interval", 0.008))
         self.accumulated_dt = 0.0
         self.wave_train_injected_volume = 0.0
         self.wave_train_injected_momentum_z = 0.0
+        incoming_impulse_initial = 0.0
+        cohort_emitted_volume_initial = 0.0
+        cohort_emitted_momentum_initial = 0.0
+        cohort_returned_volume_initial = 0.0
+        cohort_returned_momentum_initial = 0.0
         host = np.zeros((self.nx, self.nz, 3), dtype=np.float32)
         depth = float(cfg["water_depth"])
+        self.base_depth = depth
         crest = float(cfg["wave_height"])
         wave_speed = float(cfg["wave_speed"])
         background = float(cfg.get("background_current", 0.0))
@@ -464,6 +539,10 @@ class ShallowWaterFarField:
         self.exchange_volume = wp.zeros((self.nx, self.nz), dtype=float, device=device)
         self.emitted_particles_total = 0
         self.emitted_volume_total = 0.0
+        self.flux_requested_particles_total = 0
+        self.flux_emitted_particles_total = 0
+        self.emission_residual_volume = np.zeros(self.nx, dtype=np.float64)
+        self.last_emission_time = 0.0
         self.merged_particles_total = 0
         self.merged_volume_total = 0.0
         if checkpoint is not None and checkpoint.exists():
@@ -472,6 +551,21 @@ class ShallowWaterFarField:
                     self.emitted_particles_total = int(saved["shallow_emitted_particles_total"])
                 if "shallow_emitted_volume_total" in saved:
                     self.emitted_volume_total = float(saved["shallow_emitted_volume_total"])
+                if "shallow_flux_requested_particles_total" in saved:
+                    self.flux_requested_particles_total = int(
+                        saved["shallow_flux_requested_particles_total"]
+                    )
+                if "shallow_flux_emitted_particles_total" in saved:
+                    self.flux_emitted_particles_total = int(
+                        saved["shallow_flux_emitted_particles_total"]
+                    )
+                if (
+                    "shallow_emission_residual_volume" in saved
+                    and saved["shallow_emission_residual_volume"].shape == (self.nx,)
+                ):
+                    self.emission_residual_volume = saved[
+                        "shallow_emission_residual_volume"
+                    ].astype(np.float64, copy=True)
                 if "shallow_merged_particles_total" in saved:
                     self.merged_particles_total = int(saved["shallow_merged_particles_total"])
                 if "shallow_merged_volume_total" in saved:
@@ -480,8 +574,44 @@ class ShallowWaterFarField:
                     self.wave_train_injected_volume = float(saved["wave_train_injected_volume"])
                 if "wave_train_injected_momentum_z" in saved:
                     self.wave_train_injected_momentum_z = float(saved["wave_train_injected_momentum_z"])
+                if "shallow_incoming_boundary_impulse" in saved:
+                    incoming_impulse_initial = float(saved["shallow_incoming_boundary_impulse"])
+                if "wave_cohort_emitted_volume" in saved:
+                    cohort_emitted_volume_initial = float(saved["wave_cohort_emitted_volume"])
+                if "wave_cohort_emitted_momentum_z" in saved:
+                    cohort_emitted_momentum_initial = float(
+                        saved["wave_cohort_emitted_momentum_z"]
+                    )
+                if "wave_cohort_returned_volume" in saved:
+                    cohort_returned_volume_initial = float(saved["wave_cohort_returned_volume"])
+                if "wave_cohort_returned_momentum_z" in saved:
+                    cohort_returned_momentum_initial = float(
+                        saved["wave_cohort_returned_momentum_z"]
+                    )
         self._wave_train_volume_step = wp.zeros(1, dtype=float, device=device)
         self._wave_train_momentum_step = wp.zeros(1, dtype=float, device=device)
+        self.emission_quota = wp.zeros(self.nx, dtype=wp.int32, device=device)
+        self.incoming_boundary_impulse = wp.array(
+            np.asarray([incoming_impulse_initial], dtype=np.float32),
+            dtype=float,
+            device=device,
+        )
+        self.wave_cohort_emitted_volume = wp.array(
+            np.asarray([cohort_emitted_volume_initial], dtype=np.float32),
+            dtype=float, device=device,
+        )
+        self.wave_cohort_emitted_momentum_z = wp.array(
+            np.asarray([cohort_emitted_momentum_initial], dtype=np.float32),
+            dtype=float, device=device,
+        )
+        self.wave_cohort_returned_volume = wp.array(
+            np.asarray([cohort_returned_volume_initial], dtype=np.float32),
+            dtype=float, device=device,
+        )
+        self.wave_cohort_returned_momentum_z = wp.array(
+            np.asarray([cohort_returned_momentum_initial], dtype=np.float32),
+            dtype=float, device=device,
+        )
 
     def couple(self, arrays: dict, count: int, dt: float):
         if not self.enabled:
@@ -493,7 +623,11 @@ class ShallowWaterFarField:
                     self.exchange_x, self.exchange_z, self.lower_x, self.lower_z,
                     self.cell_size, self.nx, self.nz, self.interface_z,
                     float(self.cfg.get("coupling_width", 4.0)),
-                    float(self.cfg.get("velocity_relaxation_rate", 1.5)), dt],
+                    float(self.cfg.get("velocity_relaxation_rate", 1.5)),
+                    int(bool(self.cfg.get("incoming_characteristic", False))),
+                    float(self.cfg.get("incoming_relaxation_rate", 6.0)),
+                    float(self.cfg.get("minimum_incoming_velocity", 0.5)),
+                    self.incoming_boundary_impulse, dt],
             device=self.device,
         )
 
@@ -511,17 +645,72 @@ class ShallowWaterFarField:
         local_dt = step_dt / substeps
         wave_train = self.cfg.get("wave_train", {})
         for substep in range(substeps):
+            local_time = simulation_time - step_dt + (substep + 1) * local_dt
+            profile = str(wave_train.get("profile", "pulse")).strip().lower()
+            sustained_enabled = bool(wave_train.get("enabled", False)) and profile in {
+                "sustained", "sustained_surge", "surge",
+            }
+            inlet_active = False
+            inlet_depth = float(wave_train.get("base_depth", self.cfg.get("base_depth", 0.0)))
+            inlet_velocity = float(wave_train.get("background_current", 0.0))
+            if sustained_enabled:
+                start = float(wave_train.get("start_seconds", 0.0))
+                ramp_up = max(float(wave_train.get("ramp_up_seconds", 2.0)), 1.0e-6)
+                hold = max(float(wave_train.get("hold_seconds", 8.0)), 0.0)
+                ramp_down = max(float(wave_train.get("ramp_down_seconds", 3.0)), 1.0e-6)
+                elapsed = local_time - start
+                total_duration = ramp_up + hold + ramp_down
+                if 0.0 <= elapsed < total_duration:
+                    inlet_active = True
+                    if elapsed < ramp_up:
+                        envelope = elapsed / ramp_up
+                    elif elapsed < ramp_up + hold:
+                        envelope = 1.0
+                    else:
+                        envelope = 1.0 - (elapsed - ramp_up - hold) / ramp_down
+                    envelope = min(max(envelope, 0.0), 1.0)
+                    # Smooth first derivative at both ends of the hydrograph so
+                    # the source does not generate a numerical impulse.
+                    envelope = envelope * envelope * (3.0 - 2.0 * envelope)
+                    base_depth = float(
+                        wave_train.get("base_depth", self.cfg.get("base_depth", 0.0))
+                    )
+                    if base_depth <= 0.0:
+                        base_depth = float(wave_train.get("water_depth", 0.0))
+                    if base_depth <= 0.0:
+                        # The global water depth is copied into the policy by
+                        # the solver constructor for compact generated configs.
+                        base_depth = float(self.base_depth)
+                    background = float(wave_train.get("background_current", 0.0))
+                    target_velocity = float(
+                        wave_train.get(
+                            "target_velocity",
+                            background + float(wave_train.get("speed", 14.0)),
+                        )
+                    )
+                    inlet_depth = base_depth + float(wave_train.get("height", 8.0)) * envelope
+                    inlet_velocity = background + (target_velocity - background) * envelope
+            self._wave_train_volume_step.zero_()
+            self._wave_train_momentum_step.zero_()
             wp.launch(
                 advance_shallow_water, dim=(self.nx, self.nz),
                 inputs=[self.state, self.updated, self.nx, self.nz, self.cell_size, local_dt,
                         9.81, float(self.cfg.get("bed_drag", 0.006)),
-                        float(self.cfg.get("dry_depth", 0.02))], device=self.device,
+                        float(self.cfg.get("dry_depth", 0.02)), int(inlet_active),
+                        inlet_depth, inlet_velocity, self._wave_train_volume_step,
+                        self._wave_train_momentum_step], device=self.device,
             )
             self.state, self.updated = self.updated, self.state
-            if bool(wave_train.get("enabled", False)):
+            if inlet_active:
+                self.wave_train_injected_volume += float(
+                    self._wave_train_volume_step.numpy()[0]
+                )
+                self.wave_train_injected_momentum_z += float(
+                    self._wave_train_momentum_step.numpy()[0]
+                )
+            if bool(wave_train.get("enabled", False)) and not sustained_enabled:
                 self._wave_train_volume_step.zero_()
                 self._wave_train_momentum_step.zero_()
-                local_time = simulation_time - step_dt + (substep + 1) * local_dt
                 wp.launch(
                     inject_wave_train_pulse, dim=(self.nx, self.nz),
                     inputs=[
@@ -668,16 +857,71 @@ class ShallowWaterFarField:
     def diagnostics(self):
         host = self.state.numpy()
         area = self.cell_size * self.cell_size
-        return {
+        result = {
             "shallow_water_cells": self.nx * self.nz,
             "shallow_water_wet_cells": int(np.count_nonzero(host[:, :, 0] > 0.02)),
             "shallow_water_volume_m3": float(np.sum(host[:, :, 0], dtype=np.float64) * area),
             "shallow_water_momentum_z": float(np.sum(host[:, :, 2], dtype=np.float64) * area),
             "shallow_emitted_particles": self.emitted_particles_total,
             "shallow_emitted_volume_m3": self.emitted_volume_total,
+            "shallow_flux_requested_particles": self.flux_requested_particles_total,
+            "shallow_flux_emitted_particles": self.flux_emitted_particles_total,
+            "shallow_flux_emission_efficiency": float(
+                self.flux_emitted_particles_total
+                / max(self.flux_requested_particles_total, 1)
+            ),
             "shallow_merged_particles": self.merged_particles_total,
             "shallow_merged_volume_m3": self.merged_volume_total,
             "shallow_net_transfer_volume_m3": self.emitted_volume_total - self.merged_volume_total,
             "wave_train_injected_volume_m3": self.wave_train_injected_volume,
             "wave_train_injected_momentum_z": self.wave_train_injected_momentum_z,
+            "coupling_incoming_boundary_impulse_kg_m_s": float(
+                self.incoming_boundary_impulse.numpy()[0]
+            ),
+            "wave_cohort_emitted_volume_m3": float(
+                self.wave_cohort_emitted_volume.numpy()[0]
+            ),
+            "wave_cohort_emitted_momentum_z_kg_m_s": float(
+                self.wave_cohort_emitted_momentum_z.numpy()[0]
+            ),
+            "wave_cohort_returned_volume_m3": float(
+                self.wave_cohort_returned_volume.numpy()[0]
+            ),
+            "wave_cohort_returned_momentum_z_kg_m_s": float(
+                self.wave_cohort_returned_momentum_z.numpy()[0]
+            ),
         }
+        dry_depth = float(self.cfg.get("dry_depth", 0.02))
+        for row_index, row_z in enumerate(self.probe_rows_m, start=1):
+            iz = int(np.clip(
+                np.floor((row_z - self.lower_z) / self.cell_size),
+                0,
+                self.nz - 1,
+            ))
+            depth = host[:, iz, 0].astype(np.float64, copy=False)
+            discharge = host[:, iz, 2].astype(np.float64, copy=False)
+            velocity = np.divide(
+                discharge,
+                np.maximum(depth, dry_depth),
+                out=np.zeros_like(discharge),
+                where=depth > dry_depth,
+            )
+            # Integral across the domain width.  The specific momentum flux
+            # omits density, so multiplying it by rho gives force in newtons.
+            specific_flux = discharge * velocity + 0.5 * 9.81 * depth * depth
+            prefix = f"wave_row_{row_index}"
+            result[f"{prefix}_z_m"] = row_z
+            result[f"{prefix}_depth_mean_m"] = float(np.mean(depth))
+            result[f"{prefix}_depth_max_m"] = float(np.max(depth))
+            result[f"{prefix}_velocity_mean_m_s"] = float(np.mean(velocity))
+            result[f"{prefix}_velocity_max_m_s"] = float(np.max(velocity))
+            result[f"{prefix}_forward_discharge_m3_s"] = float(
+                np.sum(np.maximum(discharge, 0.0), dtype=np.float64) * self.cell_size
+            )
+            result[f"{prefix}_reverse_discharge_m3_s"] = float(
+                np.sum(np.minimum(discharge, 0.0), dtype=np.float64) * self.cell_size
+            )
+            result[f"{prefix}_specific_momentum_flux_m4_s2"] = float(
+                np.sum(specific_flux, dtype=np.float64) * self.cell_size
+            )
+        return result

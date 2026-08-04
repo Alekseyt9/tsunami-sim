@@ -32,6 +32,9 @@ def main():
     torque = wp.zeros((2, 3), dtype=float, device=device)
     peak = wp.zeros(2, dtype=float, device=device)
     reactivated = wp.zeros(1, dtype=wp.int32, device=device)
+    deferred = wp.zeros(2, dtype=wp.int32, device=device)
+    rigid_age = wp.zeros(2, dtype=wp.int32, device=device)
+    terminal = wp.zeros(2, dtype=wp.int32, device=device)
     grid = wp.HashGrid(8, 8, 8, device=device)
     grid.build(position, 1.5)
     wp.launch(clear_body_accumulators, dim=2, inputs=[force, torque], device=device)
@@ -52,7 +55,8 @@ def main():
         raise AssertionError("impact peak did not reach deformable-reactivation threshold")
     wp.launch(
         reactivate_rigid_after_impact, dim=2,
-        inputs=[rigid, peak, reactivated, 120.0], device=device,
+        inputs=[rigid, terminal, rigid_age, peak, reactivated, deferred,
+                120.0, 100, 150.0], device=device,
     )
     wp.synchronize_device(device)
     if np.any(rigid.numpy() != 0) or int(reactivated.numpy()[0]) != 2:

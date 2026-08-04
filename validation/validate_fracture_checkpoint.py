@@ -44,6 +44,13 @@ def main() -> None:
         solver.rigid_proxy_half_extent_host[5] = (1.5, 0.7, 2.0)
         solver.rigid_proxy_material_host[5] = 3
         solver.rigid_detached_scans_host[5:8] = np.asarray((2, 4, 7), dtype=np.int32)
+        rigid_age_seed = solver.rigid_age_substeps.numpy()
+        rigid_age_seed[5:8] = np.asarray((55, 89, 144), dtype=np.int32)
+        solver.rigid_age_substeps.assign(rigid_age_seed)
+        terminal_seed = solver.rigid_terminal.numpy()
+        terminal_seed[5:8] = np.asarray((1, 0, 1), dtype=np.int32)
+        solver.rigid_terminal.assign(terminal_seed)
+        solver.rigid_terminal_host[:] = terminal_seed
         solver.early_rigidified_total = 11
         sleep_quiet_seed = solver.rigid_sleep_quiet_substeps.numpy()
         sleep_quiet_seed[5:8] = np.asarray((13, 21, 34), dtype=np.int32)
@@ -51,6 +58,9 @@ def main() -> None:
         solver.rigid_sleep_transition_counts.assign(
             np.asarray((3, 2), dtype=np.int32)
         )
+        deferred_seed = solver.rigid_reactivation_deferred_counter.numpy()
+        deferred_seed[5] = 233
+        solver.rigid_reactivation_deferred_counter.assign(deferred_seed)
         phase_seed = np.asarray((0, 1, 2, 2), dtype=np.int32)
         candidate_seed = np.asarray((0, 1, 2, 0), dtype=np.int32)
         age_seed = np.asarray((0, 0, 1, 1), dtype=np.int32)
@@ -90,6 +100,12 @@ def main() -> None:
             or resumed.rigid_sleep_transition_counts.numpy().tolist() != [3, 2]
         ):
             raise AssertionError("rigid sleep state changed across checkpoint restore")
+        if resumed.rigid_age_substeps.numpy()[5:8].tolist() != [55, 89, 144]:
+            raise AssertionError("rigid reactivation age changed across checkpoint restore")
+        if resumed.rigid_terminal.numpy()[5:8].tolist() != [1, 0, 1]:
+            raise AssertionError("terminal plastic-rubble state changed across restore")
+        if int(resumed.rigid_reactivation_deferred_counter.numpy()[5]) != 233:
+            raise AssertionError("deferred rigid reactivation count changed across restore")
         for name, expected_seed in (
             ("water_phase", phase_seed),
             ("water_phase_candidate", candidate_seed),

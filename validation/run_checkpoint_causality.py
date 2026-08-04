@@ -109,6 +109,14 @@ def main() -> None:
             "loaded_base_fraction_max": float(np.max(loaded_fraction)),
             "wall_seconds": time.perf_counter() - started,
         }
+        row.update({
+            key: value for key, value in stats.items()
+            if key.startswith((
+                "wave_row_", "sph_row_", "building_row_", "wave_train_",
+                "coupling_", "shallow_emitted_", "shallow_merged_",
+                "shallow_flux_", "wave_cohort_",
+            ))
+        })
         with metrics_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(row, ensure_ascii=False) + "\n")
         print(

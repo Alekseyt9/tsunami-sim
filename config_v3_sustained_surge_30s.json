@@ -1,0 +1,50 @@
+{
+  "extends": "config_v3_rtx5070.json",
+  "output_basename": "deluge_v3_sustained_surge",
+  "duration_seconds": 30.0,
+  "output_fps": 24,
+  "checkpoint_every_frames": 24,
+  "wave_height": 0.0,
+  "wave_speed": 0.0,
+  "background_current": 0.0,
+  "adaptive_surface_selector": "classified",
+  "refine_vertical_speed": 4.0,
+  "v3": {
+    "rigid_clusters": {
+      "terminal_plastic_collapse": true,
+      "reactivation_hysteresis": {
+        "enabled": false,
+        "minimum_dwell_seconds": 0.10,
+        "severe_acceleration_multiplier": 3.0
+      }
+    },
+    "solid_refinement": {
+      "maximum_damage_for_refinement": 0.72
+    },
+    "shallow_water": {
+      "sph_z_min": -8.0,
+      "incoming_characteristic": true,
+      "incoming_relaxation_rate": 6.0,
+      "minimum_incoming_velocity": 0.5,
+      "reverse_capture_width": 0.0,
+      "flux_quota_enabled": true,
+      "wave_train": {
+        "enabled": true,
+        "profile": "sustained_surge",
+        "start_seconds": 0.25,
+        "ramp_up_seconds": 2.0,
+        "hold_seconds": 9.5,
+        "ramp_down_seconds": 3.5,
+        "height": 8.5,
+        "target_velocity": 17.0,
+        "background_current": 0.0
+      },
+      "wave_cohort": {
+        "enabled": true,
+        "id": 1,
+        "start_seconds": 1.5,
+        "end_seconds": 19.0
+      }
+    }
+  }
+}

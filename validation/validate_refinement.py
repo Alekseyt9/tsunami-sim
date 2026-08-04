@@ -36,7 +36,8 @@ def main() -> None:
         STRUCT_BEAM: 2,
         STRUCT_COLUMN: 2,
         STRUCT_CORE: 8,
-        STRUCT_GLASS: 4,
+        # This parent is deliberately already in the rubble regime below.
+        STRUCT_GLASS: 1,
     }
     parent_count = len(roles)
 
@@ -81,7 +82,9 @@ def main() -> None:
     building_id = ints(building_host)
     fixed = ints()
     base_fixed = ints()
-    damage = floats()
+    damage_host = np.zeros(capacity, dtype=np.float32)
+    damage_host[parent_count - 1] = 0.80
+    damage = floats(damage_host)
     rho_reference = floats()
     solid_force = gpu_array(np.zeros((capacity, 3), dtype=np.float32), wp.vec3, device)
     impact_impulse = floats()
@@ -102,8 +105,9 @@ def main() -> None:
             x, rest_x, velocity, radius, mass, volume, kind, material, structural_class,
             building_id, fixed, base_fixed, damage, rho_reference, solid_force,
             impact_impulse, local_impact_active,
-            fragment_id, normal_axis, rigid_state, preimpact, counters, count, parent_count, capacity,
-            0.195, 0.0975, 0.39, 0.08, 25.0,
+            ints(), ints(), fragment_id, normal_axis, rigid_state, preimpact, counters,
+            count, parent_count, capacity,
+            0.195, 0.0975, 0.39, 0.08, 0.72, 25.0,
         ],
         device=device,
     )
@@ -132,7 +136,8 @@ def main() -> None:
             raise AssertionError(
                 f"role {role}: {actual_children} children, expected {expected_children[int(role)]}"
             )
-        if out_counters[int(role)] != 1:
+        expected_counter = 0 if role == STRUCT_GLASS else 1
+        if out_counters[int(role)] != expected_counter:
             raise AssertionError(f"role {role}: refinement counter is {out_counters[int(role)]}")
         role_mass = float(out_mass[selection].sum(dtype=np.float64))
         role_volume = float(out_volume[selection].sum(dtype=np.float64))

@@ -34,13 +34,18 @@ def main() -> None:
     scalar = lambda: wp.zeros(capacity, dtype=float, device=device)
     count = wp.array(np.asarray([old_count], dtype=np.int32), dtype=wp.int32, device=device)
     group_id = wp.array(np.full(capacity, -1, dtype=np.int32), dtype=wp.int32, device=device)
+    surface_mask = integer()
+    surface_mask_host = np.zeros(capacity, dtype=np.int32)
+    surface_mask_host[1] = 1
+    surface_mask = wp.array(surface_mask_host, dtype=wp.int32, device=device)
     group_counter = wp.zeros(1, dtype=wp.int32, device=device)
     wp.launch(
         refine_entering_fluid, dim=old_count,
         inputs=[x, rest, velocity, radius, mass, volume, integer(), integer(), integer(),
-                integer(), scalar(), scalar(), count, group_id, group_counter,
+                integer(), scalar(), scalar(), count, group_id, integer(), surface_mask,
+                group_counter,
                 old_count, capacity, 0.25, 1.0,
-                1, 11.5, 2.5], device=device,
+                1, 1, 11.5, 2.5], device=device,
     )
     wp.synchronize_device(device)
     final_count = int(count.numpy()[0])

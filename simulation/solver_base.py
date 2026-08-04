@@ -142,6 +142,7 @@ class DelugeSolver:
             "damage": (float, np.float32, (self.capacity,)),
             "rho_reference": (float, np.float32, (self.capacity,)),
             "fluid_group_id": (wp.int32, np.int32, (self.capacity,)),
+            "wave_cohort": (wp.int32, np.int32, (self.capacity,)),
         }
         for name, (dtype, np_dtype, shape) in specs.items():
             host = np.zeros(shape, dtype=np_dtype)
@@ -211,9 +212,12 @@ class DelugeSolver:
             refine_entering_fluid, dim=old_count,
             inputs=[a["x"], a["rest_x"], a["v"], a["radius"], a["mass"], a["volume"], a["kind"],
                     a["material"], a["building_id"], a["fixed"], a["damage"], a["rho_reference"], count_device,
-                    a["fluid_group_id"], self.fluid_group_counter,
+                    a["fluid_group_id"], a["wave_cohort"], a["water_surface_mask"],
+                    self.fluid_group_counter,
                     old_count, self.capacity, float(self.cfg["fine_spacing"]) * 0.5, float(self.cfg["refine_z"]),
                     int(bool(self.cfg.get("adaptive_surface_only", False))),
+                    int(str(self.cfg.get("adaptive_surface_selector", "height")).lower()
+                        in {"classified", "surface_mask", "mask"}),
                     float(self.cfg["water_depth"]) - float(self.cfg.get("fine_surface_band", 0.0)),
                     float(self.cfg.get("refine_vertical_speed", 2.5))],
             device=self.device,
@@ -260,6 +264,11 @@ class DelugeSolver:
                 data["fluid_group_id"].copy()
                 if "fluid_group_id" in data
                 else np.full(len(result["x"]), -1, dtype=np.int32)
+            )
+            result["wave_cohort"] = (
+                data["wave_cohort"].copy()
+                if "wave_cohort" in data
+                else np.zeros(len(result["x"]), dtype=np.int32)
             )
             return result
 
@@ -357,7 +366,11 @@ class DelugeSolver:
             }
             for optional_stat in ("active_buildings", "released_fragments", "rigid_clusters", "rigid_particles",
                                   "rigid_supported_fragments",
-                                  "rigid_reactivated_fragments", "rigid_collision_proxies", "rigid_proxy_pairs",
+                                  "rigid_reactivated_fragments",
+                                  "rigid_reactivation_deferred_substeps",
+                                  "rigid_hysteresis_protected_clusters",
+                                  "terminal_rigid_clusters",
+                                  "rigid_collision_proxies", "rigid_proxy_pairs",
                                   "rigid_proxy_all_pairs", "rigid_proxy_bvh_candidates",
                                   "rigid_proxy_bvh_contacts", "rigid_proxy_bvh_refits",
                                   "rigid_proxy_bvh_rebuilds",
@@ -383,7 +396,8 @@ class DelugeSolver:
                                   "water_splash_bricks", "water_splash_mesh_vertices",
                                   "water_stitch_surface_samples", "shallow_water_cells",
                                   "shallow_water_wet_cells", "shallow_emitted_particles",
-                                  "shallow_merged_particles", "fluid_particles_above_30m",
+                                  "shallow_merged_particles", "shallow_flux_requested_particles",
+                                  "shallow_flux_emitted_particles", "fluid_particles_above_30m",
                                   "fluid_particles_above_42m", "fluid_particles_above_60m",
                                   "damaged_slab_particles", "damaged_wall_particles",
                                   "damaged_beam_particles", "damaged_column_particles",
@@ -398,6 +412,8 @@ class DelugeSolver:
                 "fluid_volume_m3", "fluid_momentum_z_kg_m_s", "shallow_water_volume_m3",
                 "shallow_water_momentum_z", "shallow_emitted_volume_m3",
                 "shallow_merged_volume_m3", "shallow_net_transfer_volume_m3",
+                "wave_train_injected_volume_m3", "wave_train_injected_momentum_z",
+                "shallow_flux_emission_efficiency",
                 "water_surface_classify_ms", "water_mesh_preprocess_ms", "water_mesh_field_ms",
                 "water_mesh_marching_cubes_ms", "water_mesh_splash_ms", "water_mesh_total_ms",
                 "structural_adjacency_rebuild_ms",
@@ -430,6 +446,15 @@ class DelugeSolver:
             ):
                 if optional_stat in stats:
                     row[optional_stat] = float(stats[optional_stat])
+            for key, value in stats.items():
+                if key in row or not key.startswith(
+                    ("wave_row_", "sph_row_", "building_row_", "coupling_", "wave_cohort_")
+                ):
+                    continue
+                if isinstance(value, (int, np.integer)):
+                    row[key] = int(value)
+                elif isinstance(value, (float, np.floating)):
+                    row[key] = float(value)
             benchmark_rows.append(row)
             with metrics_path.open("a", encoding="utf-8") as metrics_file:
                 metrics_file.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -437,6 +462,19 @@ class DelugeSolver:
             checkpoint_every = int(self.cfg.get("checkpoint_every_frames", 0))
             if checkpoint_every and frame > 0 and frame % checkpoint_every == 0:
                 self.save_checkpoint(frame)
+
+        # A duration rarely ends exactly on the legacy frame-index checkpoint
+        # cadence (for example 360 output frames end at index 359).  Preserve
+        # that final simulated state as an additional restart point instead of
+        # silently leaving only the preceding periodic checkpoint.
+        final_frame = total_frames - 1
+        checkpoint_every = int(self.cfg.get("checkpoint_every_frames", 0))
+        if (
+            checkpoint_every
+            and final_frame >= self.start_frame
+            and (final_frame <= 0 or final_frame % checkpoint_every != 0)
+        ):
+            self.save_checkpoint(final_frame)
 
         simulation_elapsed = time.perf_counter() - simulation_started
         encoding_elapsed = 0.0
@@ -487,7 +525,11 @@ class DelugeSolver:
             }
             for optional_stat in ("active_buildings", "released_fragments", "rigid_clusters", "rigid_particles",
                                   "rigid_supported_fragments",
-                                  "rigid_reactivated_fragments", "rigid_collision_proxies", "rigid_proxy_pairs",
+                                  "rigid_reactivated_fragments",
+                                  "rigid_reactivation_deferred_substeps",
+                                  "rigid_hysteresis_protected_clusters",
+                                  "terminal_rigid_clusters",
+                                  "rigid_collision_proxies", "rigid_proxy_pairs",
                                   "rigid_proxy_all_pairs", "rigid_proxy_bvh_candidates",
                                   "rigid_proxy_bvh_contacts", "rigid_proxy_bvh_refits",
                                   "rigid_proxy_bvh_rebuilds",

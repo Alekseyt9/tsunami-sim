@@ -381,12 +381,15 @@ def refine_entering_fluid(
     rho_reference: wp.array(dtype=float),
     count: wp.array(dtype=wp.int32),
     fluid_group_id: wp.array(dtype=wp.int32),
+    wave_cohort: wp.array(dtype=wp.int32),
+    surface_mask: wp.array(dtype=wp.int32),
     fluid_group_counter: wp.array(dtype=wp.int32),
     old_count: int,
     capacity: int,
     fine_radius: float,
     refine_z: float,
     surface_only: int,
+    classified_surface_only: int,
     surface_minimum_y: float,
     turbulent_vertical_speed: float,
 ):
@@ -395,6 +398,8 @@ def refine_entering_fluid(
         return
     if surface_only != 0:
         near_surface = x[i][1] >= surface_minimum_y
+        if classified_surface_only != 0:
+            near_surface = surface_mask[i] != 0
         turbulent = wp.abs(v[i][1]) >= turbulent_vertical_speed
         if not near_surface and not turbulent:
             return
@@ -406,6 +411,7 @@ def refine_entering_fluid(
 
     parent_x = x[i]
     parent_v = v[i]
+    parent_cohort = wave_cohort[i]
     child_r = radius[i] * 0.5
     child_m = mass[i] * 0.125
     child_vol = volume[i] * 0.125
@@ -417,6 +423,7 @@ def refine_entering_fluid(
     radius[i] = child_r; mass[i] = child_m; volume[i] = child_vol
     rho_reference[i] = 0.0
     fluid_group_id[i] = group_id
+    wave_cohort[i] = parent_cohort
 
     for c in range(7):
         idx = base + c
@@ -431,6 +438,7 @@ def refine_entering_fluid(
         kind[idx] = 0; material[idx] = 0; building_id[idx] = -1; fixed[idx] = 0; damage[idx] = 0.0
         rho_reference[idx] = 0.0
         fluid_group_id[idx] = group_id
+        wave_cohort[idx] = parent_cohort
 
 
 @wp.kernel

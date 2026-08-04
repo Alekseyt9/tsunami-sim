@@ -1556,6 +1556,191 @@ def clear_body_accumulators(
 
 
 @wp.kernel
+def update_terminal_obb_quadrature(
+    rigid_state: wp.array(dtype=wp.int32),
+    rigid_terminal: wp.array(dtype=wp.int32),
+    proxy_enabled: wp.array(dtype=wp.int32),
+    quadrature_occupancy: wp.array(dtype=float),
+    proxy_local_center: wp.array(dtype=wp.vec3),
+    proxy_half_extent: wp.array(dtype=wp.vec3),
+    body_center: wp.array(dtype=wp.vec3),
+    body_orientation: wp.array(dtype=wp.quat),
+    body_linear_velocity: wp.array(dtype=wp.vec3),
+    body_angular_velocity: wp.array(dtype=wp.vec3),
+    quadrature_active: wp.array(dtype=wp.int32),
+    quadrature_body: wp.array(dtype=wp.int32),
+    quadrature_position: wp.array(dtype=wp.vec3),
+    quadrature_normal: wp.array(dtype=wp.vec3),
+    quadrature_velocity: wp.array(dtype=wp.vec3),
+    quadrature_area: wp.array(dtype=float),
+):
+    """Generate four Gauss-like samples on every face of a terminal OBB.
+
+    The 24 samples exactly partition the six OBB face areas. They are derived
+    state, so a checkpoint only needs the body transform and collision proxy.
+    """
+    sample = wp.tid()
+    body = sample / 24
+    slot = sample - body * 24
+    quadrature_body[sample] = body
+    occupancy = quadrature_occupancy[sample]
+    if (
+        rigid_state[body] == 0 or rigid_terminal[body] == 0
+        or proxy_enabled[body] == 0 or occupancy <= 1.0e-4
+    ):
+        quadrature_active[sample] = 0
+        quadrature_position[sample] = wp.vec3(0.0)
+        quadrature_normal[sample] = wp.vec3(0.0)
+        quadrature_velocity[sample] = wp.vec3(0.0)
+        quadrature_area[sample] = 0.0
+        return
+
+    face = slot / 4
+    corner = slot - face * 4
+    normal_axis = face / 2
+    normal_sign = -1.0
+    if face - normal_axis * 2 != 0:
+        normal_sign = 1.0
+    tangent_axis_0 = (normal_axis + 1) % 3
+    tangent_axis_1 = (normal_axis + 2) % 3
+    tangent_sign_0 = -1.0
+    tangent_sign_1 = -1.0
+    if corner % 2 != 0:
+        tangent_sign_0 = 1.0
+    if corner / 2 != 0:
+        tangent_sign_1 = 1.0
+
+    extent = proxy_half_extent[body]
+    local = proxy_local_center[body]
+    local[normal_axis] += normal_sign * extent[normal_axis]
+    # Two-point Gauss-Legendre nodes on each tangent axis. Four equal weights
+    # integrate a constant traction to the exact face area.
+    gauss = 0.5773502691896258
+    local[tangent_axis_0] += tangent_sign_0 * gauss * extent[tangent_axis_0]
+    local[tangent_axis_1] += tangent_sign_1 * gauss * extent[tangent_axis_1]
+    local_normal = wp.vec3(0.0)
+    local_normal[normal_axis] = normal_sign
+    orientation = body_orientation[body]
+    world_position = body_center[body] + wp.quat_rotate(orientation, local)
+    world_normal = wp.quat_rotate(orientation, local_normal)
+    arm = world_position - body_center[body]
+
+    quadrature_active[sample] = 1
+    quadrature_position[sample] = world_position
+    quadrature_normal[sample] = world_normal
+    quadrature_velocity[sample] = (
+        body_linear_velocity[body] + wp.cross(body_angular_velocity[body], arm)
+    )
+    quadrature_area[sample] = (
+        extent[tangent_axis_0] * extent[tangent_axis_1] * occupancy
+    )
+
+
+@wp.kernel
+def apply_terminal_obb_hydrodynamics(
+    grid: wp.uint64,
+    x: wp.array(dtype=wp.vec3),
+    v: wp.array(dtype=wp.vec3),
+    radius: wp.array(dtype=float),
+    mass: wp.array(dtype=float),
+    volume: wp.array(dtype=float),
+    kind: wp.array(dtype=wp.int32),
+    water_phase: wp.array(dtype=wp.int32),
+    pressure: wp.array(dtype=float),
+    time_level: wp.array(dtype=wp.int32),
+    time_active: wp.array(dtype=wp.int32),
+    quadrature_active: wp.array(dtype=wp.int32),
+    quadrature_body: wp.array(dtype=wp.int32),
+    quadrature_position: wp.array(dtype=wp.vec3),
+    quadrature_normal: wp.array(dtype=wp.vec3),
+    quadrature_velocity: wp.array(dtype=wp.vec3),
+    quadrature_area: wp.array(dtype=float),
+    body_center: wp.array(dtype=wp.vec3),
+    body_mass: wp.array(dtype=float),
+    body_force: wp.array2d(dtype=float),
+    body_torque: wp.array2d(dtype=float),
+    fluid_acceleration: wp.array(dtype=wp.vec3),
+    active_counter: wp.array(dtype=wp.int32),
+    wet_counter: wp.array(dtype=wp.int32),
+    rest_density: float,
+    drag_coefficient: float,
+    maximum_body_acceleration: float,
+    query_radius: float,
+    evaluation_stride: int,
+):
+    """Exchange pressure/drag impulse between SPH water and terminal OBBs.
+
+    Each water reaction is paired with an equal opposite body reaction. The
+    body torque uses the same world-space point as the fluid force, preserving
+    both linear and angular momentum (within atomic floating-point tolerance).
+    """
+    sample = wp.tid()
+    if quadrature_active[sample] == 0:
+        return
+    wp.atomic_add(active_counter, 0, 1)
+    position = quadrature_position[sample]
+    normal = quadrature_normal[sample]
+    sample_velocity = quadrature_velocity[sample]
+    wet = int(0)
+    body = quadrature_body[sample]
+    area = quadrature_area[sample]
+    maximum_force = (
+        wp.max(body_mass[body], 1.0) * maximum_body_acceleration / 24.0
+    )
+    query = wp.hash_grid_query(grid, position, query_radius)
+    for particle in query:
+        if (
+            kind[particle] != 0 or water_phase[particle] == 2
+            or time_active[particle] == 0
+        ):
+            continue
+        delta = position - x[particle]
+        distance_squared = wp.dot(delta, delta)
+        support = 4.0 * radius[particle]
+        if distance_squared >= support * support:
+            continue
+        weight = volume[particle] * poly6(distance_squared, support)
+        if weight <= 1.0e-7:
+            continue
+        wet = 1
+        relative_velocity = v[particle] - sample_velocity
+        speed = wp.length(relative_velocity)
+        force_on_body = -normal * (
+            wp.max(pressure[particle], 0.0) * area * weight
+        )
+        if speed > 1.0e-5:
+            force_on_body += relative_velocity * (
+                0.5 * rest_density * drag_coefficient * area * weight * speed
+            )
+        # The per-neighbour cap partitions the sample's acceleration budget
+        # with the same SPH weight. In a calibrated support, sum(weight) ~= 1.
+        pair_limit = maximum_force * wp.min(weight, 1.0)
+        force_length = wp.length(force_on_body)
+        if force_length > pair_limit:
+            force_on_body *= pair_limit / force_length
+        fluid_stride = 1
+        if time_level[particle] == 1:
+            fluid_stride = 2
+        elif time_level[particle] >= 2:
+            fluid_stride = 4
+        interaction_stride = wp.max(evaluation_stride, fluid_stride)
+        force_on_water = -force_on_body * (
+            float(interaction_stride) / float(fluid_stride)
+        )
+        wp.atomic_add(
+            fluid_acceleration, particle,
+            force_on_water / wp.max(mass[particle], 1.0e-8),
+        )
+        body_reaction = -force_on_water * float(fluid_stride)
+        torque = wp.cross(x[particle] - body_center[body], body_reaction)
+        for axis in range(3):
+            wp.atomic_add(body_force, body, axis, body_reaction[axis])
+            wp.atomic_add(body_torque, body, axis, torque[axis])
+    if wet != 0:
+        wp.atomic_add(wet_counter, 0, 1)
+
+
+@wp.kernel
 def accumulate_rigid_body_loads(
     x: wp.array(dtype=wp.vec3),
     v: wp.array(dtype=wp.vec3),
@@ -1564,6 +1749,7 @@ def accumulate_rigid_body_loads(
     kind: wp.array(dtype=wp.int32),
     fragment_id: wp.array(dtype=wp.int32),
     rigid_state: wp.array(dtype=wp.int32),
+    rigid_terminal: wp.array(dtype=wp.int32),
     proxy_enabled: wp.array(dtype=wp.int32),
     acceleration: wp.array(dtype=wp.vec3),
     body_center: wp.array(dtype=wp.vec3),
@@ -1575,10 +1761,16 @@ def accumulate_rigid_body_loads(
     y_max: float,
     boundary_stiffness: float,
     boundary_damping: float,
+    shed_terminal_samples: int,
 ):
     i = wp.tid()
     fid = fragment_id[i]
     if kind[i] == 0 or fid < 0 or rigid_state[fid] == 0:
+        return
+    if (
+        shed_terminal_samples != 0 and rigid_terminal[fid] != 0
+        and proxy_enabled[fid] != 0
+    ):
         return
     xi = x[i]
     vi = v[i]
@@ -1616,6 +1808,20 @@ def accumulate_rigid_body_loads(
     for axis in range(3):
         wp.atomic_add(body_force, fid, axis, force[axis])
         wp.atomic_add(body_torque, fid, axis, torque[axis])
+
+
+@wp.kernel
+def accumulate_rigid_gravity(
+    rigid_state: wp.array(dtype=wp.int32),
+    body_mass: wp.array(dtype=float),
+    body_force: wp.array2d(dtype=float),
+    gravity: float,
+):
+    """Apply weight once per rigid body, independent of render samples."""
+    body = wp.tid()
+    if rigid_state[body] == 0:
+        return
+    wp.atomic_add(body_force, body, 1, -gravity * body_mass[body])
 
 
 @wp.func
@@ -1891,6 +2097,582 @@ def update_rigid_proxy_bounds(
     ) + wp.vec3(margin)
     bounds_lower[body] = center - extent
     bounds_upper[body] = center + extent
+
+
+@wp.kernel
+def update_terminal_proxy_bounds(
+    rigid_state: wp.array(dtype=wp.int32),
+    rigid_terminal: wp.array(dtype=wp.int32),
+    proxy_enabled: wp.array(dtype=wp.int32),
+    proxy_local_center: wp.array(dtype=wp.vec3),
+    proxy_half_extent: wp.array(dtype=wp.vec3),
+    body_center: wp.array(dtype=wp.vec3),
+    body_orientation: wp.array(dtype=wp.quat),
+    bounds_lower: wp.array(dtype=wp.vec3),
+    bounds_upper: wp.array(dtype=wp.vec3),
+    margin: float,
+):
+    """World AABBs containing only terminal OBB hydrodynamic proxies."""
+    body = wp.tid()
+    if (
+        rigid_state[body] == 0 or rigid_terminal[body] == 0
+        or proxy_enabled[body] == 0
+    ):
+        far = 1.0e6 + float(body) * 2.0
+        bounds_lower[body] = wp.vec3(far, far, far)
+        bounds_upper[body] = wp.vec3(far + 0.01, far + 0.01, far + 0.01)
+        return
+    orientation = body_orientation[body]
+    center = body_center[body] + wp.quat_rotate(
+        orientation, proxy_local_center[body]
+    )
+    half_extent = proxy_half_extent[body]
+    axis_x = proxy_axis(orientation, 0)
+    axis_y = proxy_axis(orientation, 1)
+    axis_z = proxy_axis(orientation, 2)
+    extent = wp.vec3(
+        wp.abs(axis_x[0]) * half_extent[0]
+        + wp.abs(axis_y[0]) * half_extent[1]
+        + wp.abs(axis_z[0]) * half_extent[2],
+        wp.abs(axis_x[1]) * half_extent[0]
+        + wp.abs(axis_y[1]) * half_extent[1]
+        + wp.abs(axis_z[1]) * half_extent[2],
+        wp.abs(axis_x[2]) * half_extent[0]
+        + wp.abs(axis_y[2]) * half_extent[1]
+        + wp.abs(axis_z[2]) * half_extent[2],
+    ) + wp.vec3(margin)
+    bounds_lower[body] = center - extent
+    bounds_upper[body] = center + extent
+
+
+@wp.kernel
+def clear_global_proxy_bounds(
+    global_lower: wp.array2d(dtype=float),
+    global_upper: wp.array2d(dtype=float),
+):
+    axis = wp.tid()
+    global_lower[0, axis] = 1.0e9
+    global_upper[0, axis] = -1.0e9
+
+
+@wp.kernel
+def reduce_terminal_proxy_global_bounds(
+    rigid_state: wp.array(dtype=wp.int32),
+    rigid_terminal: wp.array(dtype=wp.int32),
+    proxy_enabled: wp.array(dtype=wp.int32),
+    bounds_lower: wp.array(dtype=wp.vec3),
+    bounds_upper: wp.array(dtype=wp.vec3),
+    global_lower: wp.array2d(dtype=float),
+    global_upper: wp.array2d(dtype=float),
+):
+    body = wp.tid()
+    if (
+        rigid_state[body] == 0 or rigid_terminal[body] == 0
+        or proxy_enabled[body] == 0
+    ):
+        return
+    lower = bounds_lower[body]
+    upper = bounds_upper[body]
+    for axis in range(3):
+        wp.atomic_min(global_lower, 0, axis, lower[axis])
+        wp.atomic_max(global_upper, 0, axis, upper[axis])
+
+
+@wp.func
+def particle_proxy_contact(
+    point: wp.vec3,
+    particle_radius: float,
+    center: wp.vec3,
+    orientation: wp.quat,
+    half_extent: wp.vec3,
+) -> wp.vec4:
+    """Outward normal and penetration for a sphere against an OBB."""
+    local = wp.quat_rotate_inv(orientation, point - center)
+    closest = wp.vec3(
+        wp.clamp(local[0], -half_extent[0], half_extent[0]),
+        wp.clamp(local[1], -half_extent[1], half_extent[1]),
+        wp.clamp(local[2], -half_extent[2], half_extent[2]),
+    )
+    outside = local - closest
+    outside_distance = wp.length(outside)
+    local_normal = wp.vec3(0.0)
+    penetration = float(0.0)
+    if outside_distance > 1.0e-6:
+        if outside_distance >= particle_radius:
+            return wp.vec4(0.0)
+        local_normal = outside / outside_distance
+        penetration = particle_radius - outside_distance
+    else:
+        # The centre is inside the OBB. Push through the nearest face instead
+        # of dividing by a zero closest-point distance.
+        nearest_axis = 0
+        nearest_distance = half_extent[0] - wp.abs(local[0])
+        for axis in range(1, 3):
+            face_distance = half_extent[axis] - wp.abs(local[axis])
+            if face_distance < nearest_distance:
+                nearest_axis = axis
+                nearest_distance = face_distance
+        sign = -1.0
+        if local[nearest_axis] >= 0.0:
+            sign = 1.0
+        local_normal[nearest_axis] = sign
+        penetration = particle_radius + wp.max(nearest_distance, 0.0)
+    world_normal = wp.quat_rotate(orientation, local_normal)
+    return wp.vec4(
+        world_normal[0], world_normal[1], world_normal[2], penetration
+    )
+
+
+@wp.kernel
+def accumulate_terminal_proxy_fluid_contacts_bvh(
+    bvh_id: wp.uint64,
+    x: wp.array(dtype=wp.vec3),
+    v: wp.array(dtype=wp.vec3),
+    radius: wp.array(dtype=float),
+    mass: wp.array(dtype=float),
+    kind: wp.array(dtype=wp.int32),
+    fluid_particle: wp.array(dtype=wp.int32),
+    water_phase: wp.array(dtype=wp.int32),
+    time_level: wp.array(dtype=wp.int32),
+    time_active: wp.array(dtype=wp.int32),
+    rigid_state: wp.array(dtype=wp.int32),
+    rigid_terminal: wp.array(dtype=wp.int32),
+    proxy_enabled: wp.array(dtype=wp.int32),
+    proxy_local_center: wp.array(dtype=wp.vec3),
+    proxy_half_extent: wp.array(dtype=wp.vec3),
+    body_center: wp.array(dtype=wp.vec3),
+    body_orientation: wp.array(dtype=wp.quat),
+    body_linear_velocity: wp.array(dtype=wp.vec3),
+    body_angular_velocity: wp.array(dtype=wp.vec3),
+    body_force: wp.array2d(dtype=float),
+    body_torque: wp.array2d(dtype=float),
+    fluid_acceleration: wp.array(dtype=wp.vec3),
+    global_lower: wp.array2d(dtype=float),
+    global_upper: wp.array2d(dtype=float),
+    query_particle_counter: wp.array(dtype=wp.int32),
+    candidate_counter: wp.array(dtype=wp.int32),
+    contact_counter: wp.array(dtype=wp.int32),
+    stiffness: float,
+    normal_damping: float,
+    tangential_damping: float,
+    friction: float,
+    maximum_penetration: float,
+    maximum_fluid_acceleration: float,
+    query_margin: float,
+    evaluation_stride: int,
+):
+    """Analytical non-penetration for SPH/ballistic water against terminal OBBs."""
+    slot = wp.tid()
+    particle = fluid_particle[slot]
+    if kind[particle] != 0 or time_active[particle] == 0:
+        return
+    point = x[particle]
+    particle_radius = radius[particle] + query_margin
+    for axis in range(3):
+        if (
+            point[axis] + particle_radius < global_lower[0, axis]
+            or point[axis] - particle_radius > global_upper[0, axis]
+        ):
+            return
+    wp.atomic_add(query_particle_counter, 0, 1)
+    query_extent = wp.vec3(particle_radius)
+    query = wp.bvh_query_aabb(
+        bvh_id, point - query_extent, point + query_extent
+    )
+    body = int(0)
+    added_acceleration = wp.vec3(0.0)
+    while wp.bvh_query_next(query, body):
+        if (
+            rigid_state[body] == 0 or rigid_terminal[body] == 0
+            or proxy_enabled[body] == 0
+        ):
+            continue
+        wp.atomic_add(candidate_counter, 0, 1)
+        orientation = body_orientation[body]
+        proxy_center = body_center[body] + wp.quat_rotate(
+            orientation, proxy_local_center[body]
+        )
+        contact = particle_proxy_contact(
+            point, particle_radius, proxy_center, orientation,
+            proxy_half_extent[body],
+        )
+        if contact[3] <= 0.0:
+            continue
+        wp.atomic_add(contact_counter, 0, 1)
+        normal = wp.vec3(contact[0], contact[1], contact[2])
+        arm = point - body_center[body]
+        body_point_velocity = (
+            body_linear_velocity[body]
+            + wp.cross(body_angular_velocity[body], arm)
+        )
+        relative_velocity = v[particle] - body_point_velocity
+        normal_speed = wp.dot(relative_velocity, normal)
+        normal_magnitude = (
+            stiffness * wp.min(contact[3], maximum_penetration)
+            + normal_damping * wp.max(-normal_speed, 0.0)
+        )
+        normal_magnitude = wp.max(normal_magnitude, 0.0)
+        tangent_velocity = relative_velocity - normal * normal_speed
+        tangent_speed = wp.length(tangent_velocity)
+        force_on_water = normal * normal_magnitude
+        if tangent_speed > 1.0e-5:
+            friction_magnitude = wp.min(
+                friction * normal_magnitude,
+                tangential_damping * tangent_speed,
+            )
+            force_on_water -= tangent_velocity * (
+                friction_magnitude / tangent_speed
+            )
+        particle_mass = wp.max(mass[particle], 1.0e-8)
+        maximum_force = maximum_fluid_acceleration * particle_mass
+        force_length = wp.length(force_on_water)
+        if maximum_fluid_acceleration > 0.0 and force_length > maximum_force:
+            force_on_water *= maximum_force / force_length
+        fluid_stride = 1
+        if time_level[particle] == 1:
+            fluid_stride = 2
+        elif time_level[particle] >= 2:
+            fluid_stride = 4
+        interaction_stride = wp.max(evaluation_stride, fluid_stride)
+        force_on_water *= float(interaction_stride) / float(fluid_stride)
+        added_acceleration += force_on_water / particle_mass
+        body_reaction = -force_on_water * float(fluid_stride)
+        reaction_torque = wp.cross(arm, body_reaction)
+        for axis in range(3):
+            wp.atomic_add(body_force, body, axis, body_reaction[axis])
+            wp.atomic_add(body_torque, body, axis, reaction_torque[axis])
+    fluid_acceleration[particle] += added_acceleration
+
+
+@wp.kernel
+def build_terminal_proxy_fluid_contact_cache_bvh(
+    bvh_id: wp.uint64,
+    x: wp.array(dtype=wp.vec3),
+    radius: wp.array(dtype=float),
+    kind: wp.array(dtype=wp.int32),
+    fluid_particle: wp.array(dtype=wp.int32),
+    rigid_state: wp.array(dtype=wp.int32),
+    rigid_terminal: wp.array(dtype=wp.int32),
+    proxy_enabled: wp.array(dtype=wp.int32),
+    global_lower: wp.array2d(dtype=float),
+    global_upper: wp.array2d(dtype=float),
+    cache_body: wp.array2d(dtype=wp.int32),
+    cache_body_count: wp.array(dtype=wp.int32),
+    cache_active_flag: wp.array(dtype=wp.int32),
+    query_particle_counter: wp.array(dtype=wp.int32),
+    candidate_counter: wp.array(dtype=wp.int32),
+    overflow_counter: wp.array(dtype=wp.int32),
+    query_margin: float,
+    motion_margin: float,
+    maximum_bodies_per_particle: int,
+):
+    """Cache conservative fluid/terminal-OBB candidates between BVH refits.
+
+    Both the proxy BVH bounds and the particle query are fattened for the
+    cache lifetime. Exact sphere/OBB overlap is deliberately deferred to the
+    evaluation kernel, so a pair can become active without rebuilding.
+    """
+    slot = wp.tid()
+    cache_body_count[slot] = 0
+    cache_active_flag[slot] = 0
+    particle = fluid_particle[slot]
+    if kind[particle] != 0:
+        return
+    point = x[particle]
+    particle_radius = radius[particle] + query_margin + motion_margin
+    for axis in range(3):
+        if (
+            point[axis] + particle_radius < global_lower[0, axis]
+            or point[axis] - particle_radius > global_upper[0, axis]
+        ):
+            return
+    wp.atomic_add(query_particle_counter, 0, 1)
+    query_extent = wp.vec3(particle_radius)
+    query = wp.bvh_query_aabb(
+        bvh_id, point - query_extent, point + query_extent
+    )
+    body = int(0)
+    count = int(0)
+    while wp.bvh_query_next(query, body):
+        if (
+            rigid_state[body] == 0 or rigid_terminal[body] == 0
+            or proxy_enabled[body] == 0
+        ):
+            continue
+        if count < maximum_bodies_per_particle:
+            cache_body[slot, count] = body
+            count += 1
+            wp.atomic_add(candidate_counter, 0, 1)
+        else:
+            wp.atomic_add(overflow_counter, 0, 1)
+    cache_body_count[slot] = count
+    if count > 0:
+        cache_active_flag[slot] = 1
+
+
+@wp.kernel
+def scatter_terminal_proxy_fluid_contact_cache_active(
+    cache_active_flag: wp.array(dtype=wp.int32),
+    cache_active_offset: wp.array(dtype=wp.int32),
+    cache_active_slot: wp.array(dtype=wp.int32),
+):
+    slot = wp.tid()
+    if cache_active_flag[slot] != 0:
+        cache_active_slot[cache_active_offset[slot]] = slot
+
+
+@wp.kernel
+def accumulate_terminal_proxy_fluid_contacts_cached(
+    x: wp.array(dtype=wp.vec3),
+    v: wp.array(dtype=wp.vec3),
+    radius: wp.array(dtype=float),
+    mass: wp.array(dtype=float),
+    kind: wp.array(dtype=wp.int32),
+    fluid_particle: wp.array(dtype=wp.int32),
+    time_level: wp.array(dtype=wp.int32),
+    time_active: wp.array(dtype=wp.int32),
+    rigid_state: wp.array(dtype=wp.int32),
+    rigid_terminal: wp.array(dtype=wp.int32),
+    proxy_enabled: wp.array(dtype=wp.int32),
+    quadrature_occupancy: wp.array(dtype=float),
+    proxy_local_center: wp.array(dtype=wp.vec3),
+    proxy_half_extent: wp.array(dtype=wp.vec3),
+    body_center: wp.array(dtype=wp.vec3),
+    body_orientation: wp.array(dtype=wp.quat),
+    body_linear_velocity: wp.array(dtype=wp.vec3),
+    body_angular_velocity: wp.array(dtype=wp.vec3),
+    body_force: wp.array2d(dtype=float),
+    body_torque: wp.array2d(dtype=float),
+    fluid_acceleration: wp.array(dtype=wp.vec3),
+    cache_body: wp.array2d(dtype=wp.int32),
+    cache_body_count: wp.array(dtype=wp.int32),
+    cache_active_slot: wp.array(dtype=wp.int32),
+    contact_counter: wp.array(dtype=wp.int32),
+    stiffness: float,
+    normal_damping: float,
+    tangential_damping: float,
+    friction: float,
+    maximum_penetration: float,
+    maximum_fluid_acceleration: float,
+    query_margin: float,
+    evaluation_stride: int,
+):
+    """Evaluate exact contacts only for particles with cached OBB candidates."""
+    active = wp.tid()
+    slot = cache_active_slot[active]
+    particle = fluid_particle[slot]
+    if kind[particle] != 0 or time_active[particle] == 0:
+        return
+    point = x[particle]
+    particle_radius = radius[particle] + query_margin
+    added_acceleration = wp.vec3(0.0)
+    count = cache_body_count[slot]
+    for candidate in range(count):
+        body = cache_body[slot, candidate]
+        if (
+            rigid_state[body] == 0 or rigid_terminal[body] == 0
+            or proxy_enabled[body] == 0
+        ):
+            continue
+        orientation = body_orientation[body]
+        proxy_center = body_center[body] + wp.quat_rotate(
+            orientation, proxy_local_center[body]
+        )
+        contact = particle_proxy_contact(
+            point, particle_radius, proxy_center, orientation,
+            proxy_half_extent[body],
+        )
+        if contact[3] <= 0.0:
+            continue
+        local_point = wp.quat_rotate_inv(orientation, point - proxy_center)
+        local_normal = wp.quat_rotate_inv(
+            orientation, wp.vec3(contact[0], contact[1], contact[2])
+        )
+        normal_axis = int(0)
+        if wp.abs(local_normal[1]) > wp.abs(local_normal[normal_axis]):
+            normal_axis = 1
+        if wp.abs(local_normal[2]) > wp.abs(local_normal[normal_axis]):
+            normal_axis = 2
+        face = normal_axis * 2
+        if local_normal[normal_axis] >= 0.0:
+            face += 1
+        tangent_axis_0 = (normal_axis + 1) % 3
+        tangent_axis_1 = (normal_axis + 2) % 3
+        corner = int(0)
+        if local_point[tangent_axis_0] >= 0.0:
+            corner += 1
+        if local_point[tangent_axis_1] >= 0.0:
+            corner += 2
+        occupancy = quadrature_occupancy[body * 24 + face * 4 + corner]
+        if occupancy <= 1.0e-4:
+            continue
+        wp.atomic_add(contact_counter, 0, 1)
+        normal = wp.vec3(contact[0], contact[1], contact[2])
+        arm = point - body_center[body]
+        body_point_velocity = (
+            body_linear_velocity[body]
+            + wp.cross(body_angular_velocity[body], arm)
+        )
+        relative_velocity = v[particle] - body_point_velocity
+        normal_speed = wp.dot(relative_velocity, normal)
+        normal_magnitude = (
+            stiffness * wp.min(contact[3], maximum_penetration)
+            + normal_damping * wp.max(-normal_speed, 0.0)
+        )
+        normal_magnitude = wp.max(normal_magnitude, 0.0)
+        tangent_velocity = relative_velocity - normal * normal_speed
+        tangent_speed = wp.length(tangent_velocity)
+        force_on_water = normal * normal_magnitude
+        if tangent_speed > 1.0e-5:
+            friction_magnitude = wp.min(
+                friction * normal_magnitude,
+                tangential_damping * tangent_speed,
+            )
+            force_on_water -= tangent_velocity * (
+                friction_magnitude / tangent_speed
+            )
+        force_on_water *= occupancy
+        particle_mass = wp.max(mass[particle], 1.0e-8)
+        maximum_force = maximum_fluid_acceleration * particle_mass
+        force_length = wp.length(force_on_water)
+        if maximum_fluid_acceleration > 0.0 and force_length > maximum_force:
+            force_on_water *= maximum_force / force_length
+        fluid_stride = 1
+        if time_level[particle] == 1:
+            fluid_stride = 2
+        elif time_level[particle] >= 2:
+            fluid_stride = 4
+        interaction_stride = wp.max(evaluation_stride, fluid_stride)
+        force_on_water *= float(interaction_stride) / float(fluid_stride)
+        added_acceleration += force_on_water / particle_mass
+        body_reaction = -force_on_water * float(fluid_stride)
+        reaction_torque = wp.cross(arm, body_reaction)
+        for axis in range(3):
+            wp.atomic_add(body_force, body, axis, body_reaction[axis])
+            wp.atomic_add(body_torque, body, axis, reaction_torque[axis])
+    fluid_acceleration[particle] += added_acceleration
+
+
+@wp.kernel
+def gather_indexed_positions(
+    x: wp.array(dtype=wp.vec3),
+    particle_index: wp.array(dtype=wp.int32),
+    compact_position: wp.array(dtype=wp.vec3),
+):
+    slot = wp.tid()
+    compact_position[slot] = x[particle_index[slot]]
+
+
+@wp.kernel
+def accumulate_terminal_proxy_fluid_contacts_grid(
+    fluid_grid: wp.uint64,
+    fluid_position: wp.array(dtype=wp.vec3),
+    fluid_particle: wp.array(dtype=wp.int32),
+    x: wp.array(dtype=wp.vec3),
+    v: wp.array(dtype=wp.vec3),
+    radius: wp.array(dtype=float),
+    mass: wp.array(dtype=float),
+    time_level: wp.array(dtype=wp.int32),
+    time_active: wp.array(dtype=wp.int32),
+    rigid_state: wp.array(dtype=wp.int32),
+    rigid_terminal: wp.array(dtype=wp.int32),
+    proxy_enabled: wp.array(dtype=wp.int32),
+    proxy_local_center: wp.array(dtype=wp.vec3),
+    proxy_half_extent: wp.array(dtype=wp.vec3),
+    body_center: wp.array(dtype=wp.vec3),
+    body_orientation: wp.array(dtype=wp.quat),
+    body_linear_velocity: wp.array(dtype=wp.vec3),
+    body_angular_velocity: wp.array(dtype=wp.vec3),
+    body_force: wp.array2d(dtype=float),
+    body_torque: wp.array2d(dtype=float),
+    fluid_acceleration: wp.array(dtype=wp.vec3),
+    candidate_counter: wp.array(dtype=wp.int32),
+    contact_counter: wp.array(dtype=wp.int32),
+    stiffness: float,
+    normal_damping: float,
+    tangential_damping: float,
+    friction: float,
+    maximum_penetration: float,
+    maximum_fluid_acceleration: float,
+    query_margin: float,
+    query_padding: float,
+):
+    """Body-centric analytical contact against a compact fluid-only grid."""
+    body = wp.tid()
+    if (
+        rigid_state[body] == 0 or rigid_terminal[body] == 0
+        or proxy_enabled[body] == 0
+    ):
+        return
+    orientation = body_orientation[body]
+    proxy_center = body_center[body] + wp.quat_rotate(
+        orientation, proxy_local_center[body]
+    )
+    query_radius = wp.length(proxy_half_extent[body]) + query_padding
+    query = wp.hash_grid_query(fluid_grid, proxy_center, query_radius)
+    accumulated_force = wp.vec3(0.0)
+    accumulated_torque = wp.vec3(0.0)
+    for fluid_slot in query:
+        particle = fluid_particle[fluid_slot]
+        if time_active[particle] == 0:
+            continue
+        point = fluid_position[fluid_slot]
+        # HashGrid returns the surrounding cells; retain the documented
+        # spherical query radius before the exact OBB narrowphase.
+        if wp.length(point - proxy_center) > query_radius:
+            continue
+        wp.atomic_add(candidate_counter, 0, 1)
+        particle_radius = radius[particle] + query_margin
+        contact = particle_proxy_contact(
+            point, particle_radius, proxy_center, orientation,
+            proxy_half_extent[body],
+        )
+        if contact[3] <= 0.0:
+            continue
+        wp.atomic_add(contact_counter, 0, 1)
+        normal = wp.vec3(contact[0], contact[1], contact[2])
+        arm = point - body_center[body]
+        body_point_velocity = (
+            body_linear_velocity[body]
+            + wp.cross(body_angular_velocity[body], arm)
+        )
+        relative_velocity = v[particle] - body_point_velocity
+        normal_speed = wp.dot(relative_velocity, normal)
+        normal_magnitude = (
+            stiffness * wp.min(contact[3], maximum_penetration)
+            + normal_damping * wp.max(-normal_speed, 0.0)
+        )
+        normal_magnitude = wp.max(normal_magnitude, 0.0)
+        tangent_velocity = relative_velocity - normal * normal_speed
+        tangent_speed = wp.length(tangent_velocity)
+        force_on_water = normal * normal_magnitude
+        if tangent_speed > 1.0e-5:
+            friction_magnitude = wp.min(
+                friction * normal_magnitude,
+                tangential_damping * tangent_speed,
+            )
+            force_on_water -= tangent_velocity * (
+                friction_magnitude / tangent_speed
+            )
+        particle_mass = wp.max(mass[particle], 1.0e-8)
+        maximum_force = maximum_fluid_acceleration * particle_mass
+        force_length = wp.length(force_on_water)
+        if maximum_fluid_acceleration > 0.0 and force_length > maximum_force:
+            force_on_water *= maximum_force / force_length
+        wp.atomic_add(
+            fluid_acceleration, particle, force_on_water / particle_mass
+        )
+        stride = 1
+        if time_level[particle] == 1:
+            stride = 2
+        elif time_level[particle] >= 2:
+            stride = 4
+        body_reaction = -force_on_water * float(stride)
+        accumulated_force += body_reaction
+        accumulated_torque += wp.cross(arm, body_reaction)
+    for axis in range(3):
+        wp.atomic_add(body_force, body, axis, accumulated_force[axis])
+        wp.atomic_add(body_torque, body, axis, accumulated_torque[axis])
 
 
 @wp.kernel
@@ -2181,16 +2963,52 @@ def accumulate_rigid_contacts(
 @wp.kernel
 def reactivate_rigid_after_impact(
     rigid_state: wp.array(dtype=wp.int32),
+    rigid_terminal: wp.array(dtype=wp.int32),
+    rigid_age_substeps: wp.array(dtype=wp.int32),
     contact_acceleration_peak: wp.array(dtype=float),
     reactivated_count: wp.array(dtype=wp.int32),
+    deferred_count: wp.array(dtype=wp.int32),
     acceleration_threshold: float,
+    minimum_age_substeps: int,
+    severe_acceleration_threshold: float,
 ):
     body = wp.tid()
+    state = rigid_state[body]
+    if state == 0:
+        rigid_age_substeps[body] = 0
+        return
+
+    age = rigid_age_substeps[body]
+    if age < 2147483647:
+        age += 1
+        rigid_age_substeps[body] = age
+
     # State 2 is a sleeping rigid proxy. It is woken by the dedicated sleep
     # policy, not expanded straight back into the deformable particle graph.
-    if rigid_state[body] == 1 and contact_acceleration_peak[body] >= acceleration_threshold:
-        rigid_state[body] = 0
-        wp.atomic_add(reactivated_count, 0, 1)
+    if state != 1 or contact_acceleration_peak[body] < acceleration_threshold:
+        return
+
+    # A plastic-collapse conversion represents unresolved crushed rubble whose
+    # elastic particle graph is no longer a meaningful material state.  It may
+    # collide and move as a rigid chunk, but must not be expanded back into the
+    # already stretched spring network.  Ordinary cohesive rigid fragments
+    # retain the impact-reactivation path.
+    if rigid_terminal[body] != 0:
+        return
+
+    # A freshly fitted rigid cluster still overlaps its former deformable
+    # neighbours.  Those residual contacts used to expand hundreds of bodies
+    # back into the particle graph on the very next frame.  Keep a short dwell
+    # time, while allowing a genuinely severe new impact to bypass it.
+    if age < minimum_age_substeps and contact_acceleration_peak[body] < severe_acceleration_threshold:
+        # One counter per body avoids serializing every protected contact on a
+        # single global atomic during mass rigid conversion events.
+        wp.atomic_add(deferred_count, body, 1)
+        return
+
+    rigid_state[body] = 0
+    rigid_age_substeps[body] = 0
+    wp.atomic_add(reactivated_count, 0, 1)
 
 
 @wp.kernel
@@ -2344,20 +3162,57 @@ def accumulate_rigid_sample_bottom(
     kind: wp.array(dtype=wp.int32),
     fragment_id: wp.array(dtype=wp.int32),
     rigid_state: wp.array(dtype=wp.int32),
+    rigid_terminal: wp.array(dtype=wp.int32),
+    proxy_enabled: wp.array(dtype=wp.int32),
     rigid_local_position: wp.array(dtype=wp.vec3),
     body_center: wp.array(dtype=wp.vec3),
     body_orientation: wp.array(dtype=wp.quat),
     sample_bottom: wp.array(dtype=float),
+    shed_terminal_samples: int,
 ):
     """Find the real sample-union floor, not the bottom of one giant OBB."""
     particle = wp.tid()
     body = fragment_id[particle]
     if kind[particle] == 0 or body < 0 or rigid_state[body] == 0:
         return
+    if (
+        shed_terminal_samples != 0 and rigid_terminal[body] != 0
+        and proxy_enabled[body] != 0
+    ):
+        return
     world = body_center[body] + wp.quat_rotate(
         body_orientation[body], rigid_local_position[particle]
     )
     wp.atomic_min(sample_bottom, body, world[1] - radius[particle])
+
+
+@wp.kernel
+def accumulate_terminal_proxy_bottom(
+    rigid_state: wp.array(dtype=wp.int32),
+    rigid_terminal: wp.array(dtype=wp.int32),
+    proxy_enabled: wp.array(dtype=wp.int32),
+    proxy_local_center: wp.array(dtype=wp.vec3),
+    proxy_half_extent: wp.array(dtype=wp.vec3),
+    body_center: wp.array(dtype=wp.vec3),
+    body_orientation: wp.array(dtype=wp.quat),
+    sample_bottom: wp.array(dtype=float),
+):
+    """Analytical conservative floor for sample-shed terminal OBBs."""
+    body = wp.tid()
+    if (
+        rigid_state[body] == 0 or rigid_terminal[body] == 0
+        or proxy_enabled[body] == 0
+    ):
+        return
+    orientation = body_orientation[body]
+    center = body_center[body] + wp.quat_rotate(
+        orientation, proxy_local_center[body]
+    )
+    down = wp.vec3(0.0, 1.0, 0.0)
+    projection = proxy_projection_radius(
+        down, orientation, proxy_half_extent[body]
+    )
+    sample_bottom[body] = center[1] - projection
 
 
 @wp.kernel
@@ -2400,15 +3255,23 @@ def scatter_rigid_particles(
     kind: wp.array(dtype=wp.int32),
     fragment_id: wp.array(dtype=wp.int32),
     rigid_state: wp.array(dtype=wp.int32),
+    rigid_terminal: wp.array(dtype=wp.int32),
+    proxy_enabled: wp.array(dtype=wp.int32),
     rigid_local_position: wp.array(dtype=wp.vec3),
     body_center: wp.array(dtype=wp.vec3),
     body_orientation: wp.array(dtype=wp.quat),
     body_linear_velocity: wp.array(dtype=wp.vec3),
     body_angular_velocity: wp.array(dtype=wp.vec3),
+    skip_terminal_proxy_samples: int,
 ):
     i = wp.tid()
     fid = fragment_id[i]
     if kind[i] == 0 or fid < 0 or rigid_state[fid] == 0:
+        return
+    if (
+        skip_terminal_proxy_samples != 0 and rigid_terminal[fid] != 0
+        and proxy_enabled[fid] != 0
+    ):
         return
     offset = wp.quat_rotate(body_orientation[fid], rigid_local_position[i])
     x[i] = body_center[fid] + offset
@@ -2476,8 +3339,11 @@ def update_hydraulic_boundary_mask(
     damage: wp.array(dtype=float),
     fragment_id: wp.array(dtype=wp.int32),
     rigid_state: wp.array(dtype=wp.int32),
+    rigid_terminal: wp.array(dtype=wp.int32),
+    proxy_enabled: wp.array(dtype=wp.int32),
     boundary: wp.array(dtype=wp.int32),
     exposure_damage: float,
+    shed_terminal_samples: int,
 ):
     i = wp.tid()
     if kind[i] == 0:
@@ -2487,6 +3353,13 @@ def update_hydraulic_boundary_mask(
     exposed = base_boundary[i] != 0 or damage[i] >= exposure_damage
     if fid >= 0 and rigid_state[fid] != 0:
         exposed = True
+    if (
+        shed_terminal_samples != 0 and fid >= 0
+        and rigid_terminal[fid] != 0 and proxy_enabled[fid] != 0
+    ):
+        # The body remains in the render/checkpoint arrays, but is removed
+        # from SPH neighbour lists. Its analytical OBB owns hydrodynamics.
+        exposed = False
     boundary[i] = int(exposed)
 
 
@@ -3591,6 +4464,7 @@ def refine_impacted_solids(
     glass_crack_parent_radius: float,
     impact_parent_radius: float,
     damage_trigger: float,
+    maximum_damage_for_refinement: float,
     load_acceleration_trigger: float,
 ):
     i = wp.tid()
@@ -3598,6 +4472,11 @@ def refine_impacted_solids(
     if i >= old_count or kind[i] == 0 or base_fixed[i] != 0 or normal_axis[i] < 0:
         return
     if fid >= 0 and rigid_state[fid] != 0:
+        return
+    # Refining material that has already lost most of its stiffness only
+    # creates short-lived children immediately before rigid conversion.  Keep
+    # resolution for crack growth, but stop adding DOFs in the rubble regime.
+    if damage[i] >= maximum_damage_for_refinement:
         return
     role = structural_class[i]
     effective_crack_radius = crack_parent_radius
