@@ -1,0 +1,27 @@
+{
+  "extends": "config_v3_city_clear_surge_30s.json",
+  "output_basename": "deluge_v3_city_clear_surge_x1_7",
+  "duration_seconds": 30.0,
+  "v3": {
+    "shallow_water": {
+      "downstream_boundary": "transmissive",
+      "wave_train": {
+        "enabled": true,
+        "profile": "sustained_surge",
+        "start_seconds": 0.25,
+        "ramp_up_seconds": 2.0,
+        "hold_seconds": 30.0,
+        "ramp_down_seconds": 4.5,
+        "height": 17.85,
+        "target_velocity": 20.0,
+        "background_current": 0.0
+      },
+      "wave_cohort": {
+        "enabled": true,
+        "id": 1,
+        "start_seconds": 1.0,
+        "end_seconds": 30.0
+      }
+    }
+  }
+}

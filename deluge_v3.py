@@ -114,8 +114,10 @@ from simulation.hybrid_model import (  # noqa: E402
 )
 from rendering.hybrid_renderer import HybridRenderer  # noqa: E402
 from simulation.rigid_clusters import (  # noqa: E402
+    fit_rigid_cluster,
     fit_rigid_cluster_to_reference,
     fit_rigid_collision_proxy,
+    limit_rigid_release_motion,
 )
 from simulation.experimental_optimizations import (  # noqa: E402
     ImplicitFluidPreparation,
@@ -137,6 +139,7 @@ from kernels.surface import (  # noqa: E402
     build_water_phase_masks,
     classify_water_surface,
     smooth_sparse_field_axis,
+    splat_anisotropic_surface_field,
     splat_sparse_surface_field,
 )
 from simulation.scene import STRUCT_SLAB, building_profile  # noqa: E402
@@ -577,9 +580,21 @@ class HybridDelugeSolver(DelugeSolver):
                 float(render.get("atmosphere", {}).get("water_mist_strength", 2.2)),
                 float(render.get("taa", {}).get("history_weight", 0.86)),
                 bool(render.get("cascaded_shadows", {}).get("enabled", True)),
-                int(render.get("cascaded_shadows", {}).get("resolution", 512)),
+                int(camera.get(
+                    "shadow_resolution",
+                    render.get("cascaded_shadows", {}).get("resolution", 512),
+                )),
                 tuple(render.get("cascaded_shadows", {}).get("splits_m", [90.0, 220.0, 480.0])),
                 float(render.get("cascaded_shadows", {}).get("strength", 0.78)),
+                indirect_lighting_enabled=bool(render.get("indirect_lighting", {}).get(
+                    "enabled", True
+                )),
+                indirect_lighting_strength=float(render.get("indirect_lighting", {}).get(
+                    "strength", 0.16
+                )),
+                indirect_lighting_radius_pixels=int(render.get("indirect_lighting", {}).get(
+                    "radius_pixels", 14
+                )),
                 hdr_enabled=bool(render.get("hdr", {}).get("enabled", True)),
                 physical_sky_enabled=bool(render.get("physical_sky", {}).get("enabled", True)),
                 hdr_exposure_ev=float(render.get("hdr", {}).get("exposure_ev", -0.35)),
@@ -1389,6 +1404,7 @@ class HybridDelugeSolver(DelugeSolver):
                     int(self.surface_cfg.get("droplet_enter_classifications", 4)),
                     int(self.surface_cfg.get("droplet_exit_classifications", 2)),
                     float(self.surface_cfg.get("foam_decay", 0.80)),
+                    float(self.surface_cfg.get("normal_history_weight", 0.64)),
                     int(bool(self.surface_cfg.get("phase_separation_enabled", True)))], device=self.device,
         )
         wp.launch(
@@ -1509,10 +1525,17 @@ class HybridDelugeSolver(DelugeSolver):
         field_started = time.perf_counter()
         field = wp.zeros(shape, dtype=float, device=self.device)
         wp.launch(
-            splat_sparse_surface_field, dim=self.count,
-            inputs=[self.arrays["x"][:self.count], self.arrays["radius"][:self.count],
-                    self.arrays["kind"][:self.count], self.arrays["water_connected_mask"][:self.count],
-                    field, wp.vec3(*lower), voxel, nx, ny, nz], device=self.device,
+            splat_anisotropic_surface_field, dim=self.count,
+            inputs=[self.arrays["x"][:self.count], self.arrays["v"][:self.count],
+                    self.arrays["radius"][:self.count], self.arrays["kind"][:self.count],
+                    self.arrays["water_connected_mask"][:self.count],
+                    self.arrays["water_surface_normal"][:self.count],
+                    field, wp.vec3(*lower), voxel, nx, ny, nz,
+                    float(self.water_mesh_cfg.get("anisotropic_tangent_sigma", 1.72)),
+                    float(self.water_mesh_cfg.get("anisotropic_binormal_sigma", 1.38)),
+                    float(self.water_mesh_cfg.get("anisotropic_normal_sigma", 0.82)),
+                    float(self.water_mesh_cfg.get("anisotropic_velocity_stretch", 0.025))],
+            device=self.device,
         )
         if len(stitch_positions):
             stitch_x = wp.array(stitch_positions, dtype=wp.vec3, device=self.device)
@@ -1942,6 +1965,12 @@ class HybridDelugeSolver(DelugeSolver):
             wave_train_injected_momentum_z=np.float64(
                 self.shallow_water.wave_train_injected_momentum_z
             ),
+            shallow_downstream_outflow_volume=np.float64(
+                self.shallow_water.downstream_outflow_volume
+            ),
+            shallow_downstream_outflow_momentum_z=np.float64(
+                self.shallow_water.downstream_outflow_momentum_z
+            ),
             shallow_incoming_boundary_impulse=np.float64(
                 self.shallow_water.incoming_boundary_impulse.numpy()[0]
             ),
@@ -1970,6 +1999,9 @@ class HybridDelugeSolver(DelugeSolver):
             ),
             shallow_emission_positive_age=(
                 self.shallow_water.emission_positive_age.astype(np.float64, copy=False)
+            ),
+            shallow_emission_return_quiet_age=(
+                self.shallow_water.emission_return_quiet_age.astype(np.float64, copy=False)
             ),
             shallow_return_flow_quiet_age=np.float64(
                 self.shallow_water.return_flow_quiet_age
@@ -2661,6 +2693,15 @@ class HybridDelugeSolver(DelugeSolver):
         converted: list[tuple[int, np.ndarray, object, bool, bool]] = []
         plastic_position_rms = float(policy.get("plastic_rigidize_position_rms", 0.75))
         plastic_release_fraction = float(policy.get("plastic_rigidize_release_fraction", 0.35))
+        forced_plastic_position_rms = float(
+            policy.get("forced_plastic_position_rms", 0.40)
+        )
+        forced_plastic_fracture_energy = float(
+            policy.get("forced_plastic_fracture_energy", 0.95)
+        )
+        preserve_current_shape_rms = float(
+            policy.get("preserve_current_shape_position_rms", 0.60)
+        )
 
         for fid in range(self.fragment_count):
             if self.rigid_state_host[fid] != 0:
@@ -2681,13 +2722,27 @@ class HybridDelugeSolver(DelugeSolver):
             if len(indices) < minimum_particles or np.any(base_fixed[indices] != 0):
                 self.rigid_quiet_scans_host[fid] = 0
                 continue
-            released_fraction = float(np.count_nonzero(damage[indices] >= fully_damaged_threshold)) / len(indices)
-            if released_fraction < release_fraction:
-                self.rigid_quiet_scans_host[fid] = 0
-                continue
-            fit = fit_rigid_cluster_to_reference(
+            released_fraction = float(
+                np.count_nonzero(damage[indices] >= fully_damaged_threshold)
+            ) / len(indices)
+            reference_fit = fit_rigid_cluster_to_reference(
                 position[indices], rest_position[indices], velocity[indices], mass[indices]
             )
+            # A fragment whose load path is already gone must not remain an
+            # elastic catapult merely because most of its *internal* particles
+            # are still intact.  The support graph is the separation test;
+            # fracture energy plus visible non-rigid stretch is the emergency
+            # plastic-conversion test.  This catches complete column/floor
+            # sections before their surviving springs can launch hundreds of
+            # tonnes upward for several seconds.
+            forced_plastic_rigidize = (
+                reference_fit.reference_position_rms >= forced_plastic_position_rms
+                and self.fragment_fracture_energy_host[fid]
+                >= forced_plastic_fracture_energy
+            )
+            if released_fraction < release_fraction and not forced_plastic_rigidize:
+                self.rigid_quiet_scans_host[fid] = 0
+                continue
             # A detached concrete chunk is not an indefinitely extensible
             # rubber net.  If it has already deformed by more than roughly one
             # particle spacing, collapse its unresolved crushing modes into a
@@ -2696,8 +2751,20 @@ class HybridDelugeSolver(DelugeSolver):
             # non-rigid velocity that previously stretched 3 m floor chunks to
             # 60+ m and made them appear to fly above the city.
             plastic_rigidize = (
-                fit.reference_position_rms >= plastic_position_rms
+                reference_fit.reference_position_rms >= plastic_position_rms
                 and released_fraction >= plastic_release_fraction
+            ) or forced_plastic_rigidize
+            # Preserve the exact particle cloud whenever conversion happens
+            # early enough.  The old unconditional reference-shape Kabsch fit
+            # made facade anchors jump between two consecutive video frames.
+            # Reference recovery is now only a last-resort repair for a cloud
+            # that was already too distorted to be a plausible rigid body.
+            fit = (
+                fit_rigid_cluster(
+                    position[indices], velocity[indices], mass[indices]
+                )
+                if reference_fit.reference_position_rms <= preserve_current_shape_rms
+                else reference_fit
             )
             if fit.internal_velocity_rms > maximum_residual and not plastic_rigidize:
                 self.rigid_quiet_scans_host[fid] = 0
@@ -2737,19 +2804,8 @@ class HybridDelugeSolver(DelugeSolver):
             release_velocity = fit.linear_velocity.copy()
             if plastic_rigidize:
                 plastic_count += 1
-                reference_mass = float(policy.get("upward_speed_reference_mass", 50000.0))
-                maximum_upward = float(policy.get("maximum_upward_speed", 6.0))
-                minimum_upward = float(policy.get("minimum_mass_upward_speed", 1.5))
-                mass_limit = maximum_upward * math.sqrt(
-                    reference_mass / max(float(fit.mass), reference_mass)
-                )
-                release_velocity[1] = min(
-                    float(release_velocity[1]), max(minimum_upward, mass_limit)
-                )
             if early_conversion:
                 self.early_rigidified_total += 1
-            linear_velocity[fid] = release_velocity
-            angular_velocity[fid] = fit.angular_velocity
             body_mass[fid] = fit.mass
             inverse_inertia[fid] = fit.inverse_inertia
             if (
@@ -2769,6 +2825,20 @@ class HybridDelugeSolver(DelugeSolver):
                 self.rigid_proxy_local_center_host[fid] = proxy.local_center
                 self.rigid_proxy_half_extent_host[fid] = proxy.half_extent
                 self.rigid_proxy_material_host[fid] = proxy.material
+            release_velocity, release_angular_velocity = limit_rigid_release_motion(
+                release_velocity,
+                fit.angular_velocity,
+                float(fit.mass),
+                self.rigid_proxy_half_extent_host[fid],
+                float(policy.get("maximum_linear_speed", 22.0)),
+                float(policy.get("maximum_upward_speed", 6.0)),
+                float(policy.get("upward_speed_reference_mass", 50000.0)),
+                float(policy.get("minimum_mass_upward_speed", 1.5)),
+                float(policy.get("maximum_angular_speed", 3.0)),
+                float(policy.get("maximum_tip_speed", 10.0)),
+            )
+            linear_velocity[fid] = release_velocity
+            angular_velocity[fid] = release_angular_velocity
 
         self.rigid_state = wp.array(self.rigid_state_host, dtype=wp.int32, device=self.device)
         self.rigid_terminal_host[:] = rigid_terminal
@@ -4586,48 +4656,46 @@ class HybridDelugeSolver(DelugeSolver):
         self.shallow_water.last_emission_time = float(self.time)
         quota_host = np.zeros(emitter_nx, dtype=np.int32)
         if flux_quota_enabled and emission_elapsed > 0.0:
-            if self.shallow_water.last_frame_merged_volume > 0.0:
-                self.shallow_water.return_flow_quiet_age = 0.0
-            else:
-                self.shallow_water.return_flow_quiet_age += emission_elapsed
             return_quiet_seconds = float(
                 policy.get("emission_return_quiet_seconds", 0.75)
             )
-            return_flow_clear = (
-                self.shallow_water.return_flow_quiet_age >= return_quiet_seconds
+            returned = self.shallow_water.last_frame_return_volume_by_x > 1.0e-9
+            self.shallow_water.returning_cells = int(np.count_nonzero(returned))
+            quiet_age = self.shallow_water.emission_return_quiet_age
+            quiet_age[returned] = 0.0
+            quiet_age[~returned] += emission_elapsed
+            self.shallow_water.return_flow_quiet_age = float(np.min(quiet_age))
+            emission_allowed = quiet_age >= return_quiet_seconds
+            self.shallow_water.emission_blocked_cells = int(np.count_nonzero(~emission_allowed))
+            # Return-flow cooldown is local to each transverse shallow cell.
+            # The former global scalar let one stray reflected particle stop
+            # the complete 140 m inlet for 0.75 s, starving the SPH wave for
+            # several seconds even while the shallow discharge stayed high.
+            (
+                quota_host,
+                self.shallow_water.emission_residual_volume,
+                self.shallow_water.emission_positive_age,
+                requested_particles,
+            ) = prepare_hysteretic_emission_quota(
+                interface_state[:, interface_iz, :],
+                cell_size=self.shallow_water.cell_size,
+                emitter_spacing=spacing,
+                emitter_nx=emitter_nx,
+                elapsed=emission_elapsed,
+                residual_volume=self.shallow_water.emission_residual_volume,
+                positive_age=self.shallow_water.emission_positive_age,
+                minimum_velocity=float(policy.get("minimum_emission_velocity", 0.25)),
+                rearm_delay=float(policy.get("emission_rearm_delay_seconds", 0.35)),
+                ramp_seconds=float(policy.get("emission_ramp_seconds", 0.65)),
+                maximum_quota_per_cell=int(
+                    policy.get("maximum_flux_quota_per_cell_frame", 0)
+                ),
+                maximum_layers_per_frame=int(
+                    policy.get("maximum_emission_layers_per_frame", 3)
+                ),
+                emission_allowed=emission_allowed,
             )
-            if not return_flow_clear:
-                # Never convert water in both directions during the same
-                # interface episode.  Simultaneous SPH->shallow capture and
-                # shallow->SPH emission is the merge/re-emit chatter that made
-                # the late artificial wave.
-                self.shallow_water.emission_positive_age.fill(0.0)
-                self.shallow_water.emission_residual_volume.fill(0.0)
-            else:
-                (
-                    quota_host,
-                    self.shallow_water.emission_residual_volume,
-                    self.shallow_water.emission_positive_age,
-                    requested_particles,
-                ) = prepare_hysteretic_emission_quota(
-                    interface_state[:, interface_iz, :],
-                    cell_size=self.shallow_water.cell_size,
-                    emitter_spacing=spacing,
-                    emitter_nx=emitter_nx,
-                    elapsed=emission_elapsed,
-                    residual_volume=self.shallow_water.emission_residual_volume,
-                    positive_age=self.shallow_water.emission_positive_age,
-                    minimum_velocity=float(policy.get("minimum_emission_velocity", 0.25)),
-                    rearm_delay=float(policy.get("emission_rearm_delay_seconds", 0.35)),
-                    ramp_seconds=float(policy.get("emission_ramp_seconds", 0.65)),
-                    maximum_quota_per_cell=int(
-                        policy.get("maximum_flux_quota_per_cell_frame", 0)
-                    ),
-                    maximum_layers_per_frame=int(
-                        policy.get("maximum_emission_layers_per_frame", 3)
-                    ),
-                )
-                self.shallow_water.flux_requested_particles_total += requested_particles
+            self.shallow_water.flux_requested_particles_total += requested_particles
         self.shallow_water.emission_quota = wp.array(
             quota_host, dtype=wp.int32, device=self.device
         )
@@ -4942,6 +5010,7 @@ class HybridDelugeSolver(DelugeSolver):
         # counters contain only the representation transfer being measured.
         self.shallow_water.commit_exchange(float(self.cfg["rest_density"]))
         merged_volume = wp.zeros(1, dtype=float, device=self.device)
+        self.shallow_water.return_volume_by_x.zero_()
         wp.launch(
             mark_sph_return_particles, dim=old_count,
             inputs=[self.arrays["x"][:old_count], self.arrays["v"][:old_count],
@@ -4949,7 +5018,8 @@ class HybridDelugeSolver(DelugeSolver):
                     self.arrays["kind"][:old_count], self.arrays["wave_cohort"][:old_count],
                     self.return_keep[:old_count],
                     self.shallow_water.exchange_volume, self.shallow_water.exchange_x,
-                    self.shallow_water.exchange_z, merged_volume,
+                    self.shallow_water.exchange_z, self.shallow_water.return_volume_by_x,
+                    merged_volume,
                     self.shallow_water.wave_cohort_returned_volume,
                     self.shallow_water.wave_cohort_returned_momentum_z,
                     self.shallow_water.lower_x,
@@ -4963,6 +5033,9 @@ class HybridDelugeSolver(DelugeSolver):
             self.return_keep[:old_count], self.return_offsets[:old_count], inclusive=False
         )
         wp.synchronize_device(self.device)
+        self.shallow_water.last_frame_return_volume_by_x = (
+            self.shallow_water.return_volume_by_x.numpy().astype(np.float64, copy=True)
+        )
         tail_keep = int(self.return_keep[old_count - 1:old_count].numpy()[0])
         new_count = int(self.return_offsets[old_count - 1:old_count].numpy()[0]) + tail_keep
         merged = old_count - new_count

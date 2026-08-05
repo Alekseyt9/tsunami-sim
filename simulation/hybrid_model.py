@@ -477,22 +477,47 @@ def build_facade_skin(cfg: dict) -> dict[str, np.ndarray]:
                              (cx + hx, cy + hy, cz), (cx + hx, cy - hy, cz)))
 
     def add_wall_bay(bid, center, size, normal, wall_material, glass_material):
-        # Continuous concrete backing prevents checkerboard holes. A smaller
-        # glass quad sits slightly outward, leaving a visible concrete frame.
-        add_panel(bid, center, size, normal, wall_material)
+        # Build a real opening from four opaque reveals instead of painting a
+        # window over a full wall quad.  Glass sits inside the facade plane and
+        # a dark interior card supplies parallax/transmission depth.  Because
+        # every piece is bound to the same structural fragment, the detail is
+        # retained after detachment instead of reverting to a flat box.
         if size[1] < 1.2:
+            add_panel(bid, center, size, normal, wall_material)
             return
-        outward = 0.09
-        window_center = (
-            center[0] + normal[0] * outward,
-            center[1] + size[1] * 0.04,
-            center[2] + normal[2] * outward,
-        )
+        span = size[2] if abs(normal[0]) > 0.5 else size[0]
+        window_span = span * 0.68
+        window_height = size[1] * 0.54
+        side_span = max((span - window_span) * 0.5, 0.10)
+        horizontal_height = max((size[1] - window_height) * 0.5, 0.10)
+        tangent = (0.0, 0.0, 1.0) if abs(normal[0]) > 0.5 else (1.0, 0.0, 0.0)
+
+        def offset_center(tangent_offset=0.0, vertical_offset=0.0, normal_offset=0.0):
+            return (
+                center[0] + tangent[0] * tangent_offset + normal[0] * normal_offset,
+                center[1] + vertical_offset,
+                center[2] + tangent[2] * tangent_offset + normal[2] * normal_offset,
+            )
+
         if abs(normal[0]) > 0.5:
-            window_size = (0.12, size[1] * 0.54, size[2] * 0.72)
+            side_size = (size[0], size[1], side_span)
+            horizontal_size = (size[0], horizontal_height, window_span)
+            window_size = (0.10, window_height, window_span)
         else:
-            window_size = (size[0] * 0.72, size[1] * 0.54, 0.12)
-        add_panel(bid, window_center, window_size, normal, glass_material)
+            side_size = (side_span, size[1], size[2])
+            horizontal_size = (window_span, horizontal_height, size[2])
+            window_size = (window_span, window_height, 0.10)
+        add_panel(bid, offset_center(-(window_span + side_span) * 0.5), side_size, normal, wall_material)
+        add_panel(bid, offset_center((window_span + side_span) * 0.5), side_size, normal, wall_material)
+        add_panel(bid, offset_center(0.0, -(window_height + horizontal_height) * 0.5),
+                  horizontal_size, normal, wall_material)
+        add_panel(bid, offset_center(0.0, (window_height + horizontal_height) * 0.5),
+                  horizontal_size, normal, wall_material)
+        add_panel(bid, offset_center(0.0, size[1] * 0.04, -0.10),
+                  window_size, normal, glass_material)
+        interior_material = 80 + (wall_material - 10)
+        add_panel(bid, offset_center(0.0, size[1] * 0.04, -0.55),
+                  window_size, normal, interior_material)
 
     styles = cfg.get("building_styles", [])
     palettes = cfg.get("building_palettes", [])
@@ -785,6 +810,22 @@ def build_fragment_debris_skin(
         fid = int(fid_value)
         bid = int(building_id[indices[0]])
         palette = int(palettes[bid]) % 6 if 0 <= bid < len(palettes) else max(bid, 0) % 6
+        dominant_role = int(np.bincount(
+            structural_class[indices], minlength=7
+        ).argmax())
+        # Exterior walls, glazing and every physical floor already have an
+        # authored double-sided panel bound to these same particles.  Adding a
+        # six-face voxel union when support is lost does not reveal new
+        # structure; it suddenly wraps a 10--24 cm sheet in metre-scale cell
+        # sides and makes the rigid transition look like thin panels becoming
+        # boxes.  Keep the authored sheet through detachment/rigid motion and
+        # reserve debris hulls for genuinely volumetric frame/core material.
+        if (
+            bid >= 0
+            and bool(debris_policy.get("use_authored_sheet_surfaces", True))
+            and dominant_role in (STRUCT_WALL, STRUCT_GLASS, STRUCT_SLAB)
+        ):
+            continue
         faces = build_fragment_cell_faces(
             rest_x[indices], radius[indices], structural_class[indices], palette,
             float(cfg.get("solid_spacing", 1.3)),
@@ -793,9 +834,6 @@ def build_fragment_debris_skin(
             float(debris_policy.get("glass_thickness", 0.10)),
             float(debris_policy.get("slab_thickness", 0.24)),
         )
-        dominant_role = int(np.bincount(
-            structural_class[indices], minlength=7
-        ).argmax())
         if faces:
             for face_center, face_size, face_normal, face_material in faces:
                 render_material = face_material
@@ -1134,7 +1172,7 @@ def write_facade_skin(
     cache_path: Path | None = None
     if complete_geometry and bool(debris_policy.get("cache", True)):
         geometry_cfg = {
-            "schema": "anisotropic-fragment-skin-v7-environment",
+            "schema": "recessed-window-material-continuity-v9-environment",
             "solid_spacing": cfg.get("solid_spacing"),
             "buildings": cfg.get("buildings"),
             "building_styles": cfg.get("building_styles"),

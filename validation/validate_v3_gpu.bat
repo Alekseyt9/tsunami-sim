@@ -38,6 +38,7 @@ if not exist "%PYTHON_EXE%" (
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_temporal_water.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_taa.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_hdr_water_optics.py" || exit /b 1
+"%PYTHON_EXE%" "%VALIDATION_DIR%validate_graphics_upgrade.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_crack_rendering.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_progressive_video.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_neighbor_optimizations.py" || exit /b 1

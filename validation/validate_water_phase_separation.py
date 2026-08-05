@@ -21,7 +21,7 @@ def classify(grid, arrays, count: int) -> None:
         classify_water_surface, dim=count,
         inputs=[grid.id, x, v, radius, kind, rho_reference, mask, normal, foam, phase, candidate, age,
                 transitions,
-                2.6, 18, 8, 0.32, 5, 3, 2, 0.86, 1], device="cuda:0",
+                2.6, 18, 8, 0.32, 5, 3, 2, 0.86, 0.64, 1], device="cuda:0",
     )
 
 

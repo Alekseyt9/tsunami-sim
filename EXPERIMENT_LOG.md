@@ -955,3 +955,184 @@ Its conservative shallow-water gate reaches rows 1/2/3 at 4.32/5.64/6.92 s,
 keeps significant load at the rear row for 6.6 s, injects 623,185 m3 and closes
 volume to 0.095%. This replaces the accidentally selected short finite wave for
 the next production run.
+
+## HDR, physical sky/IBL and volumetric water (2026-08-05)
+
+The previous BRDF generated values above one but the renderer clipped them
+before gamma conversion. The V3 renderer now keeps linear HDR through water,
+atmosphere and motion-reprojected TAA, then applies a compact bloom gather and
+an ACES-fitted filmic curve. Highlights at 4x and 16x radiance remain distinct
+in the CUDA regression instead of becoming the same white value.
+
+An analytic HDR daylight model replaces the fixed background and fixed blue
+reflection tint. The same sun/sky radiance now drives facade diffuse IBL,
+roughness-aware specular IBL, glass reflection/transmission, water reflection,
+height fog and water mist. Parameters are exposed under `render.hdr` and
+`render.physical_sky`.
+
+The water pass now rasterizes both the nearest and farthest depth of the closed
+Marching Cubes surface and anisotropic surface samples. Optical distance is
+limited by the first opaque scene surface, then RGB Beer-Lambert absorption,
+RGB scattering, a configurable forward phase term, refraction and physical
+water Fresnel are evaluated. This removes the former hard-coded 5--10 m path
+length and preserves visible depth differences.
+
+Validation:
+
+- `validate_hdr_water_optics.py` passes on RTX 5070: HDR sun, monotonic filmic
+  roll-off and wavelength-dependent depth transport;
+- TAA, temporal water, water mesh, surface reconstruction and structural CUDA
+  tests still pass;
+- a full four-view smoke frame uses 2,540 MiB and takes about 0.64 s including
+  two smoke physics substeps and rendering;
+- checkpoint 432 advances and renders one late four-view frame in 4.96 s with
+  474,359 particles and 3,246 MiB peak VRAM.
+
+Control images are in `outputs/hdr_ibl_water_smoke_r2_20260805` and
+`outputs/hdr_ibl_water_checkpoint432_r2_20260805`. No production-length run
+was started.
+
+## Continuous rigid transition and heavy-fragment catapult fix (2026-08-06)
+
+The 30-second city-clear surge exposed two coupled defects. Between simulated
+seconds 6 and 7, support loss enabled a second six-face cell skin over authored
+wall/floor panels while the reference-shape rigid fit could move every anchor
+in one frame. Between seconds 12 and 13, fragments 244 and 246 from building 1
+(357.5 and 353.8 tonnes) remained deformable despite complete support loss.
+Their surviving internal springs stretched by 7--21 m RMS and maintained
+6--8.2 m/s upward centre-of-mass velocity, producing the visible flying frame.
+
+Sheet fragments now retain their authored double-sided wall, glass and slab
+panels through detachment and rigid motion. Cell-union debris hulls are emitted
+only for volumetric beams, columns and cores. This reduced the coarse-city
+debris surface from roughly 120k faces to 29,249 faces and removed the sudden
+visual thickening. The geometry-cache schema was bumped so old box skins cannot
+be reused.
+
+Detached cohesive fragments now use the current particle cloud for rigid fitting
+while deformation is below 0.60 m RMS, which preserves render anchors exactly.
+Early rigidification scans every two frames and no longer requires internal
+particle destruction after the support graph has already proven separation.
+Fragments above 0.40 m RMS with saturated connection fracture energy take the
+terminal plastic path before their elastic network can act as a catapult.
+Reference-shape recovery remains only for already malformed clouds.
+
+Initial rigid motion is now constrained before upload/render using the same
+mass-aware upward, linear, angular and tip-speed limits as the CUDA integrator.
+The known checkpoint-264 offenders terminal-rigidize immediately: fragment 244
+starts at 1.584 m/s upward and 8.70 m/s tip speed; fragment 246 is capped at
+2.256 m/s upward and 10.0 m/s tip speed. Their centres move only 2--3 cm during
+the next 100 production-size substeps.
+
+Validation:
+
+- `validate_city_styles.py` passes with authored sheet continuity and 29,249
+  volumetric debris faces for 607/3,060 coarse cohesive fragments;
+- `validate_rigid_transition.py` measures 2.384e-7 m conversion-frame vertex
+  error and 4.768e-7 m post-substep shape error; its 355 t synthetic release is
+  capped to 2.252 m/s upward;
+- rigid-cluster and collision-proxy CUDA regressions pass;
+- the checkpoint-120 control renders frames 121--191 with empty stderr. The
+  largest transition (148 new rigid bodies at frame 160) has no visible shape
+  or panel-thickness jump in adjacent frames 159/160.
+
+## 1.7x continuous surge and downstream open boundary (2026-08-06)
+
+The previous 30-second city-clear profile started ramping down at 18.25 s
+(`start_time + ramp_up_s + hold_s`), so its first-row forward discharge fell
+from about 68,178 m3/s at 18.0 s to 8,127 m3/s at 19.0 s. Extending the hold
+alone was insufficient: the reflective downstream shallow-water boundary
+eventually filled the finite domain and created backwater that stalled the
+incoming surge.
+
+`config_v3_city_clear_surge_30s_x1_7.json` now raises the surge from 10.5 m to
+17.85 m, keeps the inlet active throughout the 30-second shot, and selects a
+conservative transmissive downstream boundary. The shallow-water solver uses
+a zero-gradient Riemann ghost state at the outlet and records discharged volume
+and momentum in metrics and checkpoints. The sustained-surge validator includes
+that outflow in its mass-conservation balance.
+
+Validation:
+
+- the 24-second sustained-surge regression passes with 0.050% relative volume
+  error after accounting for 1,235,173 m3 of downstream outflow;
+- at 19.0 s, forward row discharges remain about 86,913, 85,022 and
+  82,453 m3/s instead of stopping;
+- at 30.0 s, they remain about 87,985, 87,055 and 85,848 m3/s, confirming
+  that the surge still reaches all three building rows late in the shot;
+- no production-length render was launched; the profile is prepared for the
+  next requested long run.
+
+## Temporally coherent water and graphics continuity pass (2026-08-06)
+
+The connected water field now uses a volume-normalized anisotropic Gaussian
+instead of isotropic particle blobs. Its narrow axis follows the filtered
+free-surface normal, its long axis follows tangential velocity, and the normal
+history is carried by the Lagrangian particle. The target production voxel is
+0.45 m (0.30 m in local splash bricks), with an eight-million-node ceiling.
+This preserves a coherent sheet without increasing the physical particle
+count or making distant spray expand the connected-water bounding box.
+
+Whitewater generation now requires an air-entrainment mechanism. Vorticity,
+local compression, surface-neighbour deficit and overturning velocity are
+combined, while ballistic drops retain their hysteretic phase transition.
+Fast smooth trailing water therefore remains clear; foam remains a render-only
+attribute transported by particles and spray remains physically ballistic.
+
+Facade windows are no longer glass painted over a complete wall quad. Each bay
+has four structural frame/reveal panels, glass recessed by 0.10 m and a dark,
+non-emissive interior card 0.45 m behind it. All panels retain their fragment
+anchors through deformable and rigid motion. Exposed volumetric debris keeps a
+stronger contribution from the parent building palette. The geometry cache
+schema is now `recessed-window-material-continuity-v9-environment`.
+
+Sun shadows use four stabilized cascades and 5x5 PCF. The 1440x810 hero view
+uses 2048 maps; the three 640x360 inset views use 1024 maps, matching their
+lower output resolution. Interior cards do not enter the sun maps. A frozen-
+source screen-space diffuse bounce adds bounded nearby colour bleeding without
+order-dependent radiance feedback.
+
+Validation and performance:
+
+- `validate_graphics_upgrade.py` confirms flow-aligned/normal-thin water,
+  bounded indirect colour transfer and the four-cascade production setup;
+- calm-water, water-phase, HDR optics, TAA and city-style regressions pass;
+- the city contains 36,039 authored facade panels and every glass panel has
+  exactly one correctly recessed interior card;
+- rendering all four views with 2048 maps cost 7.65 s per smoke frame; retaining
+  2048 for the hero and using 1024 for insets reduced it to 3.43 s and reduced
+  measured VRAM from 2,766 to 2,638 MiB;
+- a checkpoint-552 destructive frame with 232,959 particles, 2,206 rigid
+  clusters and 1,082 foam samples rendered in 8.51 s including 348 physics
+  substeps and all four views.
+
+The production process started before this pass continues with its already
+loaded renderer. New graphics are active in subsequent fresh/resumed runs; the
+checkpoint-552 control is in `outputs/graphics_upgrade_checkpoint552_20260806_004806`.
+
+## Local shallow/SPH return-flow gate (2026-08-06)
+
+The apparent inlet freeze after roughly 13 seconds was not a loss of discharge
+in the shallow-water domain.  The completed control still carried about
+87,900 m3/s through the first diagnostic row, but its coupled SPH velocity had
+fallen to 0.027 m/s and the cumulative emission count stayed fixed at 3,193
+particles from roughly 8 to 15 seconds.
+
+The cause was a domain-wide return-flow cooldown: one particle returning to
+the shallow domain anywhere along the 140 m interface reset the same timer for
+all 70 transverse cells.  Continuous scattered returns therefore prevented
+unrelated forward-flowing columns from emitting.  The cooldown, rearm age,
+quota and returned volume are now tracked per transverse cell.  A returning
+cell remains conservative and locally blocked, while the rest of the inlet
+continues supplying SPH water.
+
+Checkpoint 288 was replayed from 12.0417 to 13.5417 seconds.  The corrected
+interface emitted 1,967 particles, merged 61, and reached a coupled SPH volume-
+weighted velocity of 3.690 m/s while the shallow discharge remained about
+87,900 m3/s.  Both the focused quota regression and the checkpoint replay
+passed.  The replay log is in
+`outputs/interface_continuity_checkpoint288_retry_20260806/test.stdout.log`.
+
+Frame metrics are now serialized as compact JSON Lines: exactly one complete
+JSON object followed by one LF for every output frame.  This is a physical
+one-record-per-line guarantee; editors may still visually wrap a long record.

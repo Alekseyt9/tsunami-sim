@@ -36,7 +36,7 @@ def main() -> None:
         classify_water_surface,
         dim=count,
         inputs=[grid.id, x, v, radius, kind, rho_reference, mask, normal, foam, phase, candidate,
-                candidate_age, transitions, 2.6, 18, 8, 0.32, 5, 3, 2, 0.86, 1],
+                candidate_age, transitions, 2.6, 18, 8, 0.32, 5, 3, 2, 0.86, 0.64, 1],
         device=device,
     )
     wp.synchronize_device(device)

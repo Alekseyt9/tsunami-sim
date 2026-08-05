@@ -28,6 +28,7 @@ def classify_water_surface(
     droplet_enter_classifications: int,
     droplet_exit_classifications: int,
     foam_decay: float,
+    normal_history_weight: float,
     phase_separation_enabled: int,
 ):
     tid = wp.tid()
@@ -47,6 +48,7 @@ def classify_water_surface(
     neighbours = int(0)
     gradient = wp.vec3(0.0)
     vorticity = wp.vec3(0.0)
+    divergence = float(0.0)
     query = wp.hash_grid_query(grid, xi, query_radius)
     for j in query:
         if j == i or kind[j] != 0:
@@ -70,7 +72,9 @@ def classify_water_surface(
         weight = wp.max(1.0 - distance / support, 0.0)
         direction = delta / distance
         gradient -= direction * weight
-        vorticity += wp.cross(v[j] - vi, direction) * (weight / wp.max(distance, 0.05))
+        relative_velocity = v[j] - vi
+        vorticity += wp.cross(relative_velocity, direction) * (weight / wp.max(distance, 0.05))
+        divergence += wp.dot(relative_velocity, direction) * (weight / wp.max(distance, 0.05))
 
     closed = positive_x * negative_x * positive_y * negative_y * positive_z * negative_z
     is_surface = closed == 0 or neighbours < minimum_neighbours
@@ -81,13 +85,36 @@ def classify_water_surface(
         normal = wp.vec3(0.0, 1.0, 0.0)
         if gradient_length > 1.0e-5:
             normal = gradient / gradient_length
+        # Particle identity supplies a Lagrangian history for free.  Filtering
+        # the normal on that moving particle is temporally coherent, unlike a
+        # screen-space blur that leaves a stationary ghost as the wave moves.
+        previous_normal = surface_normal[i]
+        previous_length = wp.length(previous_normal)
+        history = wp.clamp(normal_history_weight, 0.0, 0.92)
+        if previous_length > 0.5:
+            previous_normal /= previous_length
+            if wp.dot(previous_normal, normal) < 0.0:
+                previous_normal = -previous_normal
+            blended_normal = normal * (1.0 - history) + previous_normal * history
+            if wp.length(blended_normal) > 1.0e-5:
+                normal = wp.normalize(blended_normal)
         surface_normal[i] = normal
         vort = wp.length(vorticity) / float(wp.max(neighbours, 1))
+        compression = wp.max(-divergence / float(wp.max(neighbours, 1)), 0.0)
         vertical = wp.abs(vi[1])
-        # Calm bulk flow remains clear. Foam is reserved for genuine rotation,
-        # overturning and detached energetic spray.
-        foam_source = 0.70 * wp.smoothstep(2.0, 9.0, vort)
-        foam_source += 0.55 * wp.smoothstep(4.0, 13.0, vertical)
+        speed = wp.length(vi)
+        neighbour_deficit = wp.clamp(
+            1.0 - float(neighbours) / float(wp.max(minimum_neighbours, 1)), 0.0, 1.0
+        )
+        rotational = wp.smoothstep(2.8, 10.5, vort)
+        compressive = wp.smoothstep(0.65, 4.8, compression)
+        overturning = wp.smoothstep(3.0, 10.0, vertical) * wp.smoothstep(5.0, 17.0, speed)
+        aerated_surface = wp.smoothstep(0.18, 0.72, neighbour_deficit)
+        # Whitewater needs both energy and a mechanism for entraining air.
+        # This prevents a fast but smooth trailing current from becoming a
+        # uniformly white sheet while retaining impact foam at the front.
+        foam_source = 0.62 * rotational * wp.max(compressive, aerated_surface * 0.55)
+        foam_source += 0.48 * overturning * wp.max(compressive, aerated_surface * 0.42)
 
         # A thin sheet has broad tangential support but little thickness along
         # its free-surface normal.  A second local pass is substantially more
@@ -327,6 +354,84 @@ def splat_sparse_surface_field(
                 distance2 = wp.length_sq(node - particle)
                 contribution = wp.exp(-distance2 * inverse_two_sigma2) * volume_weight
                 if contribution > 0.005:
+                    wp.atomic_add(field, ix, iy, iz, contribution)
+
+
+@wp.kernel
+def splat_anisotropic_surface_field(
+    x: wp.array(dtype=wp.vec3),
+    v: wp.array(dtype=wp.vec3),
+    radius: wp.array(dtype=float),
+    kind: wp.array(dtype=wp.int32),
+    surface_mask: wp.array(dtype=wp.int32),
+    surface_normal: wp.array(dtype=wp.vec3),
+    field: wp.array3d(dtype=float),
+    lower: wp.vec3,
+    voxel_size: float,
+    nx: int,
+    ny: int,
+    nz: int,
+    tangent_sigma_scale: float,
+    binormal_sigma_scale: float,
+    normal_sigma_scale: float,
+    velocity_stretch: float,
+):
+    """Splat a volume-preserving, flow-aligned ellipsoid into the water SDF.
+
+    The isotropic kernel exposes the particle lattice as round lobes.  A thin
+    normal axis and two broader tangent axes join neighbouring samples into a
+    sheet while retaining the simulated free-surface position.
+    """
+    i = wp.tid()
+    if kind[i] != 0 or surface_mask[i] == 0:
+        return
+    particle = x[i]
+    normal = surface_normal[i]
+    if wp.length(normal) < 0.5:
+        normal = wp.vec3(0.0, 1.0, 0.0)
+    else:
+        normal = wp.normalize(normal)
+    tangent_velocity = v[i] - normal * wp.dot(v[i], normal)
+    tangent_speed = wp.length(tangent_velocity)
+    tangent = wp.vec3(1.0, 0.0, 0.0)
+    if tangent_speed > 0.05:
+        tangent = tangent_velocity / tangent_speed
+    elif wp.abs(normal[1]) < 0.92:
+        tangent = wp.normalize(wp.cross(wp.vec3(0.0, 1.0, 0.0), normal))
+    else:
+        tangent = wp.normalize(wp.cross(wp.vec3(1.0, 0.0, 0.0), normal))
+    binormal = wp.normalize(wp.cross(normal, tangent))
+
+    base_radius = wp.max(radius[i], voxel_size * 0.28)
+    flow_stretch = 1.0 + wp.clamp(tangent_speed * velocity_stretch, 0.0, 0.65)
+    sigma_t = wp.max(base_radius * tangent_sigma_scale * flow_stretch, voxel_size * 0.72)
+    sigma_b = wp.max(base_radius * binormal_sigma_scale, voxel_size * 0.68)
+    sigma_n = wp.max(base_radius * normal_sigma_scale, voxel_size * 0.46)
+    center = (particle - lower) / voxel_size
+    cx = int(wp.round(center[0])); cy = int(wp.round(center[1])); cz = int(wp.round(center[2]))
+    nominal_spacing = radius[i] * 2.0
+    volume_weight = wp.pow(nominal_spacing, 3.0) / wp.max(
+        sigma_t * sigma_b * sigma_n, 1.0e-6
+    )
+    for dz in range(-4, 5):
+        iz = cz + dz
+        if iz < 0 or iz >= nz:
+            continue
+        for dy in range(-4, 5):
+            iy = cy + dy
+            if iy < 0 or iy >= ny:
+                continue
+            for dx in range(-4, 5):
+                ix = cx + dx
+                if ix < 0 or ix >= nx:
+                    continue
+                node = lower + wp.vec3(float(ix), float(iy), float(iz)) * voxel_size
+                offset = node - particle
+                qt = wp.dot(offset, tangent) / sigma_t
+                qb = wp.dot(offset, binormal) / sigma_b
+                qn = wp.dot(offset, normal) / sigma_n
+                contribution = wp.exp(-0.5 * (qt * qt + qb * qb + qn * qn)) * volume_weight
+                if contribution > 0.004:
                     wp.atomic_add(field, ix, iy, iz, contribution)
 
 

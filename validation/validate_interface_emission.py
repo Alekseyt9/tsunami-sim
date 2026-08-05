@@ -43,7 +43,26 @@ def main() -> None:
         raise AssertionError(f"column layer cap failed: quota={quota.tolist()}")
     if np.any(residual < 0.0) or np.any(residual >= 1.0):
         raise AssertionError("emission scheduler retained a whole-particle backlog")
-    print("PASS: reverse flow disarms emission; restart is delayed, ramped and layer-capped")
+
+    # A returning particle in one transverse shallow cell must not starve the
+    # complete inlet. Only its two emitter columns remain in cooldown.
+    state[:, 2] = 1000.0
+    residual[:] = 0.0
+    age[:] = 2.0
+    quota, residual, age, requested = prepare_hysteretic_emission_quota(
+        state, cell_size=2.0, emitter_spacing=1.0, emitter_nx=4, elapsed=0.1,
+        residual_volume=residual, positive_age=age, minimum_velocity=0.25,
+        rearm_delay=0.35, ramp_seconds=0.65, maximum_layers_per_frame=2,
+        emission_allowed=np.asarray((False, True)),
+    )
+    if requested != 4 or np.any(quota[:2] != 0) or np.any(quota[2:] != 2):
+        raise AssertionError(f"local return cooldown blocked unrelated inlet cells: {quota.tolist()}")
+    if age[0] != 0.0 or age[1] <= 2.0:
+        raise AssertionError("per-cell rearm state did not reset/advance independently")
+    print(
+        "PASS: reverse flow disarms emission locally; unrelated inlet cells keep flowing; "
+        "restart is delayed, ramped and layer-capped"
+    )
 
 
 if __name__ == "__main__":

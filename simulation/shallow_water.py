@@ -23,6 +23,7 @@ def prepare_hysteretic_emission_quota(
     ramp_seconds: float,
     maximum_quota_per_cell: int = 0,
     maximum_layers_per_frame: int = 0,
+    emission_allowed: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """Return bottom-up column quotas after a stable positive-flow interval.
 
@@ -46,6 +47,11 @@ def prepare_hysteretic_emission_quota(
     discharge = state[:, 2]
     velocity = discharge / depth
     stable_positive = velocity >= max(float(minimum_velocity), 0.0)
+    if emission_allowed is not None:
+        allowed = np.asarray(emission_allowed, dtype=bool)
+        if allowed.shape != (len(state),):
+            raise ValueError("emission_allowed must match shallow interface width")
+        stable_positive &= allowed
     age[stable_positive] += float(elapsed)
     age[~stable_positive] = 0.0
     # A residual is only the sub-particle fraction of a currently active
@@ -141,6 +147,9 @@ def advance_shallow_water(
     inlet_velocity_z: float,
     inlet_volume: wp.array(dtype=float),
     inlet_momentum_z: wp.array(dtype=float),
+    transmissive_outlet: int,
+    outlet_volume: wp.array(dtype=float),
+    outlet_momentum_z: wp.array(dtype=float),
 ):
     ix, iz = wp.tid()
     center = current[ix, iz]
@@ -162,11 +171,19 @@ def advance_shallow_water(
         else:
             back = wp.vec3(center[0], center[1], -center[2])
     if iz == nz - 1:
-        front = wp.vec3(center[0], center[1], -center[2])
+        if transmissive_outlet != 0:
+            # Zero-gradient Riemann ghost: outgoing characteristics leave the
+            # city instead of reflecting from an invisible wall.  This is the
+            # standard transmissive finite-volume boundary for a downstream
+            # domain whose detailed geometry lies outside the simulation.
+            front = center
+        else:
+            front = wp.vec3(center[0], center[1], -center[2])
     back_flux = _rusanov_z(back, center, gravity)
+    front_flux = _rusanov_z(center, front, gravity)
     next_value = center - (dt / cell_size) * (
         _rusanov_x(center, right, gravity) - _rusanov_x(left, center, gravity)
-        + _rusanov_z(center, front, gravity) - back_flux
+        + front_flux - back_flux
     )
     h = wp.max(next_value[0], 0.0)
     if h <= dry_depth:
@@ -179,6 +196,9 @@ def advance_shallow_water(
         # cell width and dt gives the signed volume/momentum entering this row.
         wp.atomic_add(inlet_volume, 0, back_flux[0] * cell_size * dt)
         wp.atomic_add(inlet_momentum_z, 0, back_flux[2] * cell_size * dt)
+    if iz == nz - 1 and transmissive_outlet != 0:
+        wp.atomic_add(outlet_volume, 0, front_flux[0] * cell_size * dt)
+        wp.atomic_add(outlet_momentum_z, 0, front_flux[2] * cell_size * dt)
 
 
 @wp.kernel
@@ -454,6 +474,7 @@ def mark_sph_return_particles(
     exchange_volume: wp.array2d(dtype=float),
     exchange_x: wp.array2d(dtype=float),
     exchange_z: wp.array2d(dtype=float),
+    return_volume_by_x: wp.array(dtype=float),
     merged_volume: wp.array(dtype=float),
     cohort_returned_volume: wp.array(dtype=float),
     cohort_returned_momentum_z: wp.array(dtype=float),
@@ -493,6 +514,7 @@ def mark_sph_return_particles(
     wp.atomic_add(exchange_volume, ix, iz, volume[i])
     wp.atomic_add(exchange_x, ix, iz, mass[i] * velocity[0])
     wp.atomic_add(exchange_z, ix, iz, mass[i] * velocity[2])
+    wp.atomic_add(return_volume_by_x, ix, volume[i])
     wp.atomic_add(merged_volume, 0, volume[i])
     if wave_cohort[i] > 0:
         wp.atomic_add(cohort_returned_volume, 0, volume[i])
@@ -586,6 +608,18 @@ class ShallowWaterFarField:
         self.accumulated_dt = 0.0
         self.wave_train_injected_volume = 0.0
         self.wave_train_injected_momentum_z = 0.0
+        self.downstream_outflow_volume = 0.0
+        self.downstream_outflow_momentum_z = 0.0
+        downstream_boundary = str(
+            policy.get("downstream_boundary", "reflective")
+        ).strip().lower()
+        if downstream_boundary not in {"reflective", "transmissive", "open", "outflow"}:
+            raise ValueError(
+                "shallow_water downstream_boundary must be reflective or transmissive"
+            )
+        self.transmissive_outlet = downstream_boundary in {
+            "transmissive", "open", "outflow"
+        }
         incoming_impulse_initial = 0.0
         cohort_emitted_volume_initial = 0.0
         cohort_emitted_momentum_initial = 0.0
@@ -624,6 +658,10 @@ class ShallowWaterFarField:
         self.flux_emitted_particles_total = 0
         self.emission_residual_volume = np.zeros(self.nx, dtype=np.float64)
         self.emission_positive_age = np.zeros(self.nx, dtype=np.float64)
+        self.emission_return_quiet_age = np.zeros(self.nx, dtype=np.float64)
+        self.last_frame_return_volume_by_x = np.zeros(self.nx, dtype=np.float64)
+        self.emission_blocked_cells = self.nx
+        self.returning_cells = 0
         self.return_flow_quiet_age = 0.0
         self.last_frame_merged_volume = 0.0
         self.last_emission_time = 0.0
@@ -657,6 +695,13 @@ class ShallowWaterFarField:
                     self.emission_positive_age = saved[
                         "shallow_emission_positive_age"
                     ].astype(np.float64, copy=True)
+                if (
+                    "shallow_emission_return_quiet_age" in saved
+                    and saved["shallow_emission_return_quiet_age"].shape == (self.nx,)
+                ):
+                    self.emission_return_quiet_age = saved[
+                        "shallow_emission_return_quiet_age"
+                    ].astype(np.float64, copy=True)
                 if "shallow_return_flow_quiet_age" in saved:
                     self.return_flow_quiet_age = float(saved["shallow_return_flow_quiet_age"])
                 if "shallow_merged_particles_total" in saved:
@@ -667,6 +712,14 @@ class ShallowWaterFarField:
                     self.wave_train_injected_volume = float(saved["wave_train_injected_volume"])
                 if "wave_train_injected_momentum_z" in saved:
                     self.wave_train_injected_momentum_z = float(saved["wave_train_injected_momentum_z"])
+                if "shallow_downstream_outflow_volume" in saved:
+                    self.downstream_outflow_volume = float(
+                        saved["shallow_downstream_outflow_volume"]
+                    )
+                if "shallow_downstream_outflow_momentum_z" in saved:
+                    self.downstream_outflow_momentum_z = float(
+                        saved["shallow_downstream_outflow_momentum_z"]
+                    )
                 if "shallow_incoming_boundary_impulse" in saved:
                     incoming_impulse_initial = float(saved["shallow_incoming_boundary_impulse"])
                 if "wave_cohort_emitted_volume" in saved:
@@ -683,7 +736,10 @@ class ShallowWaterFarField:
                     )
         self._wave_train_volume_step = wp.zeros(1, dtype=float, device=device)
         self._wave_train_momentum_step = wp.zeros(1, dtype=float, device=device)
+        self._downstream_outflow_volume_step = wp.zeros(1, dtype=float, device=device)
+        self._downstream_outflow_momentum_step = wp.zeros(1, dtype=float, device=device)
         self.emission_quota = wp.zeros(self.nx, dtype=wp.int32, device=device)
+        self.return_volume_by_x = wp.zeros(self.nx, dtype=float, device=device)
         self.incoming_boundary_impulse = wp.array(
             np.asarray([incoming_impulse_initial], dtype=np.float32),
             dtype=float,
@@ -785,15 +841,26 @@ class ShallowWaterFarField:
                     inlet_velocity = background + (target_velocity - background) * envelope
             self._wave_train_volume_step.zero_()
             self._wave_train_momentum_step.zero_()
+            self._downstream_outflow_volume_step.zero_()
+            self._downstream_outflow_momentum_step.zero_()
             wp.launch(
                 advance_shallow_water, dim=(self.nx, self.nz),
                 inputs=[self.state, self.updated, self.nx, self.nz, self.cell_size, local_dt,
                         9.81, float(self.cfg.get("bed_drag", 0.006)),
                         float(self.cfg.get("dry_depth", 0.02)), int(inlet_active),
                         inlet_depth, inlet_velocity, self._wave_train_volume_step,
-                        self._wave_train_momentum_step], device=self.device,
+                        self._wave_train_momentum_step, int(self.transmissive_outlet),
+                        self._downstream_outflow_volume_step,
+                        self._downstream_outflow_momentum_step], device=self.device,
             )
             self.state, self.updated = self.updated, self.state
+            if self.transmissive_outlet:
+                self.downstream_outflow_volume += float(
+                    self._downstream_outflow_volume_step.numpy()[0]
+                )
+                self.downstream_outflow_momentum_z += float(
+                    self._downstream_outflow_momentum_step.numpy()[0]
+                )
             if inlet_active:
                 self.wave_train_injected_volume += float(
                     self._wave_train_volume_step.numpy()[0]
@@ -967,12 +1034,16 @@ class ShallowWaterFarField:
                 self.emission_positive_age
                 >= float(self.cfg.get("emission_rearm_delay_seconds", 0.35))
             )),
+            "shallow_emission_blocked_cells": int(self.emission_blocked_cells),
+            "shallow_returning_cells": int(self.returning_cells),
             "shallow_return_flow_quiet_age_s": self.return_flow_quiet_age,
             "shallow_merged_particles": self.merged_particles_total,
             "shallow_merged_volume_m3": self.merged_volume_total,
             "shallow_net_transfer_volume_m3": self.emitted_volume_total - self.merged_volume_total,
             "wave_train_injected_volume_m3": self.wave_train_injected_volume,
             "wave_train_injected_momentum_z": self.wave_train_injected_momentum_z,
+            "shallow_downstream_outflow_volume_m3": self.downstream_outflow_volume,
+            "shallow_downstream_outflow_momentum_z": self.downstream_outflow_momentum_z,
             "coupling_incoming_boundary_impulse_kg_m_s": float(
                 self.incoming_boundary_impulse.numpy()[0]
             ),

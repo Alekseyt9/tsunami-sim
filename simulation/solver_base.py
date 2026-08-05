@@ -396,6 +396,8 @@ class DelugeSolver:
                                   "water_splash_bricks", "water_splash_mesh_vertices",
                                   "water_stitch_surface_samples", "shallow_water_cells",
                                   "shallow_water_wet_cells", "shallow_emitted_particles",
+                                  "shallow_emission_rearmed_cells",
+                                  "shallow_emission_blocked_cells", "shallow_returning_cells",
                                   "shallow_merged_particles", "shallow_flux_requested_particles",
                                   "shallow_flux_emitted_particles", "fluid_particles_above_30m",
                                   "fluid_particles_above_42m", "fluid_particles_above_60m",
@@ -413,7 +415,10 @@ class DelugeSolver:
                 "shallow_water_momentum_z", "shallow_emitted_volume_m3",
                 "shallow_merged_volume_m3", "shallow_net_transfer_volume_m3",
                 "wave_train_injected_volume_m3", "wave_train_injected_momentum_z",
+                "shallow_downstream_outflow_volume_m3",
+                "shallow_downstream_outflow_momentum_z",
                 "shallow_flux_emission_efficiency",
+                "shallow_return_flow_quiet_age_s",
                 "water_surface_classify_ms", "water_mesh_preprocess_ms", "water_mesh_field_ms",
                 "water_mesh_marching_cubes_ms", "water_mesh_splash_ms", "water_mesh_total_ms",
                 "structural_adjacency_rebuild_ms",
@@ -458,7 +463,12 @@ class DelugeSolver:
                     row[key] = float(value)
             benchmark_rows.append(row)
             with metrics_path.open("a", encoding="utf-8") as metrics_file:
-                metrics_file.write(json.dumps(row, ensure_ascii=False) + "\n")
+                # Strict JSONL: exactly one compact JSON object and one LF per
+                # output frame. Editors may visually wrap this long logical
+                # line, but the file never contains embedded formatting lines.
+                metrics_file.write(
+                    json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
+                )
             print(f"[{frame+1:05d}/{total_frames:05d}] t={self.time:8.4f}s  particles={self.count:9,d}  damage={stats['damaged']:7,d}  wall={elapsed:7.2f}s  VRAM={gpu_used_mib:7.0f}MiB")
             checkpoint_every = int(self.cfg.get("checkpoint_every_frames", 0))
             if checkpoint_every and frame > 0 and frame % checkpoint_every == 0:

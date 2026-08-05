@@ -36,6 +36,53 @@ class RigidCollisionProxy:
     material: int
 
 
+def limit_rigid_release_motion(
+    linear_velocity: np.ndarray,
+    angular_velocity: np.ndarray,
+    mass: float,
+    half_extent: np.ndarray,
+    maximum_linear_speed: float,
+    maximum_upward_speed: float,
+    upward_speed_reference_mass: float,
+    minimum_mass_upward_speed: float,
+    maximum_angular_speed: float,
+    maximum_tip_speed: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply the runtime rigid limits before the first rigid substep.
+
+    Conversion used to upload the unconstrained deformable fit and clamp it
+    only in ``integrate_rigid_bodies``.  A newly converted heavy slab could
+    therefore be rendered and collide once with an impossible release impulse.
+    This host equivalent keeps the transition frame inside the same mass- and
+    size-aware bounds as every later CUDA substep.
+    """
+    linear = np.asarray(linear_velocity, dtype=np.float64).copy()
+    angular = np.asarray(angular_velocity, dtype=np.float64).copy()
+    body_mass = max(float(mass), 1.0)
+    if maximum_upward_speed > 0.0:
+        upward_limit = float(maximum_upward_speed)
+        if upward_speed_reference_mass > 0.0:
+            upward_limit *= np.sqrt(
+                float(upward_speed_reference_mass)
+                / max(body_mass, float(upward_speed_reference_mass))
+            )
+            upward_limit = max(float(minimum_mass_upward_speed), upward_limit)
+        linear[1] = min(float(linear[1]), upward_limit)
+    linear_speed = float(np.linalg.norm(linear))
+    if maximum_linear_speed > 0.0 and linear_speed > maximum_linear_speed:
+        linear *= float(maximum_linear_speed) / linear_speed
+
+    angular_speed = float(np.linalg.norm(angular))
+    angular_limit = float(maximum_angular_speed)
+    if maximum_tip_speed > 0.0:
+        body_radius = max(float(np.linalg.norm(half_extent)), 0.25)
+        size_limit = float(maximum_tip_speed) / body_radius
+        angular_limit = size_limit if angular_limit <= 0.0 else min(angular_limit, size_limit)
+    if angular_limit > 0.0 and angular_speed > angular_limit:
+        angular *= angular_limit / angular_speed
+    return linear.astype(np.float32), angular.astype(np.float32)
+
+
 def fit_rigid_collision_proxy(
     local_positions: np.ndarray,
     radius: np.ndarray,

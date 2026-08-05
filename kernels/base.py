@@ -1261,3 +1261,101 @@ def apply_cinematic_postprocess(
     ny = (float(y) + 0.5) / float(height) * 2.0 - 1.0
     vignette = 1.0 - 0.13 * wp.clamp(nx * nx + ny * ny - 0.35, 0.0, 1.0)
     color[i] = value * vignette
+
+
+@wp.kernel
+def apply_screen_space_indirect_lighting(
+    source_color: wp.array(dtype=wp.vec3),
+    scene_depth: wp.array(dtype=float),
+    water_depth: wp.array(dtype=float),
+    gbuffer_normal: wp.array(dtype=wp.vec3),
+    output_color: wp.array(dtype=wp.vec3),
+    cam: wp.vec3,
+    camera_right: wp.vec3,
+    camera_up: wp.vec3,
+    camera_forward: wp.vec3,
+    focal: float,
+    width: int,
+    height: int,
+    strength: float,
+    radius_pixels: int,
+):
+    """Deterministic one-bounce diffuse screen-space light transport.
+
+    This is deliberately conservative: it adds nearby colour bleeding and
+    sky-lit fill without replacing the physically based direct/IBL terms.
+    Reading from a frozen source buffer avoids order-dependent feedback.
+    """
+    i = wp.tid()
+    x = i % width
+    y = i // width
+    z = wp.min(scene_depth[i], water_depth[i])
+    base = source_color[i]
+    if z > 1.0e8 or strength <= 0.0:
+        output_color[i] = base
+        return
+    normal = gbuffer_normal[i]
+    if wp.length(normal) < 0.25:
+        normal = wp.vec3(0.0, 1.0, 0.0)
+    else:
+        normal = wp.normalize(normal)
+    camera_x = (float(x) + 0.5 - float(width) * 0.5) * z / focal
+    camera_y = -(float(y) + 0.5 - float(height) * 0.5) * z / focal
+    world = cam + camera_right * camera_x + camera_up * camera_y + camera_forward * z
+    accumulated = wp.vec3(0.0)
+    weight_sum = float(0.0)
+    phase = (x * 17 + y * 11) & 7
+    for ring in range(2):
+        sample_radius = wp.max(2, radius_pixels * (ring + 1) // 2)
+        for sample in range(8):
+            direction_index = (sample + phase) & 7
+            ox = 0
+            oy = 0
+            if direction_index == 0: ox = sample_radius
+            elif direction_index == 1: ox = sample_radius; oy = sample_radius
+            elif direction_index == 2: oy = sample_radius
+            elif direction_index == 3: ox = -sample_radius; oy = sample_radius
+            elif direction_index == 4: ox = -sample_radius
+            elif direction_index == 5: ox = -sample_radius; oy = -sample_radius
+            elif direction_index == 6: oy = -sample_radius
+            else: ox = sample_radius; oy = -sample_radius
+            px = x + ox
+            py = y + oy
+            if px < 0 or px >= width or py < 0 or py >= height:
+                continue
+            neighbour_index = py * width + px
+            neighbour_z = wp.min(scene_depth[neighbour_index], water_depth[neighbour_index])
+            if neighbour_z > 1.0e8 or wp.abs(neighbour_z - z) > 36.0:
+                continue
+            neighbour_x = (float(px) + 0.5 - float(width) * 0.5) * neighbour_z / focal
+            neighbour_y = -(float(py) + 0.5 - float(height) * 0.5) * neighbour_z / focal
+            neighbour_world = (
+                cam + camera_right * neighbour_x + camera_up * neighbour_y
+                + camera_forward * neighbour_z
+            )
+            delta = neighbour_world - world
+            distance = wp.length(delta)
+            if distance < 0.05:
+                continue
+            ray = delta / distance
+            neighbour_normal = gbuffer_normal[neighbour_index]
+            if wp.length(neighbour_normal) < 0.25:
+                neighbour_normal = wp.vec3(0.0, 1.0, 0.0)
+            else:
+                neighbour_normal = wp.normalize(neighbour_normal)
+            receiver = wp.max(wp.dot(normal, ray), 0.0)
+            emitter = wp.max(wp.dot(neighbour_normal, -ray), 0.0)
+            # A small isotropic term approximates unresolved diffuse transport
+            # at contact edges where the screen-space direction is tangent.
+            geometry = 0.12 + 0.88 * wp.sqrt(receiver * emitter)
+            attenuation = geometry / (1.0 + 0.10 * distance + 0.012 * distance * distance)
+            accumulated += source_color[neighbour_index] * attenuation
+            weight_sum += attenuation
+    if weight_sum > 1.0e-5:
+        bounced = accumulated / weight_sum
+        # Limit energy injection; this pass is a one-bounce approximation and
+        # must not become an emissive blur in highly fragmented regions.
+        bounced = wp.min(bounced, wp.vec3(2.5, 2.5, 2.5))
+        output_color[i] = base + bounced * wp.clamp(strength, 0.0, 0.45)
+    else:
+        output_color[i] = base

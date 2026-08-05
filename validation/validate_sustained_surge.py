@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from _bootstrap import ROOT
 
+import argparse
 import copy
 import json
 from pathlib import Path
@@ -16,7 +17,14 @@ from simulation.shallow_water import ShallowWaterFarField
 
 
 def main() -> None:
-    config_path = ROOT / "config_v3_sustained_surge_30s.json"
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=ROOT / "config_v3_sustained_surge_30s.json",
+    )
+    args = parser.parse_args()
+    config_path = args.config.resolve()
     cfg = load_run_config(config_path)
     control_cfg = copy.deepcopy(cfg)
     control_cfg["v3"]["shallow_water"]["wave_train"]["enabled"] = False
@@ -59,10 +67,16 @@ def main() -> None:
         - control_diagnostics["shallow_water_volume_m3"]
     )
     injected = diagnostics["wave_train_injected_volume_m3"]
-    relative_error = abs(volume_delta - injected) / max(abs(injected), 1.0)
+    net_outflow = (
+        diagnostics["shallow_downstream_outflow_volume_m3"]
+        - control_diagnostics["shallow_downstream_outflow_volume_m3"]
+    )
+    expected_storage = injected - net_outflow
+    relative_error = abs(volume_delta - expected_storage) / max(abs(injected), 1.0)
     if relative_error > 2.0e-3:
         raise AssertionError(
-            f"surge boundary is not conservative: delta={volume_delta}, source={injected}"
+            "surge boundaries are not conservative: "
+            f"delta={volume_delta}, source={injected}, outflow={net_outflow}"
         )
 
     row_summaries = []
@@ -92,6 +106,7 @@ def main() -> None:
         "stop_time_s": stop_time,
         "injected_volume_m3": injected,
         "injected_momentum_z": diagnostics["wave_train_injected_momentum_z"],
+        "downstream_outflow_volume_m3": net_outflow,
         "volume_conservation_relative_error": relative_error,
         "rows": row_summaries,
     }

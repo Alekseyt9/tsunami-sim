@@ -20,7 +20,11 @@ from simulation.hybrid_model import (  # noqa: E402
     build_fragment_ids,
     build_refinement_axes,
 )
-from simulation.scene import STRUCT_WALL  # noqa: E402
+from simulation.scene import (  # noqa: E402
+    STRUCT_GLASS,
+    STRUCT_SLAB,
+    STRUCT_WALL,
+)
 
 
 def main() -> None:
@@ -70,13 +74,26 @@ def main() -> None:
         scene_cfg, state["rest_x"], state["kind"], state["building_id"], fragment_id,
         state["radius"], state["structural_class"], normal_axis,
     )
-    if not np.all(debris["panel_mode"] == 1) or set(debris["owner_fragment"]) != set(range(len(fragment_counts))):
-        raise AssertionError("debris cell surfaces are not bound to every cohesive fragment")
+    fragment_role = np.zeros(len(fragment_counts), dtype=np.int32)
+    for fid in range(len(fragment_counts)):
+        roles = state["structural_class"][fragment_id == fid]
+        fragment_role[fid] = np.bincount(roles, minlength=7).argmax()
+    volumetric_fragments = set(np.flatnonzero(
+        ~np.isin(fragment_role, (STRUCT_WALL, STRUCT_GLASS, STRUCT_SLAB))
+    ).tolist())
+    debris_owners = set(debris["owner_fragment"].tolist())
+    if not np.all(debris["panel_mode"] == 1) or debris_owners != volumetric_fragments:
+        raise AssertionError(
+            "debris hulls must cover only volumetric frame/core fragments; "
+            "authored wall/glass/slab panels must survive rigid conversion"
+        )
     if not np.isfinite(debris["vertex"]).all():
         raise AssertionError("fragment debris cell surface contains invalid vertices")
     debris_face_count = np.bincount(debris["owner_fragment"], minlength=len(fragment_counts))
-    if np.any(debris_face_count < 4):
-        raise AssertionError("one or more fragment cell union is not a closed volume")
+    if volumetric_fragments and np.any(
+        debris_face_count[np.asarray(sorted(volumetric_fragments), dtype=np.int32)] < 4
+    ):
+        raise AssertionError("one or more volumetric fragment cell union is not closed")
     if np.any(np.all(np.isclose(debris["vertex"][:, 2], debris["vertex"][:, 3]), axis=1)):
         raise AssertionError("legacy convex-hull triangles remain in the debris skin")
 
@@ -111,15 +128,26 @@ def main() -> None:
     wall_palettes = set((material[(material >= 10) & (material < 20)] % 10).tolist())
     glass_palettes = set((material[(material >= 20) & (material < 30)] % 10).tolist())
     roof_palettes = set((material[(material >= 30) & (material < 40)] % 10).tolist())
+    glass_indices = np.flatnonzero((material >= 20) & (material < 30))
+    interior_indices = np.flatnonzero((material >= 80) & (material < 90))
     if len(wall_palettes) < 6 or len(glass_palettes) < 6 or len(roof_palettes) < 6:
         raise AssertionError("not all six facade palettes are represented")
+    if len(interior_indices) != len(glass_indices) or len(interior_indices) == 0:
+        raise AssertionError("every recessed window must have one interior depth card")
+    recess = np.einsum(
+        "ij,ij->i",
+        skin["center"][interior_indices] - skin["center"][glass_indices],
+        skin["normal"][glass_indices],
+    )
+    if not np.allclose(recess, -0.45, atol=1.0e-4):
+        raise AssertionError(f"window/interior depth is not preserved: {recess.min()}..{recess.max()}")
     if not np.isfinite(skin["vertex"]).all():
         raise AssertionError("styled facade contains invalid vertices")
     print(
         f"PASS: {len(signatures)} physical silhouettes, {sum(counts):,} coarse structural particles, "
-        f"{len(material):,} facade panels, {len(debris['material']):,} hidden cell-union faces "
-        f"for {len(fragment_counts):,} cohesive fragments "
-        "and six wall/glass/roof palettes"
+        f"{len(material):,} facade panels, {len(debris['material']):,} volumetric cell-union faces "
+        f"for {len(volumetric_fragments):,}/{len(fragment_counts):,} cohesive fragments "
+        "six wall/glass/roof palettes and recessed window interiors"
     )
 
 

@@ -4182,7 +4182,8 @@ def raster_facade_shadow_depth(
 ):
     triangle = wp.tid()
     panel = triangle // 2
-    if material[panel] // 10 == 2:
+    family = material[panel] // 10
+    if family == 2 or family == 8:
         return
     if panel_mode[panel] != 0:
         owner = owner_fragment[panel]
@@ -4251,6 +4252,7 @@ def apply_cascaded_shadow_maps(
     cascade_count: int,
     shadow_resolution: int,
     shadow_strength: float,
+    sun_direction_input: wp.vec3,
 ):
     i = wp.tid()
     x = i % width; y = i // width
@@ -4258,7 +4260,7 @@ def apply_cascaded_shadow_maps(
     if z > 1.0e8:
         return
     cascade = cascade_count - 1
-    for candidate in range(3):
+    for candidate in range(4):
         if candidate < cascade_count and z <= far_splits[candidate]:
             cascade = wp.min(cascade, candidate)
     camera_x = (float(x) + 0.5 - float(width) * 0.5) * z / focal
@@ -4272,14 +4274,14 @@ def apply_cascaded_shadow_maps(
     if sx < 0 or sx >= shadow_resolution or sy < 0 or sy >= shadow_resolution:
         return
     normal = wp.normalize(gbuffer_normal[i])
-    sun_direction = wp.normalize(wp.vec3(-0.38, 0.82, -0.35))
+    sun_direction = wp.normalize(sun_direction_input)
     normal_light = wp.clamp(wp.dot(normal, sun_direction), 0.0, 1.0)
     bias = 0.12 + (1.0 - normal_light) * 0.32
     occluded = float(0.0)
     samples = int(0)
     offset = cascade * shadow_resolution * shadow_resolution
-    for oy in range(-1, 2):
-        for ox in range(-1, 2):
+    for oy in range(-2, 3):
+        for ox in range(-2, 3):
             px = sx + ox; py = sy + oy
             if px >= 0 and px < shadow_resolution and py >= 0 and py < shadow_resolution:
                 blocker = shadow_depth[offset + py * shadow_resolution + px]
@@ -4324,8 +4326,8 @@ def facade_material_color(code: int) -> wp.vec3:
         base *= 0.68
     elif family == 4:
         # Exposed structural fragment hull: darker concrete/steel aggregate,
-        # while retaining a trace of the original building palette.
-        base = base * 0.48 + wp.vec3(0.18, 0.19, 0.18)
+        # while retaining the parent building palette after rigid conversion.
+        base = base * 0.72 + wp.vec3(0.075, 0.080, 0.078)
     elif family == 5:  # painted vehicle body
         base = wp.vec3(0.12, 0.25, 0.48)
         if palette == 1: base = wp.vec3(0.62, 0.10, 0.07)
@@ -4340,6 +4342,11 @@ def facade_material_color(code: int) -> wp.vec3:
         base = wp.vec3(0.075, 0.25, 0.10)
         if palette == 1: base = wp.vec3(0.11, 0.31, 0.13)
         elif palette == 2: base = wp.vec3(0.06, 0.19, 0.09)
+    elif family == 8:  # recessed, non-emissive apartment interior
+        base = wp.vec3(0.030, 0.034, 0.037)
+        if palette == 1: base = wp.vec3(0.045, 0.039, 0.031)
+        elif palette == 3: base = wp.vec3(0.040, 0.037, 0.029)
+        elif palette == 4: base = wp.vec3(0.042, 0.028, 0.023)
     elif family == 9:  # terrain / asphalt / pavement
         base = wp.vec3(0.18, 0.20, 0.20)
         if palette == 1: base = wp.vec3(0.075, 0.083, 0.085)
@@ -4363,6 +4370,8 @@ def facade_material_roughness(family: int, panel: int) -> float:
         roughness = 0.46
     elif family == 7:  # foliage
         roughness = 0.78
+    elif family == 8:  # interior cards
+        roughness = 0.92
     elif family == 9:  # wet asphalt and pavement
         roughness = 0.54
     variation = (facade_hash01(panel, 211) - 0.5) * 0.10

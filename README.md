@@ -32,6 +32,12 @@ The project targets an NVIDIA RTX 5070 with 12 GB of VRAM. It prioritizes physic
   building-row depths; it replaces the former long pulse that read as a slow
   water-level rise.
 - Cinematic lighting, water Fresnel/specular response, foam, screen-space contact shading, wetness, atmospheric haze, and vignette.
+- Linear HDR lighting with an ACES filmic resolve, stable highlight bloom, an
+  analytic daylight sky, and shared sky IBL for facades, glazing, vehicles,
+  water reflections, fog, and mist.
+- Depth-aware single-layer water transport using front/back surface depth,
+  wavelength-dependent absorption and scattering, anisotropic phase response,
+  Fresnel reflection, refraction, and an HDR sky fallback outside screen space.
 - Original, front, side, and top cameras combined into one 1920×1080 video.
 - Direct NVENC output without intermediate PNG sequences.
 - A playable MP4 is atomically updated after every completed simulated second.

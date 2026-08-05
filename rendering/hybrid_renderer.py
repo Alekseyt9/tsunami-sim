@@ -11,6 +11,7 @@ from kernels.base import (
     apply_directional_screen_shadows,
     bilateral_depth_axis,
     apply_cinematic_postprocess,
+    apply_screen_space_indirect_lighting,
     clear_depth,
     clear_gbuffer,
     clear_render,
@@ -55,6 +56,9 @@ class HybridRenderer(ParticleRenderer):
                  shadow_resolution: int = 512,
                  shadow_splits: tuple[float, float, float] = (90.0, 220.0, 480.0),
                  shadow_strength: float = 0.78,
+                 indirect_lighting_enabled: bool = True,
+                 indirect_lighting_strength: float = 0.16,
+                 indirect_lighting_radius_pixels: int = 14,
                  hdr_enabled: bool = True,
                  physical_sky_enabled: bool = True,
                  hdr_exposure_ev: float = -0.35,
@@ -88,6 +92,9 @@ class HybridRenderer(ParticleRenderer):
         self.cascaded_shadows = bool(cascaded_shadows)
         self.shadow_resolution = max(128, int(shadow_resolution))
         self.shadow_strength = max(0.0, min(float(shadow_strength), 1.0))
+        self.indirect_lighting_enabled = bool(indirect_lighting_enabled)
+        self.indirect_lighting_strength = max(0.0, min(float(indirect_lighting_strength), 0.45))
+        self.indirect_lighting_radius_pixels = max(2, int(indirect_lighting_radius_pixels))
         self.hdr_enabled = bool(hdr_enabled)
         self.physical_sky_enabled = bool(physical_sky_enabled)
         self.hdr_exposure_ev = float(hdr_exposure_ev)
@@ -118,6 +125,7 @@ class HybridRenderer(ParticleRenderer):
         self.taa_history_depth = wp.empty(pixel_count, dtype=float, device=device)
         self.taa_output = wp.empty(pixel_count, dtype=wp.vec3, device=device)
         self.display_color = wp.empty(pixel_count, dtype=wp.vec3, device=device)
+        self.lighting_source = wp.empty(pixel_count, dtype=wp.vec3, device=device)
         wp.launch(clear_depth, dim=pixel_count, inputs=[self.taa_history_depth], device=device)
         self.taa_history_valid = False
         with np.load(skin_path, allow_pickle=False) as skin:
@@ -155,13 +163,13 @@ class HybridRenderer(ParticleRenderer):
         self.fragment_fracture_energy = wp.zeros(fragment_count, dtype=float, device=device)
         self._initialize_shadow_cascades(tuple(float(value) for value in shadow_splits))
 
-    def _initialize_shadow_cascades(self, splits: tuple[float, float, float]) -> None:
+    def _initialize_shadow_cascades(self, splits: tuple[float, ...]) -> None:
         """Build stable orthographic sunlight volumes around camera-frustum slices."""
         splits_array = np.maximum.accumulate(np.asarray(splits, dtype=np.float32))
-        cascade_count = min(3, len(splits_array))
+        cascade_count = min(4, len(splits_array))
         tan_half_fov = 0.5 * float(self.height) / max(float(self.focal), 1.0e-6)
         aspect = float(self.width) / max(float(self.height), 1.0)
-        sun = np.asarray((-0.38, 0.82, -0.35), dtype=np.float32)
+        sun = np.asarray(self.sun_direction, dtype=np.float32)
         sun /= np.linalg.norm(sun)
         light_forward = -sun
         light_right = np.cross(light_forward, np.asarray((0.0, 1.0, 0.0), dtype=np.float32))
@@ -383,7 +391,7 @@ class HybridRenderer(ParticleRenderer):
                     self.focal, self.width, self.height, self.shadow_depth,
                     self.shadow_origins, self.shadow_rights, self.shadow_ups, self.shadow_forwards,
                     self.shadow_extents, self.shadow_far_splits, self.shadow_cascade_count,
-                    self.shadow_resolution, self.shadow_strength,
+                    self.shadow_resolution, self.shadow_strength, wp.vec3(*self.sun_direction),
                 ], device=self.device,
             )
         else:
@@ -393,6 +401,20 @@ class HybridRenderer(ParticleRenderer):
                     self.depth, smooth_source, self.color,
                     wp.vec3(*self.right), wp.vec3(*self.up), wp.vec3(*self.forward),
                     self.focal, self.width, self.height,
+                ], device=self.device,
+            )
+        if self.indirect_lighting_enabled:
+            wp.launch(
+                copy_vec3, dim=pixel_count,
+                inputs=[self.color, self.lighting_source], device=self.device,
+            )
+            wp.launch(
+                apply_screen_space_indirect_lighting, dim=pixel_count,
+                inputs=[
+                    self.lighting_source, self.depth, smooth_source, self.gbuffer_normal,
+                    self.color, wp.vec3(*self.cam), wp.vec3(*self.right), wp.vec3(*self.up),
+                    wp.vec3(*self.forward), self.focal, self.width, self.height,
+                    self.indirect_lighting_strength, self.indirect_lighting_radius_pixels,
                 ], device=self.device,
             )
         wp.launch(

@@ -128,6 +128,7 @@
     "debris_skin": {
       "enabled": true,
       "cache": true,
+      "use_authored_sheet_surfaces": true,
       "architectural_overlay_tolerance": 0.9,
       "wall_thickness": 0.18,
       "glass_thickness": 0.10,
@@ -279,13 +280,16 @@
       "maximum_internal_velocity_rms": 2.5,
       "plastic_rigidize_position_rms": 0.75,
       "plastic_rigidize_release_fraction": 0.35,
+      "forced_plastic_position_rms": 0.40,
+      "forced_plastic_fracture_energy": 0.95,
+      "preserve_current_shape_position_rms": 0.60,
       "terminal_plastic_collapse": true,
       "early_rigidification": {
-        "enabled": false,
+        "enabled": true,
         "scan_every_frames": 2,
         "minimum_detached_scans": 2,
         "required_quiet_scans": 1,
-        "release_damage_fraction": 0.30,
+        "release_damage_fraction": 0.0,
         "maximum_internal_velocity_rms": 3.0
       },
       "sleeping": {
@@ -378,13 +382,14 @@
       "droplet_enter_classifications": 4,
       "droplet_exit_classifications": 2,
       "foam_decay": 0.80,
+      "normal_history_weight": 0.64,
       "tangent_scale": 2.8,
       "normal_scale": 2.45
     },
     "water_mesh": {
       "enabled": true,
-      "voxel_size": 0.65,
-      "maximum_field_nodes": 6000000,
+      "voxel_size": 0.45,
+      "maximum_field_nodes": 8000000,
       "maximum_core_height": 42.0,
       "margin_cells": 3.0,
       "bbox_lower_quantile": [0.0, 0.0, 0.0],
@@ -392,6 +397,10 @@
       "domain_shrink_alpha": 0.12,
       "lod_recovery_frames": 8,
       "temporal_field_previous_weight": 0.12,
+      "anisotropic_tangent_sigma": 1.72,
+      "anisotropic_binormal_sigma": 1.38,
+      "anisotropic_normal_sigma": 0.82,
+      "anisotropic_velocity_stretch": 0.025,
       "iso_threshold": 5.0,
       "field_smoothing_iterations": 1,
       "rebuild_every_frames": 1,
@@ -400,7 +409,7 @@
       "splash_enter_particles": 48,
       "splash_keep_particles": 24,
       "maximum_splash_bricks": 6,
-      "splash_voxel_size": 0.4,
+      "splash_voxel_size": 0.3,
       "splash_margin_cells": 2,
       "splash_iso_threshold": 1.35
     },
@@ -491,19 +500,25 @@
     },
     "cascaded_shadows": {
       "enabled": true,
-      "cascade_count": 3,
-      "resolution": 512,
-      "splits_m": [90.0, 220.0, 480.0],
+      "cascade_count": 4,
+      "resolution": 2048,
+      "splits_m": [70.0, 150.0, 300.0, 520.0],
       "strength": 0.78,
-      "pcf": "3x3",
+      "pcf": "5x5",
       "texel_stabilization": true
+    },
+    "indirect_lighting": {
+      "enabled": true,
+      "method": "screen_space_diffuse_bounce",
+      "strength": 0.16,
+      "radius_pixels": 14
     },
     "camera": {"position": [145, 72, -105], "target": [0, 20, 48], "fov_degrees": 43},
     "views": {
-      "original": {"position": [145, 72, -105], "target": [0, 20, 48], "fov_degrees": 43, "render_width": 1440, "render_height": 810},
-      "front": {"position": [0, 50, -125], "target": [0, 21, 49], "fov_degrees": 45},
-      "side": {"position": [168, 57, 48], "target": [0, 22, 50], "fov_degrees": 45},
-      "top": {"position": [0, 218, 2], "target": [0, 0, 52], "fov_degrees": 46}
+      "original": {"position": [145, 72, -105], "target": [0, 20, 48], "fov_degrees": 43, "render_width": 1440, "render_height": 810, "shadow_resolution": 2048},
+      "front": {"position": [0, 50, -125], "target": [0, 21, 49], "fov_degrees": 45, "shadow_resolution": 1024},
+      "side": {"position": [168, 57, 48], "target": [0, 22, 50], "fov_degrees": 45, "shadow_resolution": 1024},
+      "top": {"position": [0, 218, 2], "target": [0, 0, 52], "fov_degrees": 46, "shadow_resolution": 1024}
     }
   }
 }
