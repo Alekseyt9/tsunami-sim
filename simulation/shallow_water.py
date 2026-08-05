@@ -9,6 +9,84 @@ import numpy as np
 import warp as wp
 
 
+def prepare_hysteretic_emission_quota(
+    interface_state: np.ndarray,
+    *,
+    cell_size: float,
+    emitter_spacing: float,
+    emitter_nx: int,
+    elapsed: float,
+    residual_volume: np.ndarray,
+    positive_age: np.ndarray,
+    minimum_velocity: float,
+    rearm_delay: float,
+    ramp_seconds: float,
+    maximum_quota_per_cell: int = 0,
+    maximum_layers_per_frame: int = 0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """Return bottom-up column quotas after a stable positive-flow interval.
+
+    Return flow resets the per-cell clock.  Water is represented only in the
+    shallow field during the dead time, so no mass is discarded.  When flow
+    becomes positive again the quota ramps up without retaining a large
+    scheduler backlog that could later emerge as one vertical particle wall.
+    """
+    state = np.asarray(interface_state, dtype=np.float64)
+    residual = np.asarray(residual_volume, dtype=np.float64).copy()
+    age = np.asarray(positive_age, dtype=np.float64).copy()
+    if state.ndim != 2 or state.shape[1] < 3:
+        raise ValueError("interface_state must have shape (nx, >=3)")
+    if residual.shape != (len(state),) or age.shape != (len(state),):
+        raise ValueError("emission state arrays must match shallow interface width")
+    column_quota = np.zeros(max(int(emitter_nx), 1), dtype=np.int32)
+    if elapsed <= 0.0:
+        return column_quota, residual, age, 0
+
+    depth = np.maximum(state[:, 0], 1.0e-6)
+    discharge = state[:, 2]
+    velocity = discharge / depth
+    stable_positive = velocity >= max(float(minimum_velocity), 0.0)
+    age[stable_positive] += float(elapsed)
+    age[~stable_positive] = 0.0
+    # A residual is only the sub-particle fraction of a currently active
+    # discharge.  Keeping it through reverse flow creates an artificial pulse
+    # when the sign changes again.
+    residual[~stable_positive] = 0.0
+
+    delay = max(float(rearm_delay), 0.0)
+    ramp_duration = max(float(ramp_seconds), 1.0e-6)
+    ramp = np.clip((age - delay) / ramp_duration, 0.0, 1.0)
+    positive_discharge = np.maximum(discharge, 0.0) * ramp
+    particle_volume = float(emitter_spacing) ** 3
+    requested_volume = positive_discharge * float(cell_size) * float(elapsed) + residual
+    raw_quota = np.floor(requested_volume / particle_volume).astype(np.int64)
+    # Preserve only a fractional scheduler residual.  Whole particles denied
+    # by a rate cap remain physical shallow-water volume and are reconsidered
+    # from the next frame's actual discharge instead of forming a backlog.
+    residual = requested_volume - raw_quota.astype(np.float64) * particle_volume
+    cell_quota = raw_quota.copy()
+    if maximum_quota_per_cell > 0:
+        cell_quota = np.minimum(cell_quota, int(maximum_quota_per_cell))
+
+    emitter_indices = np.arange(len(column_quota), dtype=np.int32)
+    emitter_x = (emitter_indices.astype(np.float64) + 0.5) * float(emitter_spacing)
+    emitter_cell = np.clip(
+        np.floor(emitter_x / float(cell_size)).astype(np.int32), 0, len(state) - 1
+    )
+    for cell in np.flatnonzero(cell_quota > 0):
+        columns = emitter_indices[emitter_cell == cell]
+        if len(columns) == 0:
+            continue
+        quota = int(cell_quota[cell])
+        if maximum_layers_per_frame > 0:
+            quota = min(quota, len(columns) * int(maximum_layers_per_frame))
+        base, extra = divmod(quota, len(columns))
+        column_quota[columns] = base
+        if extra:
+            column_quota[columns[:extra]] += 1
+    return column_quota, residual, age, int(np.sum(column_quota, dtype=np.int64))
+
+
 @wp.func
 def _flux_x(q: wp.vec3, gravity: float) -> wp.vec3:
     h = wp.max(q[0], 1.0e-5)
@@ -287,78 +365,81 @@ def emit_sph_interface_particles(
     cohort_emitted_volume: wp.array(dtype=float),
     cohort_emitted_momentum_z: wp.array(dtype=float),
 ):
-    emitter_x, emitter_y = wp.tid()
-    if emitter_x >= emitter_nx or emitter_y >= emitter_ny:
+    emitter_x = wp.tid()
+    if emitter_x >= emitter_nx:
         return
     px = lower_x + (float(emitter_x) + 0.5) * particle_spacing
-    py = (float(emitter_y) + 0.5) * particle_spacing
     pz = interface_z + 0.55 * particle_spacing
     sx = wp.clamp(int(wp.floor((px - lower_x) / cell_size)), 0, shallow_nx - 1)
     sz = wp.clamp(int(wp.floor((interface_z - lower_z) / cell_size)), 0, shallow_nz - 1)
     state = shallow[sx, sz]
-    if state[0] <= py + 0.5 * particle_spacing:
-        return
-    position = wp.vec3(px, py, pz)
-    occupied = int(0)
-    query = wp.hash_grid_query(grid, position, particle_spacing * 0.62)
-    for neighbour in query:
-        if neighbour < old_count and kind[neighbour] == 0:
-            if wp.length_sq(x[neighbour] - position) < particle_spacing * particle_spacing * 0.38:
-                occupied = 1
-                break
-    if occupied != 0:
-        return
     velocity_x = state[1] / wp.max(state[0], 1.0e-5)
     velocity_z = state[2] / wp.max(state[0], 1.0e-5)
     if velocity_z < minimum_emission_velocity:
         return
+    allowed = emitter_ny
     if use_flux_quota != 0:
-        previous_quota = wp.atomic_sub(emission_quota, sx, 1)
-        if previous_quota <= 0:
-            wp.atomic_add(emission_quota, sx, 1)
-            return
-    target = wp.atomic_add(count, 0, 1)
-    if target >= capacity:
-        if use_flux_quota != 0:
-            wp.atomic_add(emission_quota, sx, 1)
+        allowed = emission_quota[emitter_x]
+    if allowed <= 0:
         return
     particle_volume = particle_spacing * particle_spacing * particle_spacing
     particle_mass = particle_volume * rest_density
     velocity = wp.vec3(velocity_x, 0.0, velocity_z)
-    x[target] = position
-    rest_x[target] = position
-    v[target] = velocity
-    radius[target] = 0.5 * particle_spacing
-    mass[target] = particle_mass
-    volume[target] = particle_volume
-    kind[target] = 0
-    material[target] = 0
-    building_id[target] = -1
-    structural_class[target] = 0
-    fixed[target] = 0
-    damage[target] = 0.0
-    impact_impulse[target] = 0.0
-    local_impact_active[target] = 0
-    rho_reference[target] = 0.0
-    rho[target] = rest_density
-    acceleration[target] = wp.vec3(0.0)
-    solid_force[target] = wp.vec3(0.0)
-    base_fixed[target] = 0
-    fragment_id[target] = -1
-    normal_axis[target] = -1
-    time_level[target] = 0
-    time_active[target] = 1
-    surface_mask[target] = 0
-    surface_normal[target] = wp.vec3(0.0)
-    foam_strength[target] = 0.0
-    fluid_group_id[target] = -1
-    wave_cohort[target] = cohort_id
-    if cohort_id > 0:
-        wp.atomic_add(cohort_emitted_volume, 0, particle_volume)
-        wp.atomic_add(cohort_emitted_momentum_z, 0, particle_mass * velocity_z)
-    wp.atomic_add(exchange_volume, sx, sz, -particle_volume)
-    wp.atomic_add(exchange_x, sx, sz, -particle_mass * velocity_x)
-    wp.atomic_add(exchange_z, sx, sz, -particle_mass * velocity_z)
+    emitted_column = int(0)
+    # One thread owns one x-column and visits layers in ascending order.  The
+    # old 2-D launch let arbitrary GPU threads consume a shared quota, which
+    # selected disconnected particles anywhere up to the full shallow depth
+    # and reconstructed them as a tall water wall after flow reversal.
+    for emitter_y in range(emitter_ny):
+        if emitted_column < allowed:
+            py = (float(emitter_y) + 0.5) * particle_spacing
+            if state[0] > py + 0.5 * particle_spacing:
+                position = wp.vec3(px, py, pz)
+                occupied = int(0)
+                query = wp.hash_grid_query(grid, position, particle_spacing * 0.62)
+                for neighbour in query:
+                    if neighbour < old_count and kind[neighbour] == 0:
+                        if wp.length_sq(x[neighbour] - position) < particle_spacing * particle_spacing * 0.38:
+                            occupied = 1
+                            break
+                if occupied == 0:
+                    target = wp.atomic_add(count, 0, 1)
+                    if target < capacity:
+                        x[target] = position
+                        rest_x[target] = position
+                        v[target] = velocity
+                        radius[target] = 0.5 * particle_spacing
+                        mass[target] = particle_mass
+                        volume[target] = particle_volume
+                        kind[target] = 0
+                        material[target] = 0
+                        building_id[target] = -1
+                        structural_class[target] = 0
+                        fixed[target] = 0
+                        damage[target] = 0.0
+                        impact_impulse[target] = 0.0
+                        local_impact_active[target] = 0
+                        rho_reference[target] = 0.0
+                        rho[target] = rest_density
+                        acceleration[target] = wp.vec3(0.0)
+                        solid_force[target] = wp.vec3(0.0)
+                        base_fixed[target] = 0
+                        fragment_id[target] = -1
+                        normal_axis[target] = -1
+                        time_level[target] = 0
+                        time_active[target] = 1
+                        surface_mask[target] = 0
+                        surface_normal[target] = wp.vec3(0.0)
+                        foam_strength[target] = 0.0
+                        fluid_group_id[target] = -1
+                        wave_cohort[target] = cohort_id
+                        if cohort_id > 0:
+                            wp.atomic_add(cohort_emitted_volume, 0, particle_volume)
+                            wp.atomic_add(cohort_emitted_momentum_z, 0, particle_mass * velocity_z)
+                        wp.atomic_add(exchange_volume, sx, sz, -particle_volume)
+                        wp.atomic_add(exchange_x, sx, sz, -particle_mass * velocity_x)
+                        wp.atomic_add(exchange_z, sx, sz, -particle_mass * velocity_z)
+                        emitted_column += 1
 
 
 @wp.kernel
@@ -542,6 +623,9 @@ class ShallowWaterFarField:
         self.flux_requested_particles_total = 0
         self.flux_emitted_particles_total = 0
         self.emission_residual_volume = np.zeros(self.nx, dtype=np.float64)
+        self.emission_positive_age = np.zeros(self.nx, dtype=np.float64)
+        self.return_flow_quiet_age = 0.0
+        self.last_frame_merged_volume = 0.0
         self.last_emission_time = 0.0
         self.merged_particles_total = 0
         self.merged_volume_total = 0.0
@@ -566,6 +650,15 @@ class ShallowWaterFarField:
                     self.emission_residual_volume = saved[
                         "shallow_emission_residual_volume"
                     ].astype(np.float64, copy=True)
+                if (
+                    "shallow_emission_positive_age" in saved
+                    and saved["shallow_emission_positive_age"].shape == (self.nx,)
+                ):
+                    self.emission_positive_age = saved[
+                        "shallow_emission_positive_age"
+                    ].astype(np.float64, copy=True)
+                if "shallow_return_flow_quiet_age" in saved:
+                    self.return_flow_quiet_age = float(saved["shallow_return_flow_quiet_age"])
                 if "shallow_merged_particles_total" in saved:
                     self.merged_particles_total = int(saved["shallow_merged_particles_total"])
                 if "shallow_merged_volume_total" in saved:
@@ -870,6 +963,11 @@ class ShallowWaterFarField:
                 self.flux_emitted_particles_total
                 / max(self.flux_requested_particles_total, 1)
             ),
+            "shallow_emission_rearmed_cells": int(np.count_nonzero(
+                self.emission_positive_age
+                >= float(self.cfg.get("emission_rearm_delay_seconds", 0.35))
+            )),
+            "shallow_return_flow_quiet_age_s": self.return_flow_quiet_age,
             "shallow_merged_particles": self.merged_particles_total,
             "shallow_merged_volume_m3": self.merged_volume_total,
             "shallow_net_transfer_volume_m3": self.emitted_volume_total - self.merged_volume_total,

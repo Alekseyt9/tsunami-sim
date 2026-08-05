@@ -106,7 +106,7 @@ def build_fragment_support_graph(
     anchored = np.zeros(fragment_count, dtype=bool)
     anchored_ids = fragment_id[(kind != 0) & (base_fixed != 0) & (fragment_id >= 0)]
     anchored[anchored_ids] = True
-    solid = np.flatnonzero((kind != 0) & (building_id >= 0) & (fragment_id >= 0))
+    solid = np.flatnonzero((kind != 0) & (fragment_id >= 0))
     if len(solid) == 0:
         empty2 = np.empty((0, 2), dtype=np.int32)
         return FragmentSupportGraph(
@@ -181,6 +181,7 @@ def evaluate_fragment_support(
     same_level_tolerance: float = 0.75,
     maximum_lateral_transfer: float = 0.0,
     minimum_load_capacity_fraction: float = 0.0,
+    previous_edge_intact: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return fragments with a physically directed path to the foundation.
 
@@ -207,6 +208,17 @@ def evaluate_fragment_support(
     sample_count = np.diff(graph.sample_offsets)
     required = np.maximum(1, np.ceil(sample_count * minimum_intact_sample_fraction)).astype(np.int32)
     edge_intact = intact_count >= required
+    if previous_edge_intact is not None:
+        previous = np.asarray(previous_edge_intact, dtype=bool)
+        if len(previous) != edge_count:
+            raise ValueError(
+                "previous_edge_intact must match the fragment support edge count"
+            )
+        # Cohesive structural bonds are irreversible. Previously this state
+        # was checkpointed but ignored during the next support evaluation, so
+        # a stretched/broken wall could become load-bearing again after the
+        # oscillating fragments happened to move closer together.
+        edge_intact &= previous
 
     supported = graph.anchored_fragments.copy()
     live = graph.edge_fragments[edge_intact]
@@ -540,12 +552,12 @@ def build_facade_skin(cfg: dict) -> dict[str, np.ndarray]:
                     )
 
     return {
-        "center": np.asarray(centers, dtype=np.float32),
-        "size": np.asarray(sizes, dtype=np.float32),
-        "normal": np.asarray(normals, dtype=np.float32),
+        "center": np.asarray(centers, dtype=np.float32).reshape((-1, 3)),
+        "size": np.asarray(sizes, dtype=np.float32).reshape((-1, 3)),
+        "normal": np.asarray(normals, dtype=np.float32).reshape((-1, 3)),
         "material": np.asarray(materials, dtype=np.int32),
         "building_id": np.asarray(building_ids, dtype=np.int32),
-        "vertex": np.asarray(vertices, dtype=np.float32),
+        "vertex": np.asarray(vertices, dtype=np.float32).reshape((-1, 4, 3)),
         "panel_mode": np.zeros(len(materials), dtype=np.int32),
         "owner_fragment": np.full(len(materials), -1, dtype=np.int32),
     }
@@ -601,6 +613,10 @@ def build_fragment_cell_faces(
     structural_class: np.ndarray,
     palette: int,
     nominal_spacing: float,
+    normal_axis: np.ndarray | None = None,
+    wall_thickness: float = 0.18,
+    glass_thickness: float = 0.10,
+    slab_thickness: float = 0.24,
 ) -> list[tuple[np.ndarray, np.ndarray, tuple[float, float, float], int]]:
     """Return a watertight, hole-preserving union of local particle cells.
 
@@ -617,6 +633,25 @@ def build_fragment_cell_faces(
         return []
     inferred_spacing = float(np.median(radii)) / 0.48
     spacing = max(min(float(nominal_spacing), inferred_spacing * 1.05), 1.0e-3)
+    half_extent = np.repeat(radii[:, None], 3, axis=1)
+    if normal_axis is not None:
+        axes = np.asarray(normal_axis, dtype=np.int32)
+        if len(axes) != len(points):
+            raise ValueError("normal_axis must match fragment particle count")
+        thickness_by_role = {
+            STRUCT_WALL: max(float(wall_thickness), 0.04),
+            STRUCT_GLASS: max(float(glass_thickness), 0.04),
+            STRUCT_SLAB: max(float(slab_thickness), 0.04),
+        }
+        for particle, role in enumerate(roles):
+            axis = int(axes[particle])
+            thickness = thickness_by_role.get(int(role))
+            if thickness is not None and 0 <= axis < 3:
+                # Structural particles are isotropic SPH samples, but their
+                # authored material is not.  Reconstruct walls, glazing and
+                # slabs as thin solids instead of exposing a cube with side
+                # length 2*particle_radius when the fragment becomes rigid.
+                half_extent[particle, axis] = 0.5 * thickness
     origin = np.min(points, axis=0)
     keys = np.rint((points - origin) / spacing).astype(np.int32)
 
@@ -674,10 +709,10 @@ def build_fragment_cell_faces(
             ]
             remaining.difference_update(rectangle)
             particle_indices = np.asarray([cells[cell] for cell in rectangle], dtype=np.int32)
-            lower = np.min(points[particle_indices] - radii[particle_indices, None], axis=0)
-            upper = np.max(points[particle_indices] + radii[particle_indices, None], axis=0)
+            lower = np.min(points[particle_indices] - half_extent[particle_indices], axis=0)
+            upper = np.max(points[particle_indices] + half_extent[particle_indices], axis=0)
             face_coordinate = np.mean(
-                points[particle_indices, axis] + sign * radii[particle_indices]
+                points[particle_indices, axis] + sign * half_extent[particle_indices, axis]
             )
             center = 0.5 * (lower + upper)
             center[axis] = face_coordinate
@@ -699,6 +734,7 @@ def build_fragment_debris_skin(
     fragment_id: np.ndarray,
     radius: np.ndarray,
     structural_class: np.ndarray,
+    normal_axis: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """Build hidden box hulls that become visible after a fragment detaches."""
     centers: list[np.ndarray] = []
@@ -709,6 +745,7 @@ def build_fragment_debris_skin(
     vertices: list[tuple[tuple[float, float, float], ...]] = []
     owners: list[int] = []
     palettes = cfg.get("building_palettes", [])
+    debris_policy = cfg.get("v3", {}).get("debris_skin", {})
 
     def add_face(fid: int, bid: int, center: np.ndarray, size: np.ndarray,
                  normal: tuple[float, float, float], material: int) -> None:
@@ -751,10 +788,22 @@ def build_fragment_debris_skin(
         faces = build_fragment_cell_faces(
             rest_x[indices], radius[indices], structural_class[indices], palette,
             float(cfg.get("solid_spacing", 1.3)),
+            normal_axis[indices] if normal_axis is not None else None,
+            float(debris_policy.get("wall_thickness", 0.18)),
+            float(debris_policy.get("glass_thickness", 0.10)),
+            float(debris_policy.get("slab_thickness", 0.24)),
         )
+        dominant_role = int(np.bincount(
+            structural_class[indices], minlength=7
+        ).argmax())
         if faces:
             for face_center, face_size, face_normal, face_material in faces:
-                add_face(fid, bid, face_center, face_size, face_normal, face_material)
+                render_material = face_material
+                if -2000 < bid <= -1000:
+                    render_material = 20 + palette if dominant_role == STRUCT_GLASS else 50 + palette
+                elif -3000 < bid <= -2000:
+                    render_material = 60 if dominant_role == STRUCT_COLUMN else 70 + palette
+                add_face(fid, bid, face_center, face_size, face_normal, render_material)
         else:
             roles, role_counts = np.unique(structural_class[indices], return_counts=True)
             role = int(roles[int(np.argmax(role_counts))])
@@ -979,31 +1028,79 @@ def build_environment_skin(cfg: dict) -> dict[str, np.ndarray]:
     if any(layout.values()):
         # Terrain and roads are render-only panels bound to four fixed anchors.
         add_panel(-9000, (0.0, -0.04, 55.0), (140.0, 0.08, 150.0), (0, 1, 0), 90)
-        for z in (34.0, 72.0):
+        foreground_road_z = float(
+            cfg.get("environment", {}).get("cars", {}).get("foreground_z", -5.0)
+        ) + 1.35
+        for z in (foreground_road_z, 34.0, 72.0):
             add_panel(-9000, (0.0, 0.015, z), (140.0, 0.08, 13.0), (0, 1, 0), 91)
             for edge in (-7.4, 7.4):
                 add_panel(-9000, (0.0, 0.035, z + edge), (140.0, 0.08, 1.4), (0, 1, 0), 92)
 
     for car in layout["cars"]:
         cx, cz = car["center"]; bid = int(car["id"]); palette = int(car["palette"])
-        add_box(bid, (cx, 0.72, cz), (4.3, 0.85, 1.85), 50 + palette)
-        add_box(bid, (cx + 0.15, 1.32, cz), (2.25, 0.58, 1.58), 20 + palette)
+        # Three separately anchored crumple sections prevent the render skin
+        # from remaining one intact car-shaped box after its particle lattice
+        # fractures.  The cabin and wheels are independent components too.
+        for offset_x, length in ((-1.45, 1.35), (0.0, 1.55), (1.45, 1.35)):
+            add_box(bid, (cx + offset_x, 0.72, cz), (length, 0.85, 1.85), 50 + palette)
+        for offset_x in (-0.58, 0.58):
+            add_box(bid, (cx + offset_x, 1.34, cz), (1.08, 0.58, 1.58), 20 + palette)
         for dx in (-1.45, 1.45):
             for dz in (-0.92, 0.92):
                 add_box(bid, (cx + dx, 0.43, cz + dz), (0.62, 0.62, 0.22), 58)
 
     for tree in layout["trees"]:
         cx, cz = tree["center"]; height = float(tree["height"]); bid = int(tree["id"])
-        add_box(bid, (cx, height * 0.43, cz), (0.62, height * 0.86, 0.62), 60)
-        add_box(bid, (cx, height - 0.15, cz), (3.1, 2.4, 2.5), 70 + (abs(bid) % 3))
+        trunk_segment = 1.6
+        for lower in np.arange(0.0, max(height - 0.8, 0.1), trunk_segment):
+            segment_height = min(trunk_segment, height - 0.7 - float(lower))
+            if segment_height > 0.05:
+                add_box(
+                    bid, (cx, float(lower) + 0.5 * segment_height, cz),
+                    (0.58, segment_height, 0.58), 60,
+                )
+        crown_material = 70 + (abs(bid) % 3)
+        for dx, dy, dz in ((0, 0, 0), (-0.9, -0.25, 0), (0.9, -0.25, 0),
+                           (0, 0.3, -0.72), (0, 0.3, 0.72)):
+            add_box(bid, (cx + dx, height - 0.15 + dy, cz + dz),
+                    (1.55, 1.35, 1.35), crown_material)
 
     for shop in layout["small_buildings"]:
         cx, cz = shop["center"]; width, depth, height = map(float, shop["size"])
         bid = int(shop["id"]); palette = int(shop["palette"])
-        add_box(bid, (cx, height * 0.5, cz), (width, height, depth), 10 + palette)
-        add_panel(bid, (cx, height + 0.08, cz), (width + 0.4, 0.16, depth + 0.4), (0, 1, 0), 30 + palette)
-        add_panel(bid, (cx, 2.0, cz - depth * 0.5 - 0.06),
-                  (width * 0.62, 2.2, 0.10), (0, 0, -1), 20 + palette)
+        bay_width = 2.4
+        floor_height = 2.4
+        x_bays = max(1, int(np.ceil(width / bay_width)))
+        z_bays = max(1, int(np.ceil(depth / bay_width)))
+        floors = max(1, int(np.ceil(height / floor_height)))
+        for floor in range(floors):
+            y0 = floor * height / floors
+            y1 = (floor + 1) * height / floors
+            cy = 0.5 * (y0 + y1)
+            for bay in range(x_bays):
+                x0 = -0.5 * width + bay * width / x_bays
+                x1 = -0.5 * width + (bay + 1) * width / x_bays
+                material = 20 + palette if (bay + floor) % 3 == 1 else 10 + palette
+                add_panel(bid, (cx + 0.5 * (x0 + x1), cy, cz - 0.5 * depth),
+                          (x1 - x0, y1 - y0, 0.12), (0, 0, -1), material)
+                add_panel(bid, (cx + 0.5 * (x0 + x1), cy, cz + 0.5 * depth),
+                          (x1 - x0, y1 - y0, 0.12), (0, 0, 1), material)
+            for bay in range(z_bays):
+                z0 = -0.5 * depth + bay * depth / z_bays
+                z1 = -0.5 * depth + (bay + 1) * depth / z_bays
+                add_panel(bid, (cx - 0.5 * width, cy, cz + 0.5 * (z0 + z1)),
+                          (0.12, y1 - y0, z1 - z0), (-1, 0, 0), 10 + palette)
+                add_panel(bid, (cx + 0.5 * width, cy, cz + 0.5 * (z0 + z1)),
+                          (0.12, y1 - y0, z1 - z0), (1, 0, 0), 10 + palette)
+        for bay_x in range(x_bays):
+            x0 = -0.5 * width + bay_x * width / x_bays
+            x1 = -0.5 * width + (bay_x + 1) * width / x_bays
+            for bay_z in range(z_bays):
+                z0 = -0.5 * depth + bay_z * depth / z_bays
+                z1 = -0.5 * depth + (bay_z + 1) * depth / z_bays
+                add_panel(bid, (cx + 0.5 * (x0 + x1), height + 0.08,
+                                cz + 0.5 * (z0 + z1)),
+                          (x1 - x0, 0.16, z1 - z0), (0, 1, 0), 30 + palette)
 
     panel_count = len(materials)
     return {
@@ -1027,6 +1124,7 @@ def write_facade_skin(
     fragment_id: np.ndarray | None = None,
     radius: np.ndarray | None = None,
     structural_class: np.ndarray | None = None,
+    normal_axis: np.ndarray | None = None,
 ) -> int:
     debris_policy = cfg.get("v3", {}).get("debris_skin", {})
     complete_geometry = all(
@@ -1036,7 +1134,7 @@ def write_facade_skin(
     cache_path: Path | None = None
     if complete_geometry and bool(debris_policy.get("cache", True)):
         geometry_cfg = {
-            "schema": "cell-union-fragment-skin-v6-environment",
+            "schema": "anisotropic-fragment-skin-v7-environment",
             "solid_spacing": cfg.get("solid_spacing"),
             "buildings": cfg.get("buildings"),
             "building_styles": cfg.get("building_styles"),
@@ -1076,7 +1174,8 @@ def write_facade_skin(
         and bool(debris_policy.get("enabled", True))
     ):
         debris = build_fragment_debris_skin(
-            cfg, rest_x, kind, building_id, fragment_id, radius, structural_class
+            cfg, rest_x, kind, building_id, fragment_id, radius, structural_class,
+            normal_axis,
         )
         skin = {name: np.concatenate((skin[name], debris[name]), axis=0) for name in skin}
     if rest_x is not None and kind is not None and building_id is not None:
@@ -1180,6 +1279,50 @@ def build_fragment_ids(
             fragment_id[indices] = local_ids + next_fragment
             next_fragment += len(representatives)
 
+    environment_fracture = cfg.get("environment", {}).get("fracture", {})
+    if bool(environment_fracture.get("enabled", False)):
+        minimum_environment = max(
+            2, int(environment_fracture.get("minimum_fragment_particles", 6))
+        )
+        environment_ids = np.unique(
+            building_id[(kind != 0) & (building_id < 0) & (building_id != -9000)]
+        )
+        for bid in environment_ids:
+            object_indices = np.flatnonzero((kind != 0) & (building_id == bid))
+            if -2000 < int(bid) <= -1000:
+                object_cell = environment_fracture.get("car_cell_size", [1.55, 1.2, 1.4])
+            elif -3000 < int(bid) <= -2000:
+                object_cell = environment_fracture.get("tree_cell_size", [1.8, 2.0, 1.8])
+            else:
+                object_cell = environment_fracture.get(
+                    "small_building_cell_size", [3.0, 2.4, 3.0]
+                )
+            object_cell = np.maximum(np.asarray(object_cell, dtype=np.float32), 0.25)
+            object_origin = np.min(rest_x[object_indices], axis=0) - 1.0e-4
+            for family in np.unique(structural_family[object_indices]):
+                indices = object_indices[structural_family[object_indices] == family]
+                coordinates = np.floor(
+                    (rest_x[indices] - object_origin) / object_cell
+                ).astype(np.int32)
+                unique_cells, inverse, cell_counts = np.unique(
+                    coordinates, axis=0, return_inverse=True, return_counts=True
+                )
+                stable = np.flatnonzero(cell_counts >= minimum_environment)
+                if len(stable) == 0:
+                    fragment_id[indices] = next_fragment
+                    next_fragment += 1
+                    continue
+                remap = np.arange(len(unique_cells), dtype=np.int32)
+                for source in np.flatnonzero(cell_counts < minimum_environment):
+                    delta = unique_cells[stable] - unique_cells[source]
+                    target = int(stable[int(np.argmin(np.sum(delta * delta, axis=1)))])
+                    remap[source] = target
+                merged = remap[inverse]
+                representatives = np.unique(merged)
+                local_ids = np.searchsorted(representatives, merged).astype(np.int32)
+                fragment_id[indices] = local_ids + next_fragment
+                next_fragment += len(representatives)
+
     counts = np.bincount(fragment_id[fragment_id >= 0], minlength=next_fragment).astype(np.int32)
     return fragment_id, counts
 
@@ -1190,6 +1333,7 @@ def build_refinement_axes(
     building_id: np.ndarray,
     spacing: float,
     structural_class: np.ndarray | None = None,
+    cfg: dict | None = None,
 ) -> np.ndarray:
     """Infer plane normal or longitudinal beam/column axis from connectivity."""
     axes = np.full(len(rest_x), -1, dtype=np.int32)
@@ -1198,9 +1342,23 @@ def build_refinement_axes(
         ((0, -1, 0), (0, 1, 0)),
         ((0, 0, -1), (0, 0, 1)),
     )
-    for bid in np.unique(building_id[building_id >= 0]):
+    object_mask = (building_id >= 0) | ((building_id < 0) & (building_id != -9000))
+    for bid in np.unique(building_id[object_mask]):
         indices = np.flatnonzero((kind != 0) & (building_id == bid))
-        keys = np.rint(rest_x[indices] / spacing).astype(np.int32)
+        object_spacing = float(spacing)
+        if cfg is not None and bid < 0:
+            environment = cfg.get("environment", {})
+            if -2000 < int(bid) <= -1000:
+                object_spacing = float(environment.get("cars", {}).get(
+                    "particle_spacing", object_spacing
+                ))
+            elif -3000 < int(bid) <= -2000:
+                object_spacing = float(environment.get("trees", {}).get(
+                    "particle_spacing", object_spacing
+                ))
+            else:
+                object_spacing = 1.2
+        keys = np.rint(rest_x[indices] / object_spacing).astype(np.int32)
         occupied = {tuple(map(int, key)) for key in keys}
         for particle_index, key in zip(indices, keys):
             connectivity = []

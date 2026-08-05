@@ -888,3 +888,70 @@ that excludes render-only terminal samples from the global/contact grids plus
 a persistent active OBB/contact cache. A one-second visual/trajectory gate is
 premature until the short-window rigid velocity delta is materially lower and
 complete speedup reaches at least 1.15x.
+### Persistent terminal-OBB candidate cache and sparse-proxy audit
+
+The particle-to-OBB BVH path now has an optional conservative candidate cache.
+At each BVH refit it expands both body bounds and particle queries by the
+maximum configured motion over the cache lifetime, stores up to 48 OBBs per
+fluid particle, compacts only particles with candidates, and evaluates exact
+sphere/OBB contact on that active list. Cache overflow is a hard error rather
+than a silently missed collision. The isolated CUDA regression matches the
+uncached linear force, torque, ballistic-droplet contact and multirate impulse.
+
+Checkpoint 302, two frames, contact stride 8 and cache refresh every four
+contact evaluations:
+
+- baseline: 10.118 s;
+- cached coupled samples: 10.398 s;
+- cached shed samples: 9.265 s, or 1.092x faster than baseline;
+- active contact particles: 133,795--135,497 instead of roughly 256k particles
+  inside the global terminal-proxy bounds;
+- cached candidates: 649k--655k, with no overflow;
+- terminal shedding reduced the fluid Verlet graph from about 45.9M to 40.7M
+  entries.
+
+Refreshing every eight evaluations was rejected: the fatter cache grew to
+767k--785k candidates and speed fell to 1.081x. Four evaluations remains the
+experimental default. The 1.15x production speed gate is still unmet and the
+two-frame rigid velocity RMS remains about 1.19 m/s, so production flags stay
+disabled.
+
+A 32-substep load audit explains the trajectory mismatch. One terminal OBB
+contains 3.97x the represented particle material volume in aggregate; 745 of
+977 terminal bodies exceed 2x. Treating those sparse wall/slab assemblies as
+solid boxes therefore closes real voids. A 24-cell face occupancy mask was
+tested but rejected: it reduced longitudinal proxy force from about 338 MN to
+117 MN while the sample reference was 361 MN. Force weighting cannot repair
+incorrect geometry.
+
+An offline adaptive decomposition was prepared. With the same 0.7-radius
+padding and at most four body-local boxes, checkpoint 302 needs 2,904 boxes,
+reduces filled proxy volume from 127,218 to 104,193 m3, and still replaces
+144,553 terminal samples with 69,696 face quadratures (51.8% fewer). Eight
+boxes reduce volume further to 91,418 m3 but leave only 38.4% sample reduction.
+The next implementation gate is therefore 1--4 hydrodynamic sub-OBBs per body,
+preferably six face samples per sub-OBB, while keeping the existing single OBB
+for rigid/ground collision until the hydrodynamic comparison passes.
+
+## Irreversible support and sustained-flow correction (2026-08-05)
+
+The stopped 30-second run used the finite-wave base preset. At 16 seconds its
+second and third rows received only sparse SPH trickles, while the first-row
+buildings retained long elastic load paths even after large displacement.
+The support evaluator was recomputing bond state from current distance every
+frame, allowing a failed edge to become intact again when oscillating pieces
+moved closer. Checkpointed edge state existed but was not used by evaluation.
+
+Support edges are now monotonically irreversible and the production thresholds
+are moderately stricter: 1.4 maximum bond stretch, 60% intact boundary samples,
+4 m lateral redistribution and 65% minimum load-path capacity. A fresh full
+city initialization keeps every main-building fragment supported; the 180
+initially disconnected fragments belong only to destructible environment
+objects. The unloading regression, structural hierarchy and CUDA impact gates
+all pass.
+
+The default RTX 5070 launcher now selects `config_v3_sustained_surge_30s.json`.
+Its conservative shallow-water gate reaches rows 1/2/3 at 4.32/5.64/6.92 s,
+keeps significant load at the rear row for 6.6 s, injects 623,185 m3 and closes
+volume to 0.095%. This replaces the accidentally selected short finite wave for
+the next production run.

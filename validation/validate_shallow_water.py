@@ -95,7 +95,7 @@ def main():
     grid.build(emit_arrays["x"][:old_count], 1.0)
     wp.launch(
         emit_sph_interface_particles,
-        dim=(1, 1),
+        dim=1,
         inputs=[
             grid.id, emit_arrays["x"], emit_arrays["rest_x"], emit_arrays["v"],
             emit_arrays["radius"], emit_arrays["mass"], emit_arrays["volume"],
@@ -140,7 +140,7 @@ def main():
     )
     wp.launch(
         emit_sph_interface_particles,
-        dim=(1, 1),
+        dim=1,
         inputs=[
             grid.id, emit_arrays["x"], emit_arrays["rest_x"], emit_arrays["v"],
             emit_arrays["radius"], emit_arrays["mass"], emit_arrays["volume"],

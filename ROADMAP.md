@@ -294,3 +294,16 @@ centre RMS to 0.059 m, but rigid velocity RMS is still 1.19 m/s and the 1.15x
 speed target is not met. Next remove render-only terminal samples from the
 global/contact grids, cache the active fluid/OBB contact set between BVH
 refreshes, and only then run the required one-second wake/trajectory gate.
+## Adaptive hydrodynamic sub-OBBs
+
+The conservative active contact cache improves the sample-shed checkpoint-302
+result from 1.048x to 1.092x; a longer cache lifetime is slower. The remaining
+trajectory error is geometric: a single OBB fills roughly 3.97x the represented
+terminal material volume. Scalar and 24-cell occupancy weighting were rejected
+because they destroy the correct longitudinal wave impulse.
+
+Next build an adaptive 1--4 hydrodynamic sub-OBB representation with a
+proxy-to-body map and six face quadratures per sub-box. Keep the existing single
+OBB for rigid and ground collision until the new hydrodynamic force, two-frame,
+and one-second gates pass. Production proxy hydrodynamics and terminal shedding
+remain disabled.

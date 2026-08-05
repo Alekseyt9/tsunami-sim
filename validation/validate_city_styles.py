@@ -18,6 +18,7 @@ from simulation.hybrid_model import (  # noqa: E402
     build_fragment_cell_faces,
     build_fragment_debris_skin,
     build_fragment_ids,
+    build_refinement_axes,
 )
 from simulation.scene import STRUCT_WALL  # noqa: E402
 
@@ -61,9 +62,13 @@ def main() -> None:
         state["rest_x"], state["kind"], state["building_id"], scene_cfg,
         state["structural_class"],
     )
+    normal_axis = build_refinement_axes(
+        state["rest_x"], state["kind"], state["building_id"],
+        float(scene_cfg["solid_spacing"]), state["structural_class"], scene_cfg,
+    )
     debris = build_fragment_debris_skin(
         scene_cfg, state["rest_x"], state["kind"], state["building_id"], fragment_id,
-        state["radius"], state["structural_class"],
+        state["radius"], state["structural_class"], normal_axis,
     )
     if not np.all(debris["panel_mode"] == 1) or set(debris["owner_fragment"]) != set(range(len(fragment_counts))):
         raise AssertionError("debris cell surfaces are not bound to every cohesive fragment")
@@ -90,6 +95,16 @@ def main() -> None:
         upper = center[:2] + size[:2] * 0.5
         if np.all(missing_center > lower + 1.0e-4) and np.all(missing_center < upper - 1.0e-4):
             raise AssertionError("cell-union debris surface filled an L-shaped void")
+
+    thin_wall = build_fragment_cell_faces(
+        np.zeros((1, 3), dtype=np.float32), np.asarray((0.6,), dtype=np.float32),
+        np.asarray((STRUCT_WALL,), dtype=np.int32), 0, 1.25,
+        np.asarray((2,), dtype=np.int32), wall_thickness=0.18,
+    )
+    lower = np.min(np.asarray([center - size * 0.5 for center, size, _n, _m in thin_wall]), axis=0)
+    upper = np.max(np.asarray([center + size * 0.5 for center, size, _n, _m in thin_wall]), axis=0)
+    if upper[2] - lower[2] > 0.27 or min(upper[0] - lower[0], upper[1] - lower[1]) < 1.1:
+        raise AssertionError("detached wall was reconstructed as an isotropic cube")
 
     skin = build_facade_skin(cfg)
     material = skin["material"]

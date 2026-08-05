@@ -11,6 +11,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from simulation.scene import STRUCT_GLASS, STRUCT_SLAB, STRUCT_WALL
+
 
 @dataclass(frozen=True)
 class RigidClusterFit:
@@ -40,6 +42,9 @@ def fit_rigid_collision_proxy(
     material: np.ndarray,
     mass: np.ndarray | None = None,
     padding_scale: float = 1.0,
+    normal_axis: np.ndarray | None = None,
+    structural_class: np.ndarray | None = None,
+    maximum_sheet_thickness: float | None = None,
 ) -> RigidCollisionProxy:
     """Fit the eight-vertex convex proxy used after rigid conversion.
 
@@ -62,6 +67,31 @@ def fit_rigid_collision_proxy(
         raise ValueError("collision proxy material weights must match the particle arrays")
     maximum_material = max(3, int(np.max(material)))
     dominant = int(np.argmax(np.bincount(material, weights=weights, minlength=maximum_material + 1)))
+    if (
+        maximum_sheet_thickness is not None
+        and normal_axis is not None
+        and structural_class is not None
+    ):
+        axes = np.asarray(normal_axis, dtype=np.int32)
+        roles = np.asarray(structural_class, dtype=np.int32)
+        if len(axes) != len(local) or len(roles) != len(local):
+            raise ValueError("sheet proxy metadata must match the particle arrays")
+        sheet = np.isin(roles, (STRUCT_WALL, STRUCT_GLASS, STRUCT_SLAB)) & (axes >= 0) & (axes < 3)
+        sheet_weight = float(np.sum(weights[sheet]))
+        total_weight = float(np.sum(weights))
+        if sheet_weight >= 0.80 * max(total_weight, 1.0e-12):
+            axis_weight = np.bincount(axes[sheet], weights=weights[sheet], minlength=3)
+            axis = int(np.argmax(axis_weight))
+            center_span = float(np.ptp(local[sheet, axis]))
+            thickness = max(float(maximum_sheet_thickness), 0.04)
+            # Only collapse a genuinely planar fragment.  A malformed cluster
+            # containing two parallel walls must retain an enclosing proxy
+            # rather than silently losing collision coverage between them.
+            if axis_weight[axis] >= 0.80 * sheet_weight and center_span <= thickness:
+                local_center[axis] = 0.5 * (
+                    float(np.min(local[sheet, axis])) + float(np.max(local[sheet, axis]))
+                )
+                half_extent[axis] = 0.5 * thickness
     return RigidCollisionProxy(
         local_center=local_center.astype(np.float32),
         half_extent=half_extent.astype(np.float32),

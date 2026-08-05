@@ -15,7 +15,7 @@ import warp as wp
 
 from kernels.base import (
     bilateral_depth_axis, clear_depth, clear_render, clear_scalar, raster_color, raster_depth,
-    raster_water_depth, shade_water_surface,
+    composite_surface_foam, raster_water_depth, shade_water_surface,
 )
 
 
@@ -26,6 +26,7 @@ class ParticleRenderer:
         self.device = device
         self.depth = wp.empty(width * height, dtype=float, device=device)
         self.water_depth = wp.empty(width * height, dtype=float, device=device)
+        self.water_back_depth = wp.empty(width * height, dtype=float, device=device)
         self.water_temp = wp.empty(width * height, dtype=float, device=device)
         self.water_foam = wp.empty(width * height, dtype=float, device=device)
         self.color = wp.empty(width * height, dtype=wp.vec3, device=device)
@@ -43,6 +44,7 @@ class ParticleRenderer:
     def render(self, arrays: dict, count: int, output_path: Path | None, frame: int, time_s: float, stats: dict):
         wp.launch(clear_render, dim=self.width * self.height, inputs=[self.depth, self.color, self.width, self.height], device=self.device)
         wp.launch(clear_depth, dim=self.width * self.height, inputs=[self.water_depth], device=self.device)
+        wp.launch(clear_scalar, dim=self.width * self.height, inputs=[self.water_back_depth, 0.0], device=self.device)
         wp.launch(clear_scalar, dim=self.width * self.height, inputs=[self.water_foam, 0.0], device=self.device)
         common = [
             wp.vec3(*self.cam), wp.vec3(*self.right), wp.vec3(*self.up), wp.vec3(*self.forward),
@@ -58,7 +60,7 @@ class ParticleRenderer:
             raster_water_depth,
             dim=count,
             inputs=[arrays["x"][:count], arrays["v"][:count], arrays["radius"][:count], arrays["kind"][:count],
-                    self.water_depth, self.water_foam, *common],
+                    self.water_depth, self.water_back_depth, self.water_foam, *common],
             device=self.device,
         )
         # Three separable bilateral iterations cost 6*7 taps per pixel instead
@@ -91,7 +93,18 @@ class ParticleRenderer:
         )
         wp.launch(
             shade_water_surface, dim=self.width * self.height,
-            inputs=[smooth_source, self.water_foam, self.depth, self.color, self.width, self.height], device=self.device,
+            inputs=[
+                smooth_source, self.water_back_depth, self.water_foam, self.depth, self.color,
+                self.width, self.height, wp.vec3(*self.right), wp.vec3(*self.up),
+                wp.vec3(*self.forward), self.focal, 1.0, 8.0,
+                wp.vec3(0.17, 0.045, 0.018), wp.vec3(0.012, 0.032, 0.055),
+                0.35, 18.0, wp.vec3(-0.38, 0.82, -0.35), 3.2, 1.0, 3.1, 0.72,
+            ], device=self.device,
+        )
+        wp.launch(
+            composite_surface_foam, dim=self.width * self.height,
+            inputs=[smooth_source, self.water_foam, self.depth, self.color, self.width, self.height,
+                    float(time_s), 1.0], device=self.device,
         )
         wp.synchronize_device(self.device)
         rgb = self.color.numpy().reshape(self.height, self.width, 3)

@@ -39,6 +39,27 @@ def clear_vec3(values: wp.array(dtype=wp.vec3)):
 
 
 @wp.kernel
+def copy_vec3(source: wp.array(dtype=wp.vec3), target: wp.array(dtype=wp.vec3)):
+    target[wp.tid()] = source[wp.tid()]
+
+
+@wp.kernel
+def clear_gbuffer(
+    normal: wp.array(dtype=wp.vec3),
+    motion: wp.array(dtype=wp.vec2),
+    material: wp.array(dtype=wp.int32),
+    roughness: wp.array(dtype=float),
+    metallic: wp.array(dtype=float),
+):
+    i = wp.tid()
+    normal[i] = wp.vec3(0.0, 1.0, 0.0)
+    motion[i] = wp.vec2(0.0, 0.0)
+    material[i] = 0
+    roughness[i] = 1.0
+    metallic[i] = 0.0
+
+
+@wp.kernel
 def compute_density(
     grid: wp.uint64,
     x: wp.array(dtype=wp.vec3),
@@ -184,6 +205,10 @@ def material_stiffness(material: int) -> float:
         return 1.0e8
     if material == 3:  # reinforcement steel
         return 8.0e8
+    if material == 4:  # light masonry / shop walls
+        return 1.2e8
+    if material == 5:  # wood
+        return 6.0e7
     return 3.0e8       # reinforced concrete / masonry
 
 
@@ -193,6 +218,10 @@ def material_failure_strain(material: int) -> float:
         return 0.012
     if material == 3:
         return 0.11
+    if material == 4:
+        return 0.018
+    if material == 5:
+        return 0.070
     return 0.032
 
 
@@ -487,6 +516,129 @@ def project_point(p: wp.vec3, cam: wp.vec3, right: wp.vec3, up: wp.vec3, forward
     return wp.vec3(x, y, z)
 
 
+@wp.func
+def physical_sky_radiance(
+    direction: wp.vec3,
+    sun_direction: wp.vec3,
+    turbidity: float,
+    sky_intensity: float,
+    sun_intensity: float,
+) -> wp.vec3:
+    """Compact HDR daylight model shared by sky, IBL and water.
+
+    This is an analytic clear/hazy sky approximation rather than an LDR
+    background gradient.  It preserves a real HDR sun disc and horizon glow,
+    which can then be reflected and passed through filmic tone mapping.
+    """
+    ray = wp.normalize(direction)
+    sun = wp.normalize(sun_direction)
+    elevation = wp.clamp(ray[1], -1.0, 1.0)
+    haze = wp.clamp((turbidity - 1.5) / 7.0, 0.0, 1.0)
+    horizon_amount = wp.exp(-wp.max(elevation, 0.0) * (4.2 - 1.6 * haze))
+    zenith = wp.vec3(0.055, 0.145, 0.285) * (1.05 - 0.24 * haze)
+    horizon = wp.vec3(0.54, 0.63, 0.66) * (0.82 + 0.34 * haze)
+    ground = wp.vec3(0.105, 0.115, 0.105)
+    sky = wp.lerp(zenith, horizon, horizon_amount)
+    if elevation < 0.0:
+        below = wp.smoothstep(-0.24, 0.0, elevation)
+        sky = wp.lerp(ground, horizon, below)
+
+    sun_cosine = wp.clamp(wp.dot(ray, sun), 0.0, 1.0)
+    # A slightly enlarged disc remains sub-pixel stable at 360p inset views;
+    # the halo carries the lower-frequency atmospheric forward scattering.
+    sun_disc = wp.smoothstep(0.99955, 0.99993, sun_cosine)
+    sun_halo = wp.pow(sun_cosine, 48.0 / (1.0 + 0.55 * haze))
+    sun_color = wp.vec3(1.0, 0.86, 0.62)
+    sky *= sky_intensity
+    sky += sun_color * sun_intensity * (sun_disc * 5.5 + sun_halo * (0.055 + 0.10 * haze))
+    return sky
+
+
+@wp.kernel
+def render_physical_sky(
+    color: wp.array(dtype=wp.vec3),
+    right: wp.vec3,
+    up: wp.vec3,
+    forward: wp.vec3,
+    focal: float,
+    width: int,
+    height: int,
+    sun_direction: wp.vec3,
+    turbidity: float,
+    sky_intensity: float,
+    sun_intensity: float,
+):
+    i = wp.tid()
+    x = i % width
+    y = i // width
+    camera_x = (float(x) + 0.5 - float(width) * 0.5) / focal
+    camera_y = -(float(y) + 0.5 - float(height) * 0.5) / focal
+    ray = wp.normalize(forward + right * camera_x + up * camera_y)
+    color[i] = physical_sky_radiance(
+        ray, sun_direction, turbidity, sky_intensity, sun_intensity
+    )
+
+
+@wp.func
+def aces_filmic_channel(value: float) -> float:
+    x = wp.max(value, 0.0)
+    return wp.clamp(
+        x * (2.51 * x + 0.03) / wp.max(x * (2.43 * x + 0.59) + 0.14, 1.0e-6),
+        0.0,
+        1.0,
+    )
+
+
+@wp.kernel
+def filmic_tonemap_color(
+    hdr_color: wp.array(dtype=wp.vec3),
+    display_color: wp.array(dtype=wp.vec3),
+    width: int,
+    height: int,
+    exposure_ev: float,
+    bloom_threshold: float,
+    bloom_strength: float,
+):
+    """Resolve HDR after TAA with a compact glare gather and ACES curve."""
+    i = wp.tid()
+    x = i % width
+    y = i // width
+    bloom = wp.vec3(0.0)
+    weight_sum = float(0.0)
+    for sample in range(13):
+        ox = 0
+        oy = 0
+        weight = 1.0
+        if sample == 1: ox = 2
+        elif sample == 2: ox = -2
+        elif sample == 3: oy = 2
+        elif sample == 4: oy = -2
+        elif sample == 5: ox = 4; weight = 0.55
+        elif sample == 6: ox = -4; weight = 0.55
+        elif sample == 7: oy = 4; weight = 0.55
+        elif sample == 8: oy = -4; weight = 0.55
+        elif sample == 9: ox = 2; oy = 2; weight = 0.72
+        elif sample == 10: ox = -2; oy = 2; weight = 0.72
+        elif sample == 11: ox = 2; oy = -2; weight = 0.72
+        elif sample == 12: ox = -2; oy = -2; weight = 0.72
+        px = x + ox
+        py = y + oy
+        if px >= 0 and px < width and py >= 0 and py < height:
+            value = hdr_color[py * width + px]
+            luminance = wp.dot(value, wp.vec3(0.2126, 0.7152, 0.0722))
+            bright = wp.max(luminance - bloom_threshold, 0.0) / wp.max(luminance, 1.0e-5)
+            bloom += value * bright * weight
+            weight_sum += weight
+    bloom /= wp.max(weight_sum, 1.0)
+    exposure = wp.pow(2.0, exposure_ev)
+    value = (hdr_color[i] + bloom * bloom_strength) * exposure
+    display_color[i] = wp.vec3(
+        aces_filmic_channel(value[0]),
+        aces_filmic_channel(value[1]),
+        aces_filmic_channel(value[2]),
+    )
+
+
 @wp.kernel
 def raster_depth(
     x: wp.array(dtype=wp.vec3), radius: wp.array(dtype=float), kind: wp.array(dtype=wp.int32), depth: wp.array(dtype=float),
@@ -529,6 +681,10 @@ def raster_color(
         base = wp.vec3(0.20, 0.55, 0.68)
     if material[i] == 3:
         base = wp.vec3(0.18, 0.20, 0.21)
+    if material[i] == 4:
+        base = wp.vec3(0.55, 0.48, 0.40)
+    if material[i] == 5:
+        base = wp.vec3(0.32, 0.20, 0.11)
     # Preserve the physical material hue. Damage lowers brightness instead of
     # replacing every fragment with the old diagnostic brown overlay.
     base *= 1.0 - 0.38 * wp.clamp(damage[i], 0.0, 1.0)
@@ -548,7 +704,7 @@ def raster_color(
 @wp.kernel
 def raster_water_depth(
     x: wp.array(dtype=wp.vec3), v: wp.array(dtype=wp.vec3), radius: wp.array(dtype=float), kind: wp.array(dtype=wp.int32),
-    depth: wp.array(dtype=float), foam_field: wp.array(dtype=float),
+    depth: wp.array(dtype=float), back_depth: wp.array(dtype=float), foam_field: wp.array(dtype=float),
     cam: wp.vec3, right: wp.vec3, up: wp.vec3, forward: wp.vec3,
     focal: float, width: int, height: int,
 ):
@@ -568,14 +724,18 @@ def raster_water_depth(
             px = cx + ox; py = cy + oy
             rr = float(ox * ox + oy * oy)
             if px >= 0 and px < width and py >= 0 and py < height and rr <= rp * rp:
-                sphere_z = p[2] - world_r * wp.sqrt(wp.max(0.0, 1.0 - rr / (rp * rp)))
-                wp.atomic_min(depth, py * width + px, sphere_z)
+                extent = world_r * wp.sqrt(wp.max(0.0, 1.0 - rr / (rp * rp)))
+                sphere_z = p[2] - extent
+                sphere_back_z = p[2] + extent
+                pixel = py * width + px
+                wp.atomic_min(depth, pixel, sphere_z)
+                wp.atomic_max(back_depth, pixel, sphere_back_z)
                 # Foam comes from energetic vertical/turbulent motion, not the
                 # silhouette of every particle splat.
                 speed = wp.length(v[i])
                 foam = wp.smoothstep(2.5, 11.0, wp.abs(v[i][1]))
                 foam += 0.45 * wp.smoothstep(20.0, 45.0, speed)
-                wp.atomic_max(foam_field, py * width + px, wp.min(foam, 1.0))
+                wp.atomic_max(foam_field, pixel, wp.min(foam, 1.0))
 
 
 @wp.kernel
@@ -640,11 +800,126 @@ def bilateral_depth_axis(
 
 
 @wp.kernel
-def shade_water_surface(
-    water_depth: wp.array(dtype=float), foam_field: wp.array(dtype=float),
-    scene_depth: wp.array(dtype=float), color: wp.array(dtype=wp.vec3),
-    width: int, height: int,
+def temporal_stabilize_water_depth(
+    current_depth: wp.array(dtype=float),
+    foam_field: wp.array(dtype=float),
+    history_depth: wp.array(dtype=float),
+    output_depth: wp.array(dtype=float),
+    has_history: int,
+    history_weight: float,
+    disocclusion_threshold: float,
 ):
+    """Static-camera temporal accumulation with splash/disocclusion rejection."""
+    i = wp.tid()
+    current = current_depth[i]
+    previous = history_depth[i]
+    result = current
+    if current < 1.0e8 and has_history != 0 and previous < 1.0e8:
+        threshold = wp.max(disocclusion_threshold, current * 0.0035)
+        difference = wp.abs(current - previous)
+        if difference < threshold:
+            # Energetic foam and spray must remain responsive. Calm connected
+            # water receives the strongest accumulation and loses lattice shimmer.
+            foam = wp.clamp(foam_field[i], 0.0, 1.0)
+            stable = 1.0 - wp.smoothstep(threshold * 0.25, threshold, difference)
+            weight = wp.clamp(history_weight * stable * (1.0 - 0.72 * foam), 0.0, 0.94)
+            result = current * (1.0 - weight) + previous * weight
+    history_depth[i] = result
+    output_depth[i] = result
+
+
+@wp.kernel
+def temporal_antialias_color(
+    current_color: wp.array(dtype=wp.vec3),
+    current_depth: wp.array(dtype=float),
+    water_depth: wp.array(dtype=float),
+    foam_field: wp.array(dtype=float),
+    motion: wp.array(dtype=wp.vec2),
+    history_color: wp.array(dtype=wp.vec3),
+    history_depth: wp.array(dtype=float),
+    output_color: wp.array(dtype=wp.vec3),
+    width: int,
+    height: int,
+    has_history: int,
+    history_weight: float,
+):
+    """Motion-reprojected TAA with depth rejection and neighbourhood clipping."""
+    i = wp.tid()
+    x = i % width
+    y = i // width
+    current = current_color[i]
+    depth = wp.min(current_depth[i], water_depth[i])
+    result = current
+    if has_history != 0:
+        velocity = motion[i]
+        previous_x = int(wp.round(float(x) - velocity[0]))
+        previous_y = int(wp.round(float(y) - velocity[1]))
+        if previous_x >= 0 and previous_x < width and previous_y >= 0 and previous_y < height:
+            previous_index = previous_y * width + previous_x
+            previous_depth = history_depth[previous_index]
+            valid_depth = depth > 1.0e8 and previous_depth > 1.0e8
+            if depth < 1.0e8 and previous_depth < 1.0e8:
+                threshold = wp.max(0.30, depth * 0.004)
+                valid_depth = wp.abs(depth - previous_depth) < threshold
+            if valid_depth:
+                minimum = current
+                maximum = current
+                for oy in range(-1, 2):
+                    for ox in range(-1, 2):
+                        px = x + ox; py = y + oy
+                        if px >= 0 and px < width and py >= 0 and py < height:
+                            sample = current_color[py * width + px]
+                            minimum = wp.vec3(
+                                wp.min(minimum[0], sample[0]),
+                                wp.min(minimum[1], sample[1]),
+                                wp.min(minimum[2], sample[2]),
+                            )
+                            maximum = wp.vec3(
+                                wp.max(maximum[0], sample[0]),
+                                wp.max(maximum[1], sample[1]),
+                                wp.max(maximum[2], sample[2]),
+                            )
+                history = history_color[previous_index]
+                history = wp.vec3(
+                    wp.clamp(history[0], minimum[0], maximum[0]),
+                    wp.clamp(history[1], minimum[1], maximum[1]),
+                    wp.clamp(history[2], minimum[2], maximum[2]),
+                )
+                speed = wp.length(velocity)
+                responsive = wp.clamp(speed / 8.0, 0.0, 1.0)
+                responsive = wp.max(responsive, wp.clamp(foam_field[i], 0.0, 1.0) * 0.82)
+                weight = wp.clamp(history_weight * (1.0 - responsive), 0.0, 0.94)
+                result = current * (1.0 - weight) + history * weight
+    output_color[i] = result
+    history_color[i] = result
+    history_depth[i] = depth
+
+
+@wp.kernel
+def shade_water_surface(
+    water_depth: wp.array(dtype=float),
+    water_back_depth: wp.array(dtype=float),
+    foam_field: wp.array(dtype=float),
+    scene_depth: wp.array(dtype=float), color: wp.array(dtype=wp.vec3),
+    width: int,
+    height: int,
+    right: wp.vec3,
+    up: wp.vec3,
+    forward: wp.vec3,
+    focal: float,
+    absorption_scale: float,
+    refraction_strength: float,
+    absorption_coefficient: wp.vec3,
+    scattering_coefficient: wp.vec3,
+    phase_g: float,
+    maximum_optical_depth: float,
+    sun_direction: wp.vec3,
+    sky_turbidity: float,
+    sky_intensity: float,
+    sun_intensity: float,
+    ibl_strength: float,
+):
+    """Single-layer participating-medium water over the opaque HDR scene."""
     i = wp.tid()
     x = i % width; y = i // width
     z = water_depth[i]
@@ -655,20 +930,54 @@ def shade_water_surface(
     if x + 1 < width and water_depth[i + 1] < 1.0e8: zr = water_depth[i + 1]
     if y > 0 and water_depth[i - width] < 1.0e8: zu = water_depth[i - width]
     if y + 1 < height and water_depth[i + width] < 1.0e8: zd = water_depth[i + width]
-    dx = zr - zl; dy = zd - zu
-    normal = wp.normalize(wp.vec3(-dx * 7.0, dy * 7.0, 1.0))
-    facing = wp.clamp(normal[2], 0.0, 1.0)
-    fresnel = 0.10 + 0.90 * wp.pow(1.0 - facing, 3.0)
-    sun = wp.normalize(wp.vec3(-0.32, 0.58, 0.75))
-    light = wp.clamp(wp.dot(normal, sun), 0.0, 1.0)
-    sparkle = wp.pow(light, 10.0)
+
+    # Reconstruct a real world-space normal from neighbouring camera-depth
+    # samples. Unlike the previous screen-facing normal, a calm horizontal
+    # surface now reflects the sky above it from every camera angle.
+    left_position = (
+        forward * zl
+        + right * ((float(x - 1) + 0.5 - float(width) * 0.5) * zl / focal)
+        + up * (-(float(y) + 0.5 - float(height) * 0.5) * zl / focal)
+    )
+    right_position = (
+        forward * zr
+        + right * ((float(x + 1) + 0.5 - float(width) * 0.5) * zr / focal)
+        + up * (-(float(y) + 0.5 - float(height) * 0.5) * zr / focal)
+    )
+    upper_position = (
+        forward * zu
+        + right * ((float(x) + 0.5 - float(width) * 0.5) * zu / focal)
+        + up * (-(float(y - 1) + 0.5 - float(height) * 0.5) * zu / focal)
+    )
+    lower_position = (
+        forward * zd
+        + right * ((float(x) + 0.5 - float(width) * 0.5) * zd / focal)
+        + up * (-(float(y + 1) + 0.5 - float(height) * 0.5) * zd / focal)
+    )
+    tangent_x = right_position - left_position
+    tangent_y = lower_position - upper_position
+    normal = wp.normalize(wp.cross(tangent_x, tangent_y))
+    camera_x = (float(x) + 0.5 - float(width) * 0.5) / focal
+    camera_y = -(float(y) + 0.5 - float(height) * 0.5) / focal
+    view_ray = wp.normalize(forward + right * camera_x + up * camera_y)
+    view_direction = -view_ray
+    if wp.dot(normal, view_direction) < 0.0:
+        normal = -normal
+    facing = wp.clamp(wp.dot(normal, view_direction), 0.0, 1.0)
+    fresnel = 0.0204 + 0.9796 * wp.pow(1.0 - facing, 5.0)
+    sun = wp.normalize(sun_direction)
+    half_vector = wp.normalize(view_direction + sun)
+    sparkle = wp.pow(wp.max(wp.dot(normal, half_vector), 0.0), 220.0)
     foam = wp.clamp(foam_field[i], 0.0, 1.0)
-    sky_reflection = wp.vec3(0.30, 0.43, 0.49)
+    incident_dot = wp.dot(view_ray, normal)
+    reflection_ray = wp.normalize(view_ray - normal * (2.0 * incident_dot))
+    sky_reflection = physical_sky_radiance(
+        reflection_ray, sun, sky_turbidity, sky_intensity, sun_intensity
+    ) * ibl_strength
     reflected_scene = sky_reflection
     reflection_found = float(0.0)
-    # Cheap screen-space reflection for the calm water behind the front. Scan
-    # towards the upper image for the nearest dry opaque silhouette and use it
-    # as a softened reflection instead of pretending Fresnel is only a tint.
+    # Preserve a conservative local SSR contribution for nearby silhouettes;
+    # the analytic HDR sky supplies valid data outside screen space.
     for step in range(1, 17):
         py = y - step * 4
         if py >= 0 and reflection_found < 0.5:
@@ -676,14 +985,169 @@ def shade_water_surface(
             if scene_depth[sample_index] < 1.0e8 and water_depth[sample_index] > 1.0e8:
                 reflected_scene = color[sample_index]
                 reflection_found = 1.0
-    reflection = wp.lerp(sky_reflection, reflected_scene, reflection_found * 0.62)
-    water = wp.lerp(wp.vec3(0.008, 0.085, 0.125), reflection, fresnel * 0.72)
-    water += wp.vec3(0.13, 0.19, 0.20) * light * 0.30
-    water += wp.vec3(0.94, 0.83, 0.61) * sparkle * 0.75
-    water = wp.lerp(water, wp.vec3(0.82, 0.89, 0.86), wp.sqrt(foam) * 0.84)
-    behind = color[i]
-    alpha = 0.76 + foam * 0.18
-    color[i] = wp.lerp(behind, water, alpha)
+    reflection = wp.lerp(sky_reflection, reflected_scene, reflection_found * 0.58)
+
+    normal_right = wp.dot(normal, right)
+    normal_up = wp.dot(normal, up)
+    refract_x = wp.clamp(
+        x + int(-normal_right * refraction_strength / wp.max(facing, 0.25)), 0, width - 1
+    )
+    refract_y = wp.clamp(
+        y + int(normal_up * refraction_strength / wp.max(facing, 0.25)), 0, height - 1
+    )
+    refract_index = refract_y * width + refract_x
+    refracted_scene = color[refract_index]
+    refracted_depth = scene_depth[refract_index]
+
+    exit_depth = water_back_depth[i]
+    if refracted_depth < 1.0e8 and refracted_depth > z:
+        if exit_depth <= z:
+            exit_depth = refracted_depth
+        else:
+            exit_depth = wp.min(exit_depth, refracted_depth)
+    optical_path = 0.32 + foam * 0.18
+    if exit_depth > z:
+        forward_cosine = wp.max(wp.dot(view_ray, forward), 0.12)
+        optical_path = (exit_depth - z) / forward_cosine
+    optical_path = wp.clamp(
+        optical_path * absorption_scale, 0.06, maximum_optical_depth
+    )
+    extinction = absorption_coefficient + scattering_coefficient
+    transmission = wp.vec3(
+        wp.exp(-extinction[0] * optical_path),
+        wp.exp(-extinction[1] * optical_path),
+        wp.exp(-extinction[2] * optical_path),
+    )
+    g = wp.clamp(phase_g, -0.85, 0.85)
+    phase_denominator = wp.pow(
+        wp.max(1.0 + g * g - 2.0 * g * wp.dot(view_ray, sun), 0.02), 1.5
+    )
+    phase = (1.0 - g * g) / phase_denominator
+    scatter_tint = wp.vec3(0.018, 0.22, 0.31) * (0.30 + 0.34 * phase)
+    in_scatter = wp.vec3(
+        scatter_tint[0] * scattering_coefficient[0] / wp.max(extinction[0], 1.0e-5),
+        scatter_tint[1] * scattering_coefficient[1] / wp.max(extinction[1], 1.0e-5),
+        scatter_tint[2] * scattering_coefficient[2] / wp.max(extinction[2], 1.0e-5),
+    ) * sky_intensity
+    transmitted = wp.vec3(
+        refracted_scene[0] * transmission[0] + in_scatter[0] * (1.0 - transmission[0]),
+        refracted_scene[1] * transmission[1] + in_scatter[1] * (1.0 - transmission[1]),
+        refracted_scene[2] * transmission[2] + in_scatter[2] * (1.0 - transmission[2]),
+    )
+    water = wp.lerp(transmitted, reflection, fresnel)
+    water += wp.vec3(1.0, 0.83, 0.58) * sparkle * sun_intensity * 0.75
+    # Foam is composed in its own material pass below; retain only the diffuse
+    # subsurface brightening it contributes to the water immediately beneath.
+    water = wp.lerp(water, wp.vec3(0.42, 0.52, 0.53), wp.sqrt(foam) * 0.12)
+    color[i] = water
+
+
+@wp.kernel
+def composite_surface_foam(
+    water_depth: wp.array(dtype=float),
+    foam_field: wp.array(dtype=float),
+    scene_depth: wp.array(dtype=float),
+    color: wp.array(dtype=wp.vec3),
+    width: int,
+    height: int,
+    time_s: float,
+    foam_strength: float,
+):
+    """Render foam as a distinct rough, opaque surface material."""
+    i = wp.tid()
+    z = water_depth[i]
+    if z > 1.0e8 or z >= scene_depth[i]:
+        return
+    x = i % width
+    y = i // width
+    foam = wp.clamp(foam_field[i] * foam_strength, 0.0, 1.0)
+    # Deterministic moving breakup prevents one uniform white blanket while
+    # retaining temporal coherence from frame to frame.
+    phase = wp.sin(float(x) * 0.173 + float(y) * 0.119 + time_s * 2.7)
+    breakup = 0.74 + 0.26 * (phase * 0.5 + 0.5)
+    coverage = wp.smoothstep(0.20, 0.96, wp.sqrt(foam) * breakup)
+    if coverage <= 0.0:
+        return
+    foam_color = wp.vec3(0.80, 0.86, 0.83)
+    highlight = wp.pow(wp.clamp(foam, 0.0, 1.0), 2.0)
+    foam_color += wp.vec3(0.16, 0.14, 0.10) * highlight
+    color[i] = wp.lerp(color[i], foam_color, coverage * 0.72)
+
+
+@wp.kernel
+def composite_volumetric_atmosphere(
+    scene_depth: wp.array(dtype=float),
+    water_depth: wp.array(dtype=float),
+    foam_field: wp.array(dtype=float),
+    color: wp.array(dtype=wp.vec3),
+    cam: wp.vec3,
+    right: wp.vec3,
+    up: wp.vec3,
+    forward: wp.vec3,
+    focal: float,
+    width: int,
+    height: int,
+    time_s: float,
+    fog_density: float,
+    fog_height_falloff: float,
+    mist_strength: float,
+    sun_direction: wp.vec3,
+    sky_turbidity: float,
+    sky_intensity: float,
+    sun_intensity: float,
+):
+    """Height fog plus screen-space water dust sourced by energetic foam."""
+    i = wp.tid()
+    x = i % width
+    y = i // width
+    z = wp.min(scene_depth[i], water_depth[i])
+    value = color[i]
+    camera_x_normalized = (float(x) + 0.5 - float(width) * 0.5) / focal
+    camera_y_normalized = -(float(y) + 0.5 - float(height) * 0.5) / focal
+    view_ray = wp.normalize(
+        forward + right * camera_x_normalized + up * camera_y_normalized
+    )
+    atmospheric_radiance = physical_sky_radiance(
+        view_ray, sun_direction, sky_turbidity, sky_intensity, sun_intensity
+    )
+    if z < 1.0e8:
+        camera_x = (float(x) + 0.5 - float(width) * 0.5) * z / focal
+        camera_y = -(float(y) + 0.5 - float(height) * 0.5) * z / focal
+        world_y = cam[1] + right[1] * camera_x + up[1] * camera_y + forward[1] * z
+        height_density = wp.exp(-wp.max(world_y, 0.0) / wp.max(fog_height_falloff, 1.0))
+        fog_amount = 1.0 - wp.exp(-wp.min(z, 600.0) * fog_density * height_density)
+        fog_color = atmospheric_radiance * 0.58 + wp.vec3(0.055, 0.065, 0.062)
+        value = wp.lerp(value, fog_color, wp.clamp(fog_amount, 0.0, 0.55))
+
+    mist = wp.clamp(foam_field[i], 0.0, 1.0) * 1.4
+    samples = int(1)
+    # Sparse multi-radius gather approximates a short volume around breaking
+    # crests. It is deliberately independent of surface-foam coverage.
+    for ring in range(3):
+        radius = 3 + ring * 5
+        for direction in range(8):
+            ox = 0; oy = 0
+            if direction == 0: ox = radius
+            elif direction == 1: ox = radius; oy = radius
+            elif direction == 2: oy = radius
+            elif direction == 3: ox = -radius; oy = radius
+            elif direction == 4: ox = -radius
+            elif direction == 5: ox = -radius; oy = -radius
+            elif direction == 6: oy = -radius
+            else: ox = radius; oy = -radius
+            px = x + ox; py = y + oy
+            if px >= 0 and px < width and py >= 0 and py < height:
+                sample_index = py * width + px
+                sample_foam = wp.clamp(foam_field[sample_index], 0.0, 1.0)
+                sample_water = water_depth[sample_index]
+                if sample_water < 1.0e8:
+                    radial_weight = 1.0 / (1.0 + float(ring) * 0.85)
+                    mist += sample_foam * radial_weight
+                samples += 1
+    noise = 0.82 + 0.18 * wp.sin(float(x) * 0.071 - float(y) * 0.053 + time_s * 1.9)
+    mist_amount = wp.clamp(mist / float(samples) * mist_strength * noise, 0.0, 0.22)
+    mist_color = atmospheric_radiance * 0.42 + wp.vec3(0.20, 0.24, 0.235)
+    color[i] = wp.lerp(value, mist_color, mist_amount)
 
 
 @wp.kernel
@@ -761,25 +1225,38 @@ def apply_cinematic_postprocess(
     if z < 1.0e8:
         occlusion = float(0.0)
         samples = int(0)
-        for oy in range(-4, 5, 4):
-            for ox in range(-4, 5, 4):
-                if ox == 0 and oy == 0:
-                    continue
+        # Three radii retain tight wheel/tree/debris contact while also
+        # grounding large wall slabs. Rotating the sparse ring per pixel avoids
+        # the old square 3x3 halo without adding a random texture lookup.
+        phase = (x * 13 + y * 7) & 3
+        for ring in range(3):
+            radius = 2 + ring * 3
+            for sample in range(8):
+                direction = (sample + phase) & 7
+                ox = 0; oy = 0
+                if direction == 0: ox = radius
+                elif direction == 1: ox = radius; oy = radius
+                elif direction == 2: oy = radius
+                elif direction == 3: ox = -radius; oy = radius
+                elif direction == 4: ox = -radius
+                elif direction == 5: ox = -radius; oy = -radius
+                elif direction == 6: oy = -radius
+                else: ox = radius; oy = -radius
                 px = x + ox; py = y + oy
                 if px >= 0 and px < width and py >= 0 and py < height:
                     neighbour = wp.min(scene_depth[py * width + px], water_depth[py * width + px])
-                    if neighbour < z - 0.35:
-                        occlusion += wp.clamp((z - neighbour) / 4.0, 0.0, 1.0)
+                    depth_delta = z - neighbour
+                    if neighbour < 1.0e8 and depth_delta > 0.16:
+                        range_weight = 1.0 - wp.smoothstep(0.0, 12.0 + float(ring) * 5.0, depth_delta)
+                        occlusion += wp.clamp(depth_delta / (2.5 + float(ring) * 3.0), 0.0, 1.0) * range_weight
                     samples += 1
-        ao = 1.0 - 0.42 * occlusion / float(wp.max(samples, 1))
+        ao = 1.0 - 0.52 * occlusion / float(wp.max(samples, 1))
         value *= ao
         if scene_depth[i] < 1.0e8 and water_depth[i] < 1.0e8:
             separation = water_depth[i] - scene_depth[i]
             wet = 1.0 - wp.smoothstep(0.0, 4.0, wp.abs(separation))
             wet_value = wp.vec3(value[0] * 0.58, value[1] * 0.66, value[2] * 0.68)
             value = wp.lerp(value, wet_value, wet * 0.32)
-        fog = wp.smoothstep(220.0, 480.0, z)
-        value = wp.lerp(value, wp.vec3(0.36, 0.46, 0.50), fog * 0.20)
     nx = (float(x) + 0.5) / float(width) * 2.0 - 1.0
     ny = (float(y) + 0.5) / float(height) * 2.0 - 1.0
     vignette = 1.0 - 0.13 * wp.clamp(nx * nx + ny * ny - 0.35, 0.0, 1.0)

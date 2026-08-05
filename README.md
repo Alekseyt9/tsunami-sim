@@ -58,8 +58,12 @@ start_v3_rtx5070.bat
 Or run from a terminal:
 
 ```bat
-.venv\Scripts\python.exe deluge_v3.py --config config_v3_rtx5070.json
+.venv\Scripts\python.exe deluge_v3.py --config config_v3_sustained_surge_30s.json
 ```
+
+The launcher and command above use the long sustained-surge production preset,
+which reaches all three building rows. `config_v3_rtx5070.json` remains the
+finite-wave base configuration for controlled comparisons and short tests.
 
 Useful short runs:
 
@@ -304,7 +308,8 @@ It covers:
 - `benchmarks/` — performance and numerical-equivalence A/B programs.
 - `tools/` — checkpoint rendering, profiling, audits, and resumed-run assembly.
 - `validation/` — CUDA validations and production-output checks.
-- `config_v3_rtx5070.json` — production RTX 5070 configuration.
+- `config_v3_rtx5070.json` — RTX 5070 base and finite-wave comparison configuration.
+- `config_v3_sustained_surge_30s.json` — sustained-flow production preset.
 - `ROADMAP.md` — development stages and acceptance criteria.
 
 ## Status

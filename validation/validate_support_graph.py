@@ -44,6 +44,30 @@ def main() -> None:
     if supported.tolist() != [True, True, False] or int(np.count_nonzero(intact)) != 1:
         raise AssertionError("overstretched boundary remained a valid load path")
 
+    # Unloading must not weld a failed cohesive boundary back together. The
+    # production solver carries this state through every frame and checkpoint.
+    unloaded_support, unloaded_edges = evaluate_fragment_support(
+        graph,
+        rest.copy(),
+        damage,
+        maximum_stretch=1.6,
+        previous_edge_intact=intact,
+    )
+    if unloaded_support.tolist() != [True, True, False] or unloaded_edges.tolist() != intact.tolist():
+        raise AssertionError(
+            f"failed boundary healed after geometric unloading: {unloaded_support}, "
+            f"{unloaded_edges}"
+        )
+
+    try:
+        evaluate_fragment_support(
+            graph, rest.copy(), damage, previous_edge_intact=np.ones(1, dtype=bool)
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("mismatched persisted edge state was silently accepted")
+
     opening = rest.copy(); opening[2, 0] += 0.06
     edge_energy, fragment_energy = evaluate_fragment_fracture_energy(
         graph, opening, damage, material, role
@@ -139,7 +163,7 @@ def main() -> None:
         )
     print(
         "PASS: support is causal and directed upward; subcritical tensile energy opens "
-        "an irreversible crack and failed boundaries retain full fracture energy"
+        "an irreversible crack; broken load paths cannot heal after unloading"
     )
 
 

@@ -448,7 +448,8 @@ class DelugeSolver:
                     row[optional_stat] = float(stats[optional_stat])
             for key, value in stats.items():
                 if key in row or not key.startswith(
-                    ("wave_row_", "sph_row_", "building_row_", "coupling_", "wave_cohort_")
+                    ("wave_row_", "sph_row_", "building_row_", "coupling_", "wave_cohort_",
+                     "environment_")
                 ):
                     continue
                 if isinstance(value, (int, np.integer)):

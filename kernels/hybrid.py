@@ -6,6 +6,8 @@ expensive bond traversal until enough facade particles receive water load.
 
 import warp as wp
 
+from kernels.base import physical_sky_radiance
+
 
 SPH_PI = wp.constant(3.141592653589793)
 
@@ -1830,6 +1832,10 @@ def contact_friction(material: int) -> float:
         return 0.32
     if material == 3:  # reinforcement steel
         return 0.48
+    if material == 4:  # light masonry
+        return 0.72
+    if material == 5:  # wood
+        return 0.58
     return 0.64  # concrete / masonry
 
 
@@ -1839,6 +1845,10 @@ def contact_stiffness(material: int) -> float:
         return 2.2e6
     if material == 3:
         return 6.0e6
+    if material == 4:
+        return 2.5e6
+    if material == 5:
+        return 1.5e6
     return 4.0e6
 
 
@@ -4051,6 +4061,7 @@ def deform_facade_vertices(
     if panel_mode[panel] != 0:
         owner = owner_fragment[panel]
         if owner < 0 or fragment_support[owner] > 0.5:
+            current_vertex[i] = rest_vertex[i]
             return
     a = anchor[i]
     current_vertex[i] = rest_vertex[i] + (x[a] - rest_x[a])
@@ -4135,6 +4146,154 @@ def raster_facade_depth(
 
 
 @wp.func
+def project_orthographic_shadow(
+    point: wp.vec3,
+    origin: wp.vec3,
+    right: wp.vec3,
+    up: wp.vec3,
+    forward: wp.vec3,
+    half_extent: wp.vec2,
+    resolution: int,
+) -> wp.vec3:
+    relative = point - origin
+    px = (wp.dot(relative, right) / wp.max(half_extent[0], 1.0) * 0.5 + 0.5) * float(resolution)
+    py = (0.5 - wp.dot(relative, up) / wp.max(half_extent[1], 1.0) * 0.5) * float(resolution)
+    pz = wp.dot(relative, forward)
+    return wp.vec3(px, py, pz)
+
+
+@wp.kernel
+def raster_facade_shadow_depth(
+    vertex: wp.array(dtype=wp.vec3),
+    rest_vertex: wp.array(dtype=wp.vec3),
+    material: wp.array(dtype=wp.int32),
+    panel_mode: wp.array(dtype=wp.int32),
+    owner_fragment: wp.array(dtype=wp.int32),
+    fragment_support: wp.array(dtype=float),
+    shadow_depth: wp.array(dtype=float),
+    shadow_offset: int,
+    light_origin: wp.vec3,
+    light_right: wp.vec3,
+    light_up: wp.vec3,
+    light_forward: wp.vec3,
+    half_extent: wp.vec2,
+    resolution: int,
+    maximum_stretch: float,
+):
+    triangle = wp.tid()
+    panel = triangle // 2
+    if material[panel] // 10 == 2:
+        return
+    if panel_mode[panel] != 0:
+        owner = owner_fragment[panel]
+        if owner < 0 or fragment_support[owner] > 0.5:
+            return
+    ids = facade_triangle_indices(triangle)
+    world_a = vertex[ids[0]]; world_b = vertex[ids[1]]; world_c = vertex[ids[2]]
+    if facade_triangle_torn(
+        world_a, world_b, world_c,
+        rest_vertex[ids[0]], rest_vertex[ids[1]], rest_vertex[ids[2]], maximum_stretch,
+    ):
+        return
+    a = project_orthographic_shadow(
+        world_a, light_origin, light_right, light_up, light_forward, half_extent, resolution
+    )
+    b = project_orthographic_shadow(
+        world_b, light_origin, light_right, light_up, light_forward, half_extent, resolution
+    )
+    c = project_orthographic_shadow(
+        world_c, light_origin, light_right, light_up, light_forward, half_extent, resolution
+    )
+    raw_min_x = wp.floor(wp.min(a[0], wp.min(b[0], c[0])))
+    raw_max_x = wp.ceil(wp.max(a[0], wp.max(b[0], c[0])))
+    raw_min_y = wp.floor(wp.min(a[1], wp.min(b[1], c[1])))
+    raw_max_y = wp.ceil(wp.max(a[1], wp.max(b[1], c[1])))
+    if raw_max_x < 0.0 or raw_min_x >= float(resolution) or raw_max_y < 0.0 or raw_min_y >= float(resolution):
+        return
+    min_x = wp.clamp(int(raw_min_x), 0, resolution - 1)
+    max_x = wp.clamp(int(raw_max_x), 0, resolution - 1)
+    min_y = wp.clamp(int(raw_min_y), 0, resolution - 1)
+    max_y = wp.clamp(int(raw_max_y), 0, resolution - 1)
+    area = edge2(a, b, c[0], c[1])
+    if wp.abs(area) < 1.0e-6:
+        return
+    for py in range(min_y, max_y + 1):
+        for px in range(min_x, max_x + 1):
+            fx = float(px) + 0.5; fy = float(py) + 0.5
+            w0 = edge2(b, c, fx, fy) / area
+            w1 = edge2(c, a, fx, fy) / area
+            w2 = 1.0 - w0 - w1
+            if w0 >= 0.0 and w1 >= 0.0 and w2 >= 0.0:
+                z = w0 * a[2] + w1 * b[2] + w2 * c[2]
+                wp.atomic_min(shadow_depth, shadow_offset + py * resolution + px, z)
+
+
+@wp.kernel
+def apply_cascaded_shadow_maps(
+    scene_depth: wp.array(dtype=float),
+    water_depth: wp.array(dtype=float),
+    gbuffer_normal: wp.array(dtype=wp.vec3),
+    color: wp.array(dtype=wp.vec3),
+    cam: wp.vec3,
+    camera_right: wp.vec3,
+    camera_up: wp.vec3,
+    camera_forward: wp.vec3,
+    focal: float,
+    width: int,
+    height: int,
+    shadow_depth: wp.array(dtype=float),
+    light_origins: wp.array(dtype=wp.vec3),
+    light_rights: wp.array(dtype=wp.vec3),
+    light_ups: wp.array(dtype=wp.vec3),
+    light_forwards: wp.array(dtype=wp.vec3),
+    half_extents: wp.array(dtype=wp.vec2),
+    far_splits: wp.array(dtype=float),
+    cascade_count: int,
+    shadow_resolution: int,
+    shadow_strength: float,
+):
+    i = wp.tid()
+    x = i % width; y = i // width
+    z = wp.min(scene_depth[i], water_depth[i])
+    if z > 1.0e8:
+        return
+    cascade = cascade_count - 1
+    for candidate in range(3):
+        if candidate < cascade_count and z <= far_splits[candidate]:
+            cascade = wp.min(cascade, candidate)
+    camera_x = (float(x) + 0.5 - float(width) * 0.5) * z / focal
+    camera_y = -(float(y) + 0.5 - float(height) * 0.5) * z / focal
+    world = cam + camera_right * camera_x + camera_up * camera_y + camera_forward * z
+    light_point = project_orthographic_shadow(
+        world, light_origins[cascade], light_rights[cascade], light_ups[cascade],
+        light_forwards[cascade], half_extents[cascade], shadow_resolution,
+    )
+    sx = int(wp.floor(light_point[0])); sy = int(wp.floor(light_point[1]))
+    if sx < 0 or sx >= shadow_resolution or sy < 0 or sy >= shadow_resolution:
+        return
+    normal = wp.normalize(gbuffer_normal[i])
+    sun_direction = wp.normalize(wp.vec3(-0.38, 0.82, -0.35))
+    normal_light = wp.clamp(wp.dot(normal, sun_direction), 0.0, 1.0)
+    bias = 0.12 + (1.0 - normal_light) * 0.32
+    occluded = float(0.0)
+    samples = int(0)
+    offset = cascade * shadow_resolution * shadow_resolution
+    for oy in range(-1, 2):
+        for ox in range(-1, 2):
+            px = sx + ox; py = sy + oy
+            if px >= 0 and px < shadow_resolution and py >= 0 and py < shadow_resolution:
+                blocker = shadow_depth[offset + py * shadow_resolution + px]
+                if blocker < light_point[2] - bias:
+                    occluded += 1.0
+                samples += 1
+    shadow = occluded / float(wp.max(samples, 1))
+    if shadow > 0.0:
+        current = color[i]
+        ambient = wp.vec3(current[0] * 0.47, current[1] * 0.53, current[2] * 0.58)
+        color[i] = wp.lerp(current, ambient, shadow * shadow_strength)
+
+
+@wp.func
 def facade_material_color(code: int) -> wp.vec3:
     # Legacy panels (1/2) remain readable in old checkpoints and tests.
     if code == 2:
@@ -4186,6 +4345,96 @@ def facade_material_color(code: int) -> wp.vec3:
         if palette == 1: base = wp.vec3(0.075, 0.083, 0.085)
         elif palette == 2: base = wp.vec3(0.32, 0.33, 0.31)
     return base
+
+
+@wp.func
+def facade_material_roughness(family: int, panel: int) -> float:
+    """Perceptual PBR roughness for the authored facade/debris families."""
+    roughness = 0.72  # damp architectural concrete
+    if family == 2:  # glass
+        roughness = 0.075
+    elif family == 3:  # roof/floor concrete
+        roughness = 0.58
+    elif family == 4:  # exposed aggregate and broken masonry
+        roughness = 0.82
+    elif family == 5:  # painted metal / vehicle clear coat
+        roughness = 0.24
+    elif family == 6:  # wet wood
+        roughness = 0.46
+    elif family == 7:  # foliage
+        roughness = 0.78
+    elif family == 9:  # wet asphalt and pavement
+        roughness = 0.54
+    variation = (facade_hash01(panel, 211) - 0.5) * 0.10
+    return wp.clamp(roughness + variation, 0.045, 0.95)
+
+
+@wp.func
+def facade_material_metallic(family: int, palette: int) -> float:
+    metallic = 0.0
+    if family == 5:
+        # Automotive paint is a dielectric clear coat over a partly metallic
+        # base; wheels (palette 8) are treated as bare dark metal.
+        metallic = 0.28
+        if palette == 8:
+            metallic = 0.78
+    return metallic
+
+
+@wp.func
+def facade_procedural_surface(
+    normal: wp.vec3,
+    tangent_u: wp.vec3,
+    tangent_v: wp.vec3,
+    uv: wp.vec2,
+    family: int,
+    palette: int,
+    panel: int,
+) -> wp.vec4:
+    """Return tangent-normal slopes, albedo modulation and roughness offset."""
+    slope_u = 0.0
+    slope_v = 0.0
+    albedo = 1.0
+    roughness_offset = 0.0
+    if family == 1 or family == 3 or family == 4:
+        grain = wp.sin(uv[0] * 91.0 + float(panel) * 0.37) * wp.sin(uv[1] * 67.0 - float(panel) * 0.19)
+        slope_u = grain * 0.075
+        slope_v = wp.sin(uv[0] * 53.0 - uv[1] * 79.0) * 0.065
+        albedo = 0.94 + 0.08 * grain
+        roughness_offset = grain * 0.055
+        if palette == 4:  # brick/terracotta mortar courses
+            brick_u = uv[0] * 6.0
+            brick_v = uv[1] * 11.0
+            fu = brick_u - wp.floor(brick_u)
+            fv = brick_v - wp.floor(brick_v)
+            mortar = 0.0
+            if fu < 0.055 or fv < 0.075:
+                mortar = 1.0
+            albedo *= 1.0 - mortar * 0.24
+            slope_u += (0.5 - fu) * mortar * 0.12
+            slope_v += (0.5 - fv) * mortar * 0.12
+    elif family == 6:  # directional wet wood grain
+        grain = wp.sin(uv[1] * 82.0 + wp.sin(uv[0] * 13.0) * 3.2 + float(panel) * 0.11)
+        slope_u = wp.cos(uv[0] * 13.0) * grain * 0.055
+        slope_v = grain * 0.13
+        albedo = 0.88 + 0.13 * grain
+        roughness_offset = grain * 0.08
+    elif family == 9:  # aggregate in asphalt/pavement
+        aggregate = wp.sin(uv[0] * 127.0 + float(panel)) * wp.sin(uv[1] * 113.0)
+        slope_u = aggregate * 0.10
+        slope_v = wp.sin((uv[0] + uv[1]) * 149.0) * 0.09
+        albedo = 0.92 + 0.10 * aggregate
+        roughness_offset = aggregate * 0.07
+    elif family == 5:  # subtle orange peel under clear coat
+        orange_peel = wp.sin(uv[0] * 143.0) * wp.sin(uv[1] * 137.0)
+        slope_u = orange_peel * 0.018
+        slope_v = orange_peel * 0.018
+        roughness_offset = orange_peel * 0.025
+    elif family == 2:
+        waviness = wp.sin(uv[0] * 19.0 + uv[1] * 23.0 + float(panel))
+        slope_u = waviness * 0.008
+        slope_v = waviness * 0.008
+    return wp.vec4(slope_u, slope_v, albedo, roughness_offset)
 
 
 @wp.func
@@ -4251,6 +4500,7 @@ def facade_crack_mask(panel: int, uv: wp.vec2, damage: float, material: int) -> 
 @wp.kernel
 def raster_facade_color(
     vertex: wp.array(dtype=wp.vec3),
+    previous_vertex: wp.array(dtype=wp.vec3),
     rest_vertex: wp.array(dtype=wp.vec3),
     anchor: wp.array(dtype=wp.int32),
     material: wp.array(dtype=wp.int32),
@@ -4262,6 +4512,11 @@ def raster_facade_color(
     triangle_order: wp.array(dtype=wp.int32),
     depth: wp.array(dtype=float),
     color: wp.array(dtype=wp.vec3),
+    gbuffer_normal: wp.array(dtype=wp.vec3),
+    gbuffer_motion: wp.array(dtype=wp.vec2),
+    gbuffer_material: wp.array(dtype=wp.int32),
+    gbuffer_roughness: wp.array(dtype=float),
+    gbuffer_metallic: wp.array(dtype=float),
     cam: wp.vec3,
     right: wp.vec3,
     up: wp.vec3,
@@ -4272,6 +4527,11 @@ def raster_facade_color(
     maximum_stretch: float,
     crack_strength: float,
     architectural_overlay_tolerance: float,
+    sun_direction_input: wp.vec3,
+    sky_turbidity: float,
+    sky_intensity: float,
+    sun_intensity: float,
+    ibl_strength: float,
 ):
     triangle = triangle_order[wp.tid()]
     panel = triangle // 2
@@ -4289,6 +4549,9 @@ def raster_facade_color(
     a = project_point(world_a, cam, right, up, forward, focal, width, height)
     b = project_point(world_b, cam, right, up, forward, focal, width, height)
     c = project_point(world_c, cam, right, up, forward, focal, width, height)
+    previous_a = project_point(previous_vertex[ids[0]], cam, right, up, forward, focal, width, height)
+    previous_b = project_point(previous_vertex[ids[1]], cam, right, up, forward, focal, width, height)
+    previous_c = project_point(previous_vertex[ids[2]], cam, right, up, forward, focal, width, height)
     if a[2] <= 0.1 or b[2] <= 0.1 or c[2] <= 0.1:
         return
     min_x = wp.clamp(int(wp.floor(wp.min(a[0], wp.min(b[0], c[0])))), 0, width - 1)
@@ -4306,19 +4569,25 @@ def raster_facade_color(
     # normal toward the camera once, then retain a real lit and shadowed side.
     if wp.dot(normal, view_direction) < 0.0:
         normal = -normal
-    sun_direction = wp.normalize(wp.vec3(-0.38, 0.82, -0.35))
+    sun_direction = wp.normalize(sun_direction_input)
     diffuse = wp.clamp(wp.dot(normal, sun_direction), 0.0, 1.0)
-    light = 0.09 + 0.91 * diffuse
     family = material[panel] // 10
-    specular_broad = float(0.0)
-    specular_glint = float(0.0)
-    if family == 2 or family == 5:
-        half_vector = wp.normalize(view_direction + sun_direction)
-        specular_alignment = wp.clamp(
-            wp.dot(normal, half_vector), 0.0, 1.0
-        )
-        specular_broad = wp.pow(specular_alignment, 8.0)
-        specular_glint = wp.pow(specular_alignment, 38.0)
+    palette = material[panel] - family * 10
+    roughness = facade_material_roughness(family, panel)
+    metallic = facade_material_metallic(family, palette)
+    half_vector = wp.normalize(view_direction + sun_direction)
+    n_dot_v = wp.max(wp.dot(normal, view_direction), 0.001)
+    n_dot_l = wp.max(diffuse, 0.001)
+    n_dot_h = wp.max(wp.dot(normal, half_vector), 0.0)
+    v_dot_h = wp.max(wp.dot(view_direction, half_vector), 0.0)
+    alpha = roughness * roughness
+    alpha2 = alpha * alpha
+    ggx_denominator = n_dot_h * n_dot_h * (alpha2 - 1.0) + 1.0
+    distribution = alpha2 / wp.max(3.14159265 * ggx_denominator * ggx_denominator, 1.0e-5)
+    geometry_k = (roughness + 1.0) * (roughness + 1.0) * 0.125
+    geometry_v = n_dot_v / (n_dot_v * (1.0 - geometry_k) + geometry_k)
+    geometry_l = n_dot_l / (n_dot_l * (1.0 - geometry_k) + geometry_k)
+    geometry = geometry_v * geometry_l
     anchor_base = panel * 4
     damage_0 = particle_damage[anchor[anchor_base]]
     damage_1 = particle_damage[anchor[anchor_base + 1]]
@@ -4336,19 +4605,68 @@ def raster_facade_color(
     # loss of brightness; exposed particle materials supply concrete/steel
     # contrast after the facade skin actually tears.
     base *= 1.0 - 0.32 * wp.clamp(panel_damage, 0.0, 1.0)
-    base *= light
+    dielectric_f0 = wp.vec3(0.04, 0.04, 0.04)
     if family == 2:
-        # Glass keeps a cool sky reflection, but a narrow warm solar glint is
-        # added after diffuse lighting so it remains visible on a shaded
-        # facade. Slight deterministic panel variation avoids one flat stripe.
-        glint_variation = 0.76 + 0.24 * facade_hash01(panel, 83)
-        base += wp.vec3(0.44, 0.57, 0.64) * specular_broad * 0.56
-        base += wp.vec3(0.24, 0.27, 0.25) * diffuse * 0.16
-        base += wp.vec3(1.00, 0.86, 0.61) * specular_glint * (
-            1.85 * glint_variation
+        dielectric_f0 = wp.vec3(0.055, 0.065, 0.072)
+    f0 = wp.lerp(dielectric_f0, base, metallic)
+    fresnel_weight = wp.pow(1.0 - v_dot_h, 5.0)
+    fresnel = f0 + (wp.vec3(1.0, 1.0, 1.0) - f0) * fresnel_weight
+    specular = fresnel * (
+        distribution * geometry / wp.max(4.0 * n_dot_v * n_dot_l, 1.0e-4)
+    )
+    diffuse_color = base * (1.0 - metallic) / 3.14159265
+    sun_radiance = wp.vec3(1.00, 0.91, 0.76) * sun_intensity
+    sky_diffuse = physical_sky_radiance(
+        normal, sun_direction, sky_turbidity, sky_intensity, 0.0
+    )
+    incident_view = -view_direction
+    reflection_direction = wp.normalize(
+        incident_view - normal * (2.0 * wp.dot(incident_view, normal))
+    )
+    rough_reflection_direction = wp.normalize(
+        wp.lerp(reflection_direction, normal, roughness * roughness * 0.72)
+    )
+    environment_specular = physical_sky_radiance(
+        rough_reflection_direction,
+        sun_direction,
+        sky_turbidity,
+        sky_intensity,
+        sun_intensity,
+    )
+    sky_ambient = wp.vec3(0.045, 0.045, 0.045) + sky_diffuse * ibl_strength * 0.34
+    ambient = wp.vec3(
+        base[0] * sky_ambient[0],
+        base[1] * sky_ambient[1],
+        base[2] * sky_ambient[2],
+    )
+    direct_brdf = diffuse_color + specular
+    base = ambient + wp.vec3(
+        direct_brdf[0] * sun_radiance[0],
+        direct_brdf[1] * sun_radiance[1],
+        direct_brdf[2] * sun_radiance[2],
+    ) * diffuse
+    environment_scale = ibl_strength * (
+        0.10 + 0.30 * (1.0 - roughness) * (1.0 - roughness)
+    )
+    base += wp.vec3(
+        environment_specular[0] * fresnel[0],
+        environment_specular[1] * fresnel[1],
+        environment_specular[2] * fresnel[2],
+    ) * environment_scale
+    if family == 2:
+        # Approximate sky transmission plus angle-dependent reflection. This
+        # keeps windows blue in shadow without turning them into emissive tiles.
+        view_fresnel = 0.055 + 0.945 * wp.pow(1.0 - n_dot_v, 5.0)
+        transmission_radiance = physical_sky_radiance(
+            -normal, sun_direction, sky_turbidity, sky_intensity, 0.0
         )
-    elif family == 5:
-        base += wp.vec3(0.72, 0.76, 0.75) * specular_broad * 0.52
+        transmitted_sky = wp.vec3(
+            transmission_radiance[0] * 0.18,
+            transmission_radiance[1] * 0.31,
+            transmission_radiance[2] * 0.36,
+        )
+        reflected_sky = environment_specular
+        base = wp.lerp(transmitted_sky, reflected_sky, view_fresnel * 0.92) + specular * 1.8
     rest_a = rest_vertex[ids[0]]; rest_b = rest_vertex[ids[1]]; rest_c = rest_vertex[ids[2]]
     panel_vertex = panel * 4
     rest_origin = rest_vertex[panel_vertex]
@@ -4356,6 +4674,8 @@ def raster_facade_color(
     rest_v = rest_vertex[panel_vertex + 1] - rest_origin
     rest_u_length2 = wp.max(wp.dot(rest_u, rest_u), 1.0e-8)
     rest_v_length2 = wp.max(wp.dot(rest_v, rest_v), 1.0e-8)
+    tangent_u = wp.normalize(world_c - world_a)
+    tangent_v = wp.normalize(world_b - world_a)
     for py in range(min_y, max_y + 1):
         for px in range(min_x, max_x + 1):
             fx = float(px) + 0.5; fy = float(py) + 0.5
@@ -4374,22 +4694,44 @@ def raster_facade_color(
                     depth_tolerance = architectural_overlay_tolerance
                 if z <= depth[index] + depth_tolerance:
                     pixel_color = base
+                    rest_point = rest_a * w0 + rest_b * w1 + rest_c * w2
+                    relative = rest_point - rest_origin
+                    uv = wp.vec2(
+                        wp.dot(relative, rest_u) / rest_u_length2,
+                        wp.dot(relative, rest_v) / rest_v_length2,
+                    )
+                    surface = facade_procedural_surface(
+                        normal, tangent_u, tangent_v, uv, family, palette, panel
+                    )
+                    micro_normal = wp.normalize(
+                        normal + tangent_u * surface[0] + tangent_v * surface[1]
+                    )
+                    micro_diffuse = 0.16 + 0.84 * wp.clamp(wp.dot(micro_normal, sun_direction), 0.0, 1.0)
+                    macro_diffuse = 0.16 + 0.84 * diffuse
+                    texture_light = wp.clamp(micro_diffuse / wp.max(macro_diffuse, 0.08), 0.72, 1.28)
+                    pixel_color *= surface[2] * texture_light
                     if panel_mode[panel] == 0 and crack_strength > 0.0:
-                        rest_point = rest_a * w0 + rest_b * w1 + rest_c * w2
-                        relative = rest_point - rest_origin
-                        uv = wp.vec2(
-                            wp.dot(relative, rest_u) / rest_u_length2,
-                            wp.dot(relative, rest_v) / rest_v_length2,
-                        )
                         crack = facade_crack_mask(
                             panel, uv, crack_damage, material[panel]
                         ) * crack_strength
                         if material[panel] // 10 == 2:
-                            crack_color = wp.vec3(0.58, 0.78, 0.86) * light
+                            crack_light = 0.18 + 0.82 * diffuse
+                            crack_color = wp.vec3(0.58, 0.78, 0.86) * crack_light
                             pixel_color = pixel_color * (1.0 - crack) + crack_color * crack
                         else:
                             pixel_color *= 1.0 - 0.82 * crack
                     color[index] = pixel_color
+                    gbuffer_normal[index] = micro_normal
+                    gbuffer_material[index] = material[panel]
+                    gbuffer_roughness[index] = wp.clamp(roughness + surface[3], 0.04, 0.96)
+                    gbuffer_metallic[index] = metallic
+                    motion_x = 0.0; motion_y = 0.0
+                    if previous_a[2] > 0.1 and previous_b[2] > 0.1 and previous_c[2] > 0.1:
+                        previous_x = w0 * previous_a[0] + w1 * previous_b[0] + w2 * previous_c[0]
+                        previous_y = w0 * previous_a[1] + w1 * previous_b[1] + w2 * previous_c[1]
+                        motion_x = fx - previous_x
+                        motion_y = fy - previous_y
+                    gbuffer_motion[index] = wp.vec2(motion_x, motion_y)
 
 
 @wp.func

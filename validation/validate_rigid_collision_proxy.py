@@ -21,6 +21,7 @@ from kernels.hybrid import (
     update_rigid_proxy_bounds,
 )
 from simulation.rigid_clusters import fit_rigid_collision_proxy
+from simulation.scene import STRUCT_WALL
 
 
 def main() -> None:
@@ -37,6 +38,22 @@ def main() -> None:
     upper = fitted.local_center + fitted.half_extent
     if np.any(local_samples < lower) or np.any(local_samples > upper) or fitted.material != 1:
         raise AssertionError("fitted proxy does not enclose its weighted structural samples")
+
+    wall_samples = np.asarray(
+        [[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [-1.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
+        dtype=np.float32,
+    )
+    wall_proxy = fit_rigid_collision_proxy(
+        wall_samples, np.full(4, 0.6, dtype=np.float32),
+        np.ones(4, dtype=np.int32), padding_scale=0.7,
+        normal_axis=np.full(4, 2, dtype=np.int32),
+        structural_class=np.full(4, STRUCT_WALL, dtype=np.int32),
+        maximum_sheet_thickness=0.30,
+    )
+    if not np.isclose(2.0 * wall_proxy.half_extent[2], 0.30, atol=1.0e-6):
+        raise AssertionError("planar wall collision proxy retained isotropic particle padding")
+    if wall_proxy.half_extent[0] < 1.4 or wall_proxy.half_extent[1] < 1.4:
+        raise AssertionError("sheet thickness cap damaged the in-plane wall extent")
 
     rigid = wp.ones(2, dtype=wp.int32, device=device)
     enabled = wp.ones(2, dtype=wp.int32, device=device)

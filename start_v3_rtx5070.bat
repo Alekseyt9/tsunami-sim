@@ -8,6 +8,7 @@ if not exist "%PYTHON_EXE%" (
 )
 echo DELUGE V3 HYBRID / RTX 5070
 echo Do not run concurrently with another GPU simulation.
-"%PYTHON_EXE%" deluge_v3.py --config config_v3_rtx5070.json
+echo Production preset: sustained surge reaching all three building rows.
+"%PYTHON_EXE%" deluge_v3.py --config config_v3_sustained_surge_30s.json
 if errorlevel 1 pause
 endlocal

@@ -1,0 +1,44 @@
+{
+  "extends": "../config_v3_rtx5070.json",
+  "output_basename": "environment_motion_validation",
+  "duration_seconds": 0.6,
+  "output_fps": 4,
+  "checkpoint_every_frames": 0,
+  "adaptive_refinement": false,
+  "max_particles": 400000,
+  "buildings": [],
+  "building_styles": [],
+  "building_palettes": [],
+  "environment": {
+    "enabled": true,
+    "cars": {
+      "count": 4,
+      "foreground_count": 4,
+      "foreground_z": -5.0,
+      "particle_spacing": 0.55
+    },
+    "trees": {
+      "count": 2,
+      "particle_spacing": 0.55
+    },
+    "small_buildings": {
+      "count": 1,
+      "front_z": 2.0,
+      "stagger_z": 0.0
+    }
+  },
+  "v3": {
+    "shallow_water": {
+      "enabled": false,
+      "replace_far_sph": false,
+      "emit_sph": false,
+      "merge_sph": false
+    }
+  },
+  "render": {
+    "width": 960,
+    "height": 540,
+    "view_width": 480,
+    "view_height": 270
+  }
+}

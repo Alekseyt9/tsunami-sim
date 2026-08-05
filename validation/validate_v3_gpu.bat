@@ -24,6 +24,7 @@ if not exist "%PYTHON_EXE%" (
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_refinement_crack_causality.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_fracture_checkpoint.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_shallow_water.py" || exit /b 1
+"%PYTHON_EXE%" "%VALIDATION_DIR%validate_interface_emission.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_shallow_return.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_wave_train.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_wave_train_reach.py" || exit /b 1
@@ -33,6 +34,10 @@ if not exist "%PYTHON_EXE%" (
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_water_mesh_bounds.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_mesh_hysteresis.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_city_styles.py" || exit /b 1
+"%PYTHON_EXE%" "%VALIDATION_DIR%validate_environment_fracture.py" || exit /b 1
+"%PYTHON_EXE%" "%VALIDATION_DIR%validate_temporal_water.py" || exit /b 1
+"%PYTHON_EXE%" "%VALIDATION_DIR%validate_taa.py" || exit /b 1
+"%PYTHON_EXE%" "%VALIDATION_DIR%validate_hdr_water_optics.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_crack_rendering.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_progressive_video.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_neighbor_optimizations.py" || exit /b 1

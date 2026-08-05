@@ -129,6 +129,7 @@ from simulation.shallow_water import (  # noqa: E402
     compact_vec3_particles,
     emit_sph_interface_particles,
     mark_sph_return_particles,
+    prepare_hysteretic_emission_quota,
     remap_particle_indices,
 )
 from kernels.surface import (  # noqa: E402
@@ -246,7 +247,8 @@ class HybridDelugeSolver(DelugeSolver):
         self.fragment_counts = wp.array(fragment_counts, dtype=wp.int32, device=self.device)
         self.fragment_count = len(fragment_counts)
         normal_host = build_refinement_axes(
-            rest_host, kind_host, building_host, float(cfg["solid_spacing"]), structural_class_host
+            rest_host, kind_host, building_host, float(cfg["solid_spacing"]),
+            structural_class_host, cfg,
         )
         normal_capacity = np.full(self.capacity, -1, dtype=np.int32)
         normal_capacity[:self.count] = normal_host
@@ -546,6 +548,7 @@ class HybridDelugeSolver(DelugeSolver):
         panel_count = write_facade_skin(
             skin_path, cfg, rest_host, kind_host, building_host, fragment_host,
             self.arrays["radius"][:self.count].numpy(), structural_class_host,
+            self.normal_axis[:self.count].numpy(),
         )
         render = cfg["render"]
         configured_views = render.get("views", {"original": render["camera"]})
@@ -563,6 +566,41 @@ class HybridDelugeSolver(DelugeSolver):
                 if bool(self.v3_cfg.get("crack_rendering", {}).get("enabled", True)) else 0.0,
                 float(self.v3_cfg.get("debris_skin", {}).get(
                     "architectural_overlay_tolerance", 0.9
+                )),
+                float(render.get("water_optics", {}).get("absorption_scale", 1.0)),
+                float(render.get("water_optics", {}).get("refraction_strength_pixels", 8.0)),
+                float(render.get("water_temporal", {}).get("history_weight", 0.78)),
+                float(render.get("water_temporal", {}).get("disocclusion_threshold_m", 0.75)),
+                float(render.get("foam", {}).get("strength", 0.72)),
+                float(render.get("atmosphere", {}).get("fog_density", 0.0016)),
+                float(render.get("atmosphere", {}).get("height_falloff_m", 52.0)),
+                float(render.get("atmosphere", {}).get("water_mist_strength", 2.2)),
+                float(render.get("taa", {}).get("history_weight", 0.86)),
+                bool(render.get("cascaded_shadows", {}).get("enabled", True)),
+                int(render.get("cascaded_shadows", {}).get("resolution", 512)),
+                tuple(render.get("cascaded_shadows", {}).get("splits_m", [90.0, 220.0, 480.0])),
+                float(render.get("cascaded_shadows", {}).get("strength", 0.78)),
+                hdr_enabled=bool(render.get("hdr", {}).get("enabled", True)),
+                physical_sky_enabled=bool(render.get("physical_sky", {}).get("enabled", True)),
+                hdr_exposure_ev=float(render.get("hdr", {}).get("exposure_ev", -0.35)),
+                bloom_threshold=float(render.get("hdr", {}).get("bloom_threshold", 1.15)),
+                bloom_strength=float(render.get("hdr", {}).get("bloom_strength", 0.11)),
+                sky_turbidity=float(render.get("physical_sky", {}).get("turbidity", 3.2)),
+                sky_intensity=float(render.get("physical_sky", {}).get("sky_intensity", 1.0)),
+                sun_direction=tuple(render.get("physical_sky", {}).get(
+                    "sun_direction", [-0.38, 0.82, -0.35]
+                )),
+                sun_intensity=float(render.get("physical_sky", {}).get("sun_intensity", 3.1)),
+                ibl_strength=float(render.get("physical_sky", {}).get("ibl_strength", 0.72)),
+                water_absorption=tuple(render.get("water_optics", {}).get(
+                    "absorption_rgb_per_m", [0.17, 0.045, 0.018]
+                )),
+                water_scattering=tuple(render.get("water_optics", {}).get(
+                    "scattering_rgb_per_m", [0.012, 0.032, 0.055]
+                )),
+                water_phase_g=float(render.get("water_optics", {}).get("phase_g", 0.35)),
+                water_maximum_optical_depth=float(render.get("water_optics", {}).get(
+                    "maximum_optical_depth_m", 18.0
                 )),
             )
             for name, camera in configured_views.items()
@@ -610,6 +648,7 @@ class HybridDelugeSolver(DelugeSolver):
             float(policy.get("same_level_tolerance", 0.75)),
             float(policy.get("maximum_lateral_transfer", 6.0)),
             float(policy.get("minimum_load_capacity_fraction", 0.55)),
+            previous_edge_intact=self.fragment_edge_intact_host,
         )
         self.fragment_support_host = support.astype(np.float32, copy=False)
         self.fragment_edge_intact_host = intact_edges
@@ -1929,6 +1968,12 @@ class HybridDelugeSolver(DelugeSolver):
             shallow_emission_residual_volume=(
                 self.shallow_water.emission_residual_volume.astype(np.float64, copy=False)
             ),
+            shallow_emission_positive_age=(
+                self.shallow_water.emission_positive_age.astype(np.float64, copy=False)
+            ),
+            shallow_return_flow_quiet_age=np.float64(
+                self.shallow_water.return_flow_quiet_age
+            ),
             shallow_merged_particles_total=np.int64(self.shallow_water.merged_particles_total),
             shallow_merged_volume_total=np.float64(self.shallow_water.merged_volume_total),
         )
@@ -2029,6 +2074,8 @@ class HybridDelugeSolver(DelugeSolver):
             radius = self.arrays["radius"][:self.count].numpy()
             material = self.arrays["material"][:self.count].numpy()
             particle_mass = self.arrays["mass"][:self.count].numpy()
+            structural_class = self.arrays["structural_class"][:self.count].numpy()
+            normal_axis = self.normal_axis[:self.count].numpy()
             minimum_particles = int(proxy_policy.get("minimum_particles", 12))
             for fid in np.flatnonzero(state != 0):
                 indices = np.flatnonzero(fragment == fid)
@@ -2037,6 +2084,8 @@ class HybridDelugeSolver(DelugeSolver):
                 proxy = fit_rigid_collision_proxy(
                     local[indices], radius[indices], material[indices], particle_mass[indices],
                     float(proxy_policy.get("padding_scale", 0.70)),
+                    normal_axis[indices], structural_class[indices],
+                    float(proxy_policy.get("maximum_sheet_thickness", 0.30)),
                 )
                 proxy_enabled[fid] = 1
                 proxy_local_center[fid] = proxy.local_center
@@ -2589,6 +2638,8 @@ class HybridDelugeSolver(DelugeSolver):
         mass = self.arrays["mass"][:self.count].numpy()
         radius = self.arrays["radius"][:self.count].numpy()
         material = self.arrays["material"][:self.count].numpy()
+        structural_class = self.arrays["structural_class"][:self.count].numpy()
+        normal_axis = self.normal_axis[:self.count].numpy()
         fully_damaged_threshold = float(policy.get("fully_damaged_threshold", 0.95))
         release_fraction = float(
             early_policy.get("release_damage_fraction", 0.30)
@@ -2711,6 +2762,8 @@ class HybridDelugeSolver(DelugeSolver):
                     material[indices],
                     mass[indices],
                     float(proxy_policy.get("padding_scale", 0.70)),
+                    normal_axis[indices], structural_class[indices],
+                    float(proxy_policy.get("maximum_sheet_thickness", 0.30)),
                 )
                 self.rigid_proxy_enabled_host[fid] = 1
                 self.rigid_proxy_local_center_host[fid] = proxy.local_center
@@ -4107,6 +4160,7 @@ class HybridDelugeSolver(DelugeSolver):
             )
         structural_role = self.arrays["structural_class"][:self.count].numpy()
         damage_values = self.arrays["damage"][:self.count].numpy()
+        rest_position_host = self.arrays["rest_x"][:self.count].numpy()
         impact_values = self.arrays["material_impact_impulse"][:self.count].numpy()
         local_impact_values = self.arrays["local_impact_active"][:self.count].numpy()
         result["local_impact_glass_particles"] = int(np.count_nonzero(
@@ -4115,6 +4169,48 @@ class HybridDelugeSolver(DelugeSolver):
         result["material_impact_impulse_max_m_s"] = float(
             np.max(impact_values[kind_host != 0]) if np.any(kind_host != 0) else 0.0
         )
+        for object_name, object_mask in (
+            ("cars", (building_host <= -1000) & (building_host > -2000)),
+            ("trees", (building_host <= -2000) & (building_host > -3000)),
+            ("small_buildings", (building_host <= -3000) & (building_host > -4000)),
+        ):
+            object_ids = np.unique(building_host[object_mask])
+            center_displacement: list[float] = []
+            maximum_particle_displacement = 0.0
+            damaged_objects = 0
+            for object_id in object_ids:
+                mask = (building_host == object_id) & (kind_host != 0)
+                weights = mass_host[mask].astype(np.float64, copy=False)
+                total_weight = max(float(np.sum(weights)), 1.0e-9)
+                current_center = np.sum(
+                    position_host[mask].astype(np.float64, copy=False) * weights[:, None], axis=0
+                ) / total_weight
+                rest_center = np.sum(
+                    rest_position_host[mask].astype(np.float64, copy=False) * weights[:, None], axis=0
+                ) / total_weight
+                center_displacement.append(float(np.linalg.norm(
+                    (current_center - rest_center)[[0, 2]]
+                )))
+                particle_horizontal = np.linalg.norm(
+                    (position_host[mask] - rest_position_host[mask])[:, [0, 2]], axis=1
+                )
+                maximum_particle_displacement = max(
+                    maximum_particle_displacement,
+                    float(np.max(particle_horizontal)) if len(particle_horizontal) else 0.0,
+                )
+                damaged_objects += int(np.any(damage_values[mask] > 0.25))
+            displacement = np.asarray(center_displacement, dtype=np.float64)
+            result[f"environment_{object_name}_count"] = int(len(object_ids))
+            result[f"environment_{object_name}_moved_count"] = int(
+                np.count_nonzero(displacement > 0.50)
+            )
+            result[f"environment_{object_name}_center_displacement_max_m"] = float(
+                np.max(displacement) if len(displacement) else 0.0
+            )
+            result[f"environment_{object_name}_particle_displacement_max_m"] = (
+                maximum_particle_displacement
+            )
+            result[f"environment_{object_name}_damaged_count"] = int(damaged_objects)
         material_host = self.arrays["material"][:self.count].numpy()
         self._update_fragment_support_graph(
             position_host, damage_values, material_host, structural_role
@@ -4194,10 +4290,11 @@ class HybridDelugeSolver(DelugeSolver):
         )
         particle_fragment = self.fragment_id[:self.count].numpy()
         valid_support_particle = (kind_host != 0) & (particle_fragment >= 0)
-        unsupported_particle = valid_support_particle.copy()
+        unsupported_particle = valid_support_particle & (building_host >= 0)
         unsupported_particle[valid_support_particle] = ~self.fragment_support_host[
             particle_fragment[valid_support_particle]
         ].astype(bool)
+        unsupported_particle &= building_host >= 0
         unsupported_volume = np.bincount(
             building_host[unsupported_particle],
             weights=volume_host[unsupported_particle].astype(np.float64, copy=False),
@@ -4487,27 +4584,50 @@ class HybridDelugeSolver(DelugeSolver):
             0.0, float(self.time) - float(self.shallow_water.last_emission_time)
         )
         self.shallow_water.last_emission_time = float(self.time)
-        quota_host = np.zeros(self.shallow_water.nx, dtype=np.int32)
+        quota_host = np.zeros(emitter_nx, dtype=np.int32)
         if flux_quota_enabled and emission_elapsed > 0.0:
-            particle_volume = spacing ** 3
-            positive_discharge = np.maximum(
-                interface_state[:, interface_iz, 2].astype(np.float64, copy=False),
-                0.0,
+            if self.shallow_water.last_frame_merged_volume > 0.0:
+                self.shallow_water.return_flow_quiet_age = 0.0
+            else:
+                self.shallow_water.return_flow_quiet_age += emission_elapsed
+            return_quiet_seconds = float(
+                policy.get("emission_return_quiet_seconds", 0.75)
             )
-            requested_volume = (
-                positive_discharge * self.shallow_water.cell_size * emission_elapsed
-                + self.shallow_water.emission_residual_volume
+            return_flow_clear = (
+                self.shallow_water.return_flow_quiet_age >= return_quiet_seconds
             )
-            quota_host = np.floor(requested_volume / particle_volume).astype(np.int32)
-            maximum_quota = int(policy.get("maximum_flux_quota_per_cell_frame", 0))
-            if maximum_quota > 0:
-                quota_host = np.minimum(quota_host, maximum_quota)
-            self.shallow_water.emission_residual_volume = (
-                requested_volume - quota_host.astype(np.float64) * particle_volume
-            )
-            self.shallow_water.flux_requested_particles_total += int(
-                np.sum(quota_host, dtype=np.int64)
-            )
+            if not return_flow_clear:
+                # Never convert water in both directions during the same
+                # interface episode.  Simultaneous SPH->shallow capture and
+                # shallow->SPH emission is the merge/re-emit chatter that made
+                # the late artificial wave.
+                self.shallow_water.emission_positive_age.fill(0.0)
+                self.shallow_water.emission_residual_volume.fill(0.0)
+            else:
+                (
+                    quota_host,
+                    self.shallow_water.emission_residual_volume,
+                    self.shallow_water.emission_positive_age,
+                    requested_particles,
+                ) = prepare_hysteretic_emission_quota(
+                    interface_state[:, interface_iz, :],
+                    cell_size=self.shallow_water.cell_size,
+                    emitter_spacing=spacing,
+                    emitter_nx=emitter_nx,
+                    elapsed=emission_elapsed,
+                    residual_volume=self.shallow_water.emission_residual_volume,
+                    positive_age=self.shallow_water.emission_positive_age,
+                    minimum_velocity=float(policy.get("minimum_emission_velocity", 0.25)),
+                    rearm_delay=float(policy.get("emission_rearm_delay_seconds", 0.35)),
+                    ramp_seconds=float(policy.get("emission_ramp_seconds", 0.65)),
+                    maximum_quota_per_cell=int(
+                        policy.get("maximum_flux_quota_per_cell_frame", 0)
+                    ),
+                    maximum_layers_per_frame=int(
+                        policy.get("maximum_emission_layers_per_frame", 3)
+                    ),
+                )
+                self.shallow_water.flux_requested_particles_total += requested_particles
         self.shallow_water.emission_quota = wp.array(
             quota_host, dtype=wp.int32, device=self.device
         )
@@ -4528,7 +4648,7 @@ class HybridDelugeSolver(DelugeSolver):
         self.grid.build(self.arrays["x"][:old_count], self.max_support)
         counter = wp.array(np.asarray([old_count], dtype=np.int32), dtype=wp.int32, device=self.device)
         wp.launch(
-            emit_sph_interface_particles, dim=(emitter_nx, emitter_ny),
+            emit_sph_interface_particles, dim=emitter_nx,
             inputs=[self.grid.id, self.arrays["x"], self.arrays["rest_x"], self.arrays["v"],
                     self.arrays["radius"], self.arrays["mass"], self.arrays["volume"],
                     self.arrays["kind"], self.arrays["material"], self.arrays["building_id"],
@@ -4810,6 +4930,7 @@ class HybridDelugeSolver(DelugeSolver):
 
     def _merge_sph_interface_particles(self):
         policy = self.v3_cfg.get("shallow_water", {})
+        self.shallow_water.last_frame_merged_volume = 0.0
         if not (
             bool(policy.get("enabled", False))
             and bool(policy.get("replace_far_sph", False))
@@ -4848,6 +4969,7 @@ class HybridDelugeSolver(DelugeSolver):
         if merged <= 0:
             return
         volume = float(merged_volume.numpy()[0])
+        self.shallow_water.last_frame_merged_volume = volume
         self._compact_particle_arrays(old_count)
         wp.synchronize_device(self.device)
         self.count = new_count

@@ -61,12 +61,27 @@
   "environment": {
     "enabled": true,
     "seed": 7319,
-    "cars": {"count": 30},
-    "trees": {"count": 24},
+    "cars": {
+      "count": 30,
+      "foreground_count": 12,
+      "foreground_z": -5.0,
+      "particle_spacing": 0.55
+    },
+    "trees": {
+      "count": 24,
+      "particle_spacing": 0.55
+    },
     "small_buildings": {
       "count": 6,
       "front_z": 2.0,
       "stagger_z": 0.8
+    },
+    "fracture": {
+      "enabled": true,
+      "minimum_fragment_particles": 6,
+      "car_cell_size": [1.55, 1.2, 1.4],
+      "tree_cell_size": [1.8, 2.0, 1.8],
+      "small_building_cell_size": [3.0, 2.4, 3.0]
     }
   },
   "v3": {
@@ -113,7 +128,10 @@
     "debris_skin": {
       "enabled": true,
       "cache": true,
-      "architectural_overlay_tolerance": 0.9
+      "architectural_overlay_tolerance": 0.9,
+      "wall_thickness": 0.18,
+      "glass_thickness": 0.10,
+      "slab_thickness": 0.24
     },
     "crack_rendering": {
       "enabled": true,
@@ -139,6 +157,11 @@
       "emit_sph": true,
       "emitter_spacing": 1.0,
       "minimum_emission_velocity": 0.25,
+      "flux_quota_enabled": true,
+      "emission_rearm_delay_seconds": 0.35,
+      "emission_ramp_seconds": 0.65,
+      "emission_return_quiet_seconds": 0.75,
+      "maximum_emission_layers_per_frame": 3,
       "merge_sph": true,
       "merge_buffer_depth": 3.0,
       "minimum_return_speed": 0.25,
@@ -173,13 +196,13 @@
       "update_every_frames": 1,
       "maximum_samples_per_edge": 12,
       "intact_damage_threshold": 0.95,
-      "maximum_bond_stretch": 1.6,
-      "minimum_intact_sample_fraction": 0.50,
+      "maximum_bond_stretch": 1.4,
+      "minimum_intact_sample_fraction": 0.60,
       "directed_gravity_paths": true,
       "maximum_downward_step": 0.75,
       "same_level_tolerance": 0.75,
-      "maximum_lateral_transfer": 6.0,
-      "minimum_load_capacity_fraction": 0.55
+      "maximum_lateral_transfer": 4.0,
+      "minimum_load_capacity_fraction": 0.65
     },
     "solid_refinement": {
       "enabled": true,
@@ -225,7 +248,7 @@
       "enabled": false
     },
     "fragment_clustering": {
-      "schema_version": 2,
+      "schema_version": 3,
       "enabled": true,
       "scan_every_frames": 8,
       "minimum_cluster_particles": 36,
@@ -328,6 +351,7 @@
         "bvh_refit_every_substeps": 16,
         "minimum_particles": 12,
         "padding_scale": 0.7,
+        "maximum_sheet_thickness": 0.30,
         "maximum_penetration": 0.12,
         "normal_damping_ratio": 0.9,
         "maximum_contact_acceleration": 45.0,
@@ -396,6 +420,84 @@
     "view_layout": "hero_insets",
     "quad_order": ["original", "front", "side", "top"],
     "maximum_panel_stretch": 1.8,
+    "pbr_materials": {
+      "enabled": true,
+      "wet_concrete": true,
+      "glass": true,
+      "painted_metal": true,
+      "wet_wood": true
+    },
+    "water_optics": {
+      "screen_space_reflections": true,
+      "screen_space_refraction": true,
+      "refraction_strength_pixels": 8.0,
+      "beer_lambert_absorption": true,
+      "absorption_scale": 1.0,
+      "absorption_rgb_per_m": [0.17, 0.045, 0.018],
+      "scattering_rgb_per_m": [0.012, 0.032, 0.055],
+      "phase_g": 0.35,
+      "maximum_optical_depth_m": 18.0
+    },
+    "hdr": {
+      "enabled": true,
+      "exposure_ev": -0.35,
+      "tone_mapper": "aces_fitted",
+      "bloom_threshold": 1.15,
+      "bloom_strength": 0.11
+    },
+    "physical_sky": {
+      "enabled": true,
+      "turbidity": 3.2,
+      "sky_intensity": 1.0,
+      "sun_direction": [-0.38, 0.82, -0.35],
+      "sun_intensity": 3.1,
+      "ibl_strength": 0.72
+    },
+    "water_temporal": {
+      "enabled": true,
+      "history_weight": 0.78,
+      "disocclusion_threshold_m": 0.75,
+      "foam_rejection": true
+    },
+    "gbuffer": {
+      "enabled": true,
+      "normal": true,
+      "material": true,
+      "roughness": true,
+      "metallic": true,
+      "motion_vectors": true
+    },
+    "taa": {
+      "enabled": true,
+      "history_weight": 0.86,
+      "neighbourhood_clipping": true,
+      "depth_disocclusion_rejection": true
+    },
+    "foam": {
+      "separate_surface_pass": true,
+      "strength": 0.72
+    },
+    "atmosphere": {
+      "volumetric_height_fog": true,
+      "fog_density": 0.0016,
+      "height_falloff_m": 52.0,
+      "water_mist": true,
+      "water_mist_strength": 2.2
+    },
+    "screen_space_lighting": {
+      "directional_shadows": true,
+      "contact_shadows": true,
+      "multi_scale_ambient_occlusion": true
+    },
+    "cascaded_shadows": {
+      "enabled": true,
+      "cascade_count": 3,
+      "resolution": 512,
+      "splits_m": [90.0, 220.0, 480.0],
+      "strength": 0.78,
+      "pcf": "3x3",
+      "texel_stabilization": true
+    },
     "camera": {"position": [145, 72, -105], "target": [0, 20, 48], "fov_degrees": 43},
     "views": {
       "original": {"position": [145, 72, -105], "target": [0, 20, 48], "fov_degrees": 43, "render_width": 1440, "render_height": 810},

@@ -24,13 +24,24 @@ def environment_layout(cfg: dict) -> dict[str, list[dict]]:
     seed = int(policy.get("seed", 7319))
     rng = np.random.default_rng(seed)
     cars = []
-    car_count = int(policy.get("cars", {}).get("count", 30))
+    car_policy = policy.get("cars", {})
+    car_count = int(car_policy.get("count", 30))
+    foreground_count = min(car_count, int(car_policy.get("foreground_count", 0)))
+    foreground_z = float(car_policy.get("foreground_z", -5.0))
     car_palette = (0, 1, 2, 3, 4, 5)
     for index in range(car_count):
-        road = index % 2
-        lane = (index // 2) % 2
-        z = (31.0 if road == 0 else 69.0) + lane * 6.0 + rng.uniform(-0.7, 0.7)
-        x = -62.0 + 124.0 * ((index // 4 + 0.5) / max(1, int(np.ceil(car_count / 4))))
+        if index < foreground_count:
+            lane = index % 2
+            lane_count = max(1, int(math.ceil(foreground_count / 2)))
+            z = foreground_z + lane * 2.7 + rng.uniform(-0.25, 0.25)
+            x = -62.0 + 124.0 * ((index // 2 + 0.5) / lane_count)
+        else:
+            local = index - foreground_count
+            road = local % 2
+            lane = (local // 2) % 2
+            z = (31.0 if road == 0 else 69.0) + lane * 6.0 + rng.uniform(-0.7, 0.7)
+            road_count = max(1, int(np.ceil((car_count - foreground_count) / 4)))
+            x = -62.0 + 124.0 * ((local // 4 + 0.5) / road_count)
         x += rng.uniform(-2.0, 2.0)
         cars.append({"id": -1000 - index, "center": (x, z), "palette": car_palette[index % 6]})
 
@@ -353,33 +364,74 @@ class ParticleScene:
                         1, 1, -9000, 1, STRUCT_SLAB)
             counts["ground_anchors"] += 1
 
+        car_spacing = float(cfg.get("environment", {}).get("cars", {}).get(
+            "particle_spacing", 0.55
+        ))
         for car in layout["cars"]:
             cx, cz = car["center"]
-            for dx in (-1.5, 0.0, 1.5):
-                for dy in (0.45, 1.15):
-                    for dz in (-0.58, 0.58):
-                        self.append(
-                            (cx + dx, dy, cz + dz), (0.0, 0.0, 0.0), 0.48,
-                            125.0, 0.60, 1, 3, int(car["id"]), 0, STRUCT_WALL,
-                        )
-                        counts["cars"] += 1
+            samples: dict[tuple[int, int, int], tuple[np.ndarray, int, int]] = {}
 
+            def car_sample(dx: float, y: float, dz: float, material: int, role: int) -> None:
+                key = tuple(np.rint(np.asarray((dx, y, dz)) * 1000.0).astype(np.int32))
+                samples[key] = (np.asarray((cx + dx, y, cz + dz), dtype=np.float32), material, role)
+
+            # Chassis, sill and outer panels form a connected but breakable
+            # lattice.  The previous twelve samples could only behave like
+            # one soft box and had no useful local crumple zones.
+            for dx in np.arange(-1.9, 1.91, car_spacing):
+                for dz in (-0.68, 0.0, 0.68):
+                    car_sample(float(dx), 0.38, dz, 3, STRUCT_BEAM)
+                for y in (0.68, 1.02):
+                    for dz in (-0.78, 0.78):
+                        car_sample(float(dx), y, dz, 3, STRUCT_WALL)
+            for dx in np.arange(-1.05, 1.06, car_spacing):
+                for y in (1.30, 1.58):
+                    for dz in (-0.58, 0.58):
+                        car_sample(float(dx), y, dz, 2, STRUCT_GLASS if y < 1.5 else STRUCT_WALL)
+            for dx in (-1.38, 1.38):
+                for dz in (-0.94, 0.94):
+                    car_sample(dx, 0.34, dz, 3, STRUCT_BEAM)
+            sample_mass = 1500.0 / max(len(samples), 1)
+            sample_volume = 6.0 / max(len(samples), 1)
+            for position, material, role in samples.values():
+                self.append(
+                    tuple(position), (0.0, 0.0, 0.0), car_spacing * 0.47,
+                    sample_mass, sample_volume, 1, material, int(car["id"]), 0, role,
+                )
+                counts["cars"] += 1
+
+        tree_spacing = float(cfg.get("environment", {}).get("trees", {}).get(
+            "particle_spacing", 0.55
+        ))
         for tree in layout["trees"]:
             cx, cz = tree["center"]
             height = float(tree["height"])
-            trunk_levels = np.arange(0.4, height - 0.6, 0.8)
+            trunk_levels = np.arange(0.32, height - 0.7, tree_spacing)
+            trunk_samples_per_level = 5
+            trunk_mass = 560.0 / max(len(trunk_levels) * trunk_samples_per_level, 1)
             for level, y in enumerate(trunk_levels):
-                self.append(
-                    (cx, float(y), cz), (0.0, 0.0, 0.0), 0.36,
-                    72.0, 0.14, 1, 1, int(tree["id"]), int(level == 0), STRUCT_COLUMN,
-                )
-                counts["trees"] += 1
+                for dx, dz in ((0.0, 0.0), (-0.18, 0.0), (0.18, 0.0),
+                               (0.0, -0.18), (0.0, 0.18)):
+                    self.append(
+                        (cx + dx, float(y), cz + dz), (0.0, 0.0, 0.0), 0.22,
+                        trunk_mass, 0.025, 1, 5, int(tree["id"]), int(level == 0),
+                        STRUCT_COLUMN,
+                    )
+                    counts["trees"] += 1
             crown_y = height - 0.2
-            for dx, dy, dz in ((0, 0, 0), (-0.8, 0, 0), (0.8, 0, 0),
-                               (0, 0.55, -0.65), (0, 0.55, 0.65)):
+            crown_offsets = [
+                (dx, dy, dz)
+                for dx in (-0.85, 0.0, 0.85)
+                for dy in (-0.45, 0.25)
+                for dz in (-0.65, 0.0, 0.65)
+                if abs(dx) + abs(dz) > 0.1 or dy > 0.0
+            ]
+            crown_mass = 210.0 / max(len(crown_offsets), 1)
+            for dx, dy, dz in crown_offsets:
                 self.append(
                     (cx + dx, crown_y + dy, cz + dz), (0.0, 0.0, 0.0), 0.82,
-                    42.0, 0.75, 1, 1, int(tree["id"]), 0, STRUCT_WALL,
+                    crown_mass, 4.2 / max(len(crown_offsets), 1), 1, 5,
+                    int(tree["id"]), 0, STRUCT_WALL,
                 )
                 counts["trees"] += 1
 
@@ -407,7 +459,7 @@ class ParticleScene:
                 y = gy * spacing
                 self.append(
                     (cx + gx * spacing, y, cz + gz * spacing), (0.0, 0.0, 0.0),
-                    spacing * 0.48, 850.0 * volume, volume, 1, 1,
+                    spacing * 0.48, 850.0 * volume, volume, 1, 4,
                     int(shop["id"]), int(gy == 0), STRUCT_WALL if gy != roof_y else STRUCT_SLAB,
                 )
                 counts["small_buildings"] += 1

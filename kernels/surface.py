@@ -218,6 +218,7 @@ def raster_anisotropic_water_depth(
     particle_foam: wp.array(dtype=float),
     water_phase: wp.array(dtype=wp.int32),
     depth: wp.array(dtype=float),
+    back_depth: wp.array(dtype=float),
     foam_field: wp.array(dtype=float),
     cam: wp.vec3,
     right: wp.vec3,
@@ -277,8 +278,10 @@ def raster_anisotropic_water_depth(
             px = cx + ox; py = cy + oy
             if px >= 0 and px < width and py >= 0 and py < height and ellipse <= 1.0:
                 surface_depth = p[2] - radius[i] * normal_scale * wp.sqrt(wp.max(0.0, 1.0 - ellipse))
+                rear_depth = p[2] + radius[i] * normal_scale * wp.sqrt(wp.max(0.0, 1.0 - ellipse))
                 index = py * width + px
                 wp.atomic_min(depth, index, surface_depth)
+                wp.atomic_max(back_depth, index, rear_depth)
                 wp.atomic_max(foam_field, index, foam)
 
 
@@ -377,6 +380,7 @@ def raster_water_mesh_depth(
     vertex: wp.array(dtype=wp.vec3),
     index: wp.array(dtype=wp.int32),
     depth: wp.array(dtype=float),
+    back_depth: wp.array(dtype=float),
     cam: wp.vec3,
     right: wp.vec3,
     up: wp.vec3,
@@ -413,7 +417,9 @@ def raster_water_mesh_depth(
             w2 = 1.0 - w0 - w1
             if w0 >= 0.0 and w1 >= 0.0 and w2 >= 0.0:
                 z = w0 * a[2] + w1 * b[2] + w2 * c[2]
-                wp.atomic_min(depth, py * width + px, z)
+                pixel = py * width + px
+                wp.atomic_min(depth, pixel, z)
+                wp.atomic_max(back_depth, pixel, z)
 
 
 @wp.kernel
