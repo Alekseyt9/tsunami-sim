@@ -4,6 +4,12 @@ DELUGE V3 is an offline CUDA simulation of a large tsunami hitting a destructibl
 
 ![DELUGE V3 four-camera simulation](assets/deluge_v3_quad.jpg)
 
+## Latest simulation video
+
+[![Watch the latest 27-second DELUGE V3 simulation](assets/deluge_v3_quad.jpg)](assets/deluge_v3_sph_only_shoreline_27s.mp4)
+
+[Watch or download the 1920x1080 H.264 MP4](assets/deluge_v3_sph_only_shoreline_27s.mp4). This run uses four synchronized camera views, an SPH-only shoreline aligned with the land boundary, intermediate water viscosity, foam/mist spray rendering, destructible glazing, and structural debris.
+
 The project targets an NVIDIA RTX 5070 with 12 GB of VRAM. It prioritizes physical state, reproducibility, and high-quality offline output over real-time playback.
 
 ## Main features
