@@ -6,7 +6,19 @@ DELUGE V3 is an offline CUDA simulation of a large tsunami hitting a destructibl
 
 ## Latest simulation video
 
-[![Watch the latest 27-second DELUGE V3 simulation](assets/deluge_v3_quad.jpg)](assets/deluge_v3_sph_only_shoreline_27s.mp4)
+### Animated previews
+
+#### Wave approach
+
+![Tsunami wave approaching the city](assets/previews/01_wave_approach.gif)
+
+#### Main impact
+
+![Main tsunami impact and initial structural failure](assets/previews/02_main_impact.gif)
+
+#### City destruction
+
+![Late-stage flooding and city destruction](assets/previews/03_city_destruction.gif)
 
 [Watch or download the 1920x1080 H.264 MP4](assets/deluge_v3_sph_only_shoreline_27s.mp4). This run uses four synchronized camera views, an SPH-only shoreline aligned with the land boundary, intermediate water viscosity, foam/mist spray rendering, destructible glazing, and structural debris.
 
