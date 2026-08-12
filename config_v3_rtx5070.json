@@ -152,9 +152,12 @@
       "dry_depth": 0.02,
       "render_far_surface": false,
       "stitch_surface": true,
+      "stitch_overlap_m": 2.0,
+      "render_bed_height": 0.0,
       "surface_sample_spacing": 0.65,
       "minimum_stitch_height": 4.0,
       "maximum_stitch_height_delta": 6.0,
+      "maximum_stitch_height": 48.0,
       "emit_sph": true,
       "emitter_spacing": 1.0,
       "minimum_emission_velocity": 0.25,
@@ -436,6 +439,18 @@
       "painted_metal": true,
       "wet_wood": true
     },
+    "glass_shards": {
+      "enabled": true,
+      "shatter_damage": 0.42,
+      "shards_per_panel": 4,
+      "spawn_fraction": 0.62,
+      "minimum_lifetime_seconds": 1.4,
+      "maximum_lifetime_seconds": 3.2,
+      "ejection_speed_mps": 2.2,
+      "size_scale": 0.065,
+      "fixed_capacity": true,
+      "physical_large_fragments": true
+    },
     "water_optics": {
       "screen_space_reflections": true,
       "screen_space_refraction": true,
@@ -458,7 +473,7 @@
       "enabled": true,
       "turbidity": 3.2,
       "sky_intensity": 1.0,
-      "sun_direction": [-0.38, 0.82, -0.35],
+      "sun_direction": [-0.12, 0.60, -0.79],
       "sun_intensity": 3.1,
       "ibl_strength": 0.72
     },
@@ -486,6 +501,11 @@
       "separate_surface_pass": true,
       "strength": 0.72
     },
+    "spray": {
+      "ballistic_droplets_as_mist": true,
+      "refractive_droplet_geometry": false,
+      "preserve_physical_particles": true
+    },
     "atmosphere": {
       "volumetric_height_fog": true,
       "fog_density": 0.0016,
@@ -503,7 +523,7 @@
       "cascade_count": 4,
       "resolution": 2048,
       "splits_m": [70.0, 150.0, 300.0, 520.0],
-      "strength": 0.78,
+      "strength": 0.90,
       "pcf": "5x5",
       "texel_stabilization": true
     },

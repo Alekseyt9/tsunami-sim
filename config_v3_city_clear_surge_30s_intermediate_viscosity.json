@@ -1,0 +1,9 @@
+{
+  "extends": "config_v3_city_clear_surge_30s_x1_7.json",
+  "output_basename": "deluge_v3_city_clear_surge_x1_7_viscosity_0008",
+  "duration_seconds": 30.0,
+  "output_fps": 24,
+  "checkpoint_every_frames": 24,
+  "viscosity": 0.008,
+  "xsph_strength": 0.035
+}

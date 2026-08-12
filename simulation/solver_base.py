@@ -394,6 +394,7 @@ class DelugeSolver:
                                   "water_mesh_excluded_surface_particles",
                                   "water_mesh_voxel_millimeters", "water_mesh_lod_changes",
                                   "water_splash_bricks", "water_splash_mesh_vertices",
+                                  "water_far_mesh_vertices",
                                   "water_stitch_surface_samples", "shallow_water_cells",
                                   "shallow_water_wet_cells", "shallow_emitted_particles",
                                   "shallow_emission_rearmed_cells",
@@ -462,7 +463,7 @@ class DelugeSolver:
                 elif isinstance(value, (float, np.floating)):
                     row[key] = float(value)
             benchmark_rows.append(row)
-            with metrics_path.open("a", encoding="utf-8") as metrics_file:
+            with metrics_path.open("a", encoding="utf-8", newline="\n") as metrics_file:
                 # Strict JSONL: exactly one compact JSON object and one LF per
                 # output frame. Editors may visually wrap this long logical
                 # line, but the file never contains embedded formatting lines.

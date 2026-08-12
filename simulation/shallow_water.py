@@ -632,16 +632,17 @@ class ShallowWaterFarField:
         wave_speed = float(cfg["wave_speed"])
         background = float(cfg.get("background_current", 0.0))
         reservoir_front = float(cfg["reservoir_z_max"])
-        for iz in range(self.nz):
-            z = self.lower_z + (iz + 0.5) * self.cell_size
-            if z >= reservoir_front:
-                continue
-            elevation = crest * math.exp(-((z - reservoir_front + 5.0) / 7.5) ** 2)
-            h = depth + elevation
-            velocity_z = background + wave_speed * elevation / max(h, 1.0e-6)
-            host[:, iz, 0] = h
-            host[:, iz, 2] = h * velocity_z
-        if checkpoint is not None and checkpoint.exists():
+        if self.enabled:
+            for iz in range(self.nz):
+                z = self.lower_z + (iz + 0.5) * self.cell_size
+                if z >= reservoir_front:
+                    continue
+                elevation = crest * math.exp(-((z - reservoir_front + 5.0) / 7.5) ** 2)
+                h = depth + elevation
+                velocity_z = background + wave_speed * elevation / max(h, 1.0e-6)
+                host[:, iz, 0] = h
+                host[:, iz, 2] = h * velocity_z
+        if self.enabled and checkpoint is not None and checkpoint.exists():
             with np.load(checkpoint, allow_pickle=False) as saved:
                 if "shallow_water_state" in saved and saved["shallow_water_state"].shape == host.shape:
                     host = saved["shallow_water_state"].astype(np.float32, copy=True)
@@ -910,29 +911,74 @@ class ShallowWaterFarField:
         )
 
     def surface_mesh(self):
-        """Return the visible rear-field free surface up to the SPH overlap."""
+        """Return a closed rear-field water volume up to the SPH overlap.
+
+        A height-field top alone has no optical thickness, while feeding the
+        complete rear field to Marching Cubes produces a thin floating shell.
+        Top, bed and perimeter faces give the renderer a meaningful front/back
+        depth pair. The short overlap is hidden by the transition field.
+        """
         if not self.enabled or not bool(self.cfg.get("render_far_surface", True)):
             return None, None
         height = self.state.numpy()[:, :, 0]
+        coupling_width = float(self.cfg.get("coupling_width", 4.0))
+        transition_start = self.interface_z - coupling_width
         visible_nz = min(
             self.nz,
-            max(2, int(math.ceil((self.interface_z - self.lower_z) / self.cell_size)) + 2),
+            max(
+                2,
+                int(math.ceil((transition_start - self.lower_z) / self.cell_size)) + 1,
+            ),
         )
-        vertices = np.empty((self.nx * visible_nz, 3), dtype=np.float32)
+        surface_count = self.nx * visible_nz
+        vertices = np.empty((surface_count * 2, 3), dtype=np.float32)
+        bed_height = float(self.cfg.get("render_bed_height", 0.0))
         for ix in range(self.nx):
             for iz in range(visible_nz):
                 index = ix * visible_nz + iz
+                x = self.lower_x + (ix + 0.5) * self.cell_size
+                z = self.lower_z + (iz + 0.5) * self.cell_size
                 vertices[index] = (
-                    self.lower_x + (ix + 0.5) * self.cell_size,
-                    height[ix, iz],
-                    self.lower_z + (iz + 0.5) * self.cell_size,
+                    x,
+                    max(float(height[ix, iz]), bed_height),
+                    z,
                 )
-        triangles = []
+                vertices[surface_count + index] = (
+                    x,
+                    bed_height,
+                    z,
+                )
+        triangles: list[int] = []
         for ix in range(self.nx - 1):
             for iz in range(visible_nz - 1):
                 a = ix * visible_nz + iz
                 b = (ix + 1) * visible_nz + iz
-                triangles.extend((a, b, a + 1, b, b + 1, a + 1))
+                c = a + 1
+                d = b + 1
+                triangles.extend((a, b, c, b, d, c))
+                ba = surface_count + a
+                bb = surface_count + b
+                bc = surface_count + c
+                bd = surface_count + d
+                triangles.extend((ba, bc, bb, bb, bc, bd))
+
+        def append_side(a: int, b: int) -> None:
+            ba = surface_count + a
+            bb = surface_count + b
+            triangles.extend((a, ba, b, b, ba, bb))
+
+        for ix in range(self.nx - 1):
+            append_side(ix * visible_nz, (ix + 1) * visible_nz)
+            append_side(
+                ix * visible_nz + visible_nz - 1,
+                (ix + 1) * visible_nz + visible_nz - 1,
+            )
+        for iz in range(visible_nz - 1):
+            append_side(iz, iz + 1)
+            append_side(
+                (self.nx - 1) * visible_nz + iz,
+                (self.nx - 1) * visible_nz + iz + 1,
+            )
         return vertices, np.asarray(triangles, dtype=np.int32)
 
     def stitched_surface_samples(self, sph_surface_positions: np.ndarray):
@@ -955,8 +1001,13 @@ class ShallowWaterFarField:
             spacing,
             dtype=np.float32,
         )
+        transition_start = self.interface_z - coupling_width
+        overlap = max(
+            spacing,
+            float(self.cfg.get("stitch_overlap_m", max(self.cell_size, 2.0 * spacing))),
+        )
         zs = np.arange(
-            self.lower_z + 0.5 * spacing,
+            max(self.lower_z + 0.5 * spacing, transition_start - overlap),
             upper_z + 0.25 * spacing,
             spacing,
             dtype=np.float32,
@@ -968,6 +1019,7 @@ class ShallowWaterFarField:
         target = heights[ix, interface_iz].astype(np.float32, copy=True)
 
         sph = np.asarray(sph_surface_positions, dtype=np.float32)
+        has_sph_target = False
         if len(sph):
             band = (
                 (sph[:, 2] >= self.interface_z)
@@ -992,13 +1044,22 @@ class ShallowWaterFarField:
                     target = np.interp(
                         np.arange(len(xs), dtype=np.float32), known.astype(np.float32), target[known]
                     ).astype(np.float32)
-        base_at_interface = heights[ix, interface_iz]
-        maximum_delta = float(self.cfg.get("maximum_stitch_height_delta", 6.0))
-        target = np.clip(target, base_at_interface - maximum_delta, base_at_interface + maximum_delta)
+                    has_sph_target = True
+        if has_sph_target and len(target) >= 3:
+            # Suppress individual-particle peaks without moving the interface
+            # back toward the (potentially much taller) shallow column.
+            padded = np.pad(target, (1, 1), mode="edge")
+            target = (
+                0.25 * padded[:-2] + 0.50 * padded[1:-1] + 0.25 * padded[2:]
+            ).astype(np.float32)
+        target = np.clip(
+            target,
+            float(self.cfg.get("render_bed_height", 0.0)),
+            float(self.cfg.get("maximum_stitch_height", 48.0)),
+        )
 
         samples = np.empty((len(xs) * len(zs), 3), dtype=np.float32)
         cursor = 0
-        transition_start = self.interface_z - coupling_width
         transition_span = max(2.0 * coupling_width, 1.0e-5)
         for z in zs:
             iz = int(np.clip((z - self.lower_z) / self.cell_size, 0, self.nz - 1))
@@ -1015,6 +1076,45 @@ class ShallowWaterFarField:
         return samples, radius
 
     def diagnostics(self):
+        if not self.enabled:
+            result = {
+                "shallow_water_cells": 0,
+                "shallow_water_wet_cells": 0,
+                "shallow_water_volume_m3": 0.0,
+                "shallow_water_momentum_z": 0.0,
+                "shallow_emitted_particles": 0,
+                "shallow_emitted_volume_m3": 0.0,
+                "shallow_flux_requested_particles": 0,
+                "shallow_flux_emitted_particles": 0,
+                "shallow_flux_emission_efficiency": 0.0,
+                "shallow_emission_rearmed_cells": 0,
+                "shallow_emission_blocked_cells": 0,
+                "shallow_returning_cells": 0,
+                "shallow_return_flow_quiet_age_s": 0.0,
+                "shallow_merged_particles": 0,
+                "shallow_merged_volume_m3": 0.0,
+                "shallow_net_transfer_volume_m3": 0.0,
+                "wave_train_injected_volume_m3": 0.0,
+                "wave_train_injected_momentum_z": 0.0,
+                "shallow_downstream_outflow_volume_m3": 0.0,
+                "shallow_downstream_outflow_momentum_z": 0.0,
+                "coupling_incoming_boundary_impulse_kg_m_s": 0.0,
+                "wave_cohort_emitted_volume_m3": 0.0,
+                "wave_cohort_emitted_momentum_z_kg_m_s": 0.0,
+                "wave_cohort_returned_volume_m3": 0.0,
+                "wave_cohort_returned_momentum_z_kg_m_s": 0.0,
+            }
+            for row_index, row_z in enumerate(self.probe_rows_m, start=1):
+                prefix = f"wave_row_{row_index}"
+                result[f"{prefix}_z_m"] = row_z
+                result[f"{prefix}_depth_mean_m"] = 0.0
+                result[f"{prefix}_depth_max_m"] = 0.0
+                result[f"{prefix}_velocity_mean_m_s"] = 0.0
+                result[f"{prefix}_velocity_max_m_s"] = 0.0
+                result[f"{prefix}_forward_discharge_m3_s"] = 0.0
+                result[f"{prefix}_reverse_discharge_m3_s"] = 0.0
+                result[f"{prefix}_specific_momentum_flux_m4_s2"] = 0.0
+            return result
         host = self.state.numpy()
         area = self.cell_size * self.cell_size
         result = {

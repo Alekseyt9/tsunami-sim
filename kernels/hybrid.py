@@ -4092,13 +4092,69 @@ def facade_triangle_torn(
     return wp.max(ab, wp.max(bc, ca)) > maximum_stretch
 
 
+@wp.func
+def facade_hash01(panel: int, salt: int) -> float:
+    value = wp.sin(float(panel * 37 + salt * 101) * 12.9898) * 43758.5453
+    return value - wp.floor(value)
+
+
+@wp.func
+def facade_glass_coverage(panel: int, uv: wp.vec2, damage: float) -> float:
+    """Binary pane coverage shared by depth, colour and shadow passes.
+
+    Glass first develops hairline cracks, then loses irregular cells around a
+    deterministic impact point.  Keeping this binary and identical in every
+    raster pass is important: colour-only holes looked painted on, while a
+    solid depth/shadow pane continued to hide the apartment behind it.
+    """
+    if damage < 0.34:
+        return 1.0
+    severity = wp.clamp((damage - 0.34) / 0.58, 0.0, 1.0)
+    impact = wp.vec2(
+        0.30 + 0.40 * facade_hash01(panel, 301),
+        0.30 + 0.40 * facade_hash01(panel, 307),
+    )
+    delta = uv - impact
+    radial = wp.length(delta)
+    angle = wp.atan2(delta[1], delta[0])
+    jagged_radius = (0.055 + severity * 0.72) * (
+        0.80 + 0.16 * wp.sin(angle * 7.0 + facade_hash01(panel, 311) * 6.2831853)
+    )
+
+    # Coarse Voronoi-like cells make the missing area advance in fragments,
+    # instead of opening as an implausibly smooth circular alpha mask.
+    cell_x = int(wp.floor(uv[0] * 9.0))
+    cell_y = int(wp.floor(uv[1] * 11.0))
+    cell = cell_y * 9 + cell_x
+    cell_random = facade_hash01(panel, 331 + cell)
+    missing = radial < jagged_radius and cell_random < 0.18 + severity * 0.78
+
+    # Leave a thin irregular rim and a few radial slivers at high damage.  The
+    # pane therefore crumbles out of its frame rather than vanishing in one
+    # frame, while the recessed interior becomes genuinely visible.
+    edge_distance = wp.min(wp.min(uv[0], 1.0 - uv[0]), wp.min(uv[1], 1.0 - uv[1]))
+    rim_width = 0.018 + 0.026 * facade_hash01(panel, 347)
+    if edge_distance < rim_width:
+        missing = False
+    ray_phase = facade_hash01(panel, 353) * 6.2831853
+    ray = wp.abs(wp.sin(angle * 5.0 + ray_phase))
+    if ray < 0.035 * (1.0 - severity * 0.55):
+        missing = False
+    if missing:
+        return 0.0
+    return 1.0
+
+
 @wp.kernel
 def raster_facade_depth(
     vertex: wp.array(dtype=wp.vec3),
     rest_vertex: wp.array(dtype=wp.vec3),
+    anchor: wp.array(dtype=wp.int32),
+    material: wp.array(dtype=wp.int32),
     panel_mode: wp.array(dtype=wp.int32),
     owner_fragment: wp.array(dtype=wp.int32),
     fragment_support: wp.array(dtype=float),
+    particle_damage: wp.array(dtype=float),
     depth: wp.array(dtype=float),
     cam: wp.vec3,
     right: wp.vec3,
@@ -4134,6 +4190,31 @@ def raster_facade_depth(
     area = edge2(a, b, c[0], c[1])
     if wp.abs(area) < 1.0e-6:
         return
+    family = material[panel] // 10
+    glass_damage = 0.0
+    rest_origin = wp.vec3(0.0, 0.0, 0.0)
+    rest_u = wp.vec3(1.0, 0.0, 0.0)
+    rest_v = wp.vec3(0.0, 1.0, 0.0)
+    rest_u_length2 = 1.0
+    rest_v_length2 = 1.0
+    if family == 2 and panel_mode[panel] == 0:
+        anchor_base = panel * 4
+        glass_damage = wp.max(
+            particle_damage[anchor[anchor_base]],
+            wp.max(
+                particle_damage[anchor[anchor_base + 1]],
+                wp.max(
+                    particle_damage[anchor[anchor_base + 2]],
+                    particle_damage[anchor[anchor_base + 3]],
+                ),
+            ),
+        )
+        panel_vertex = panel * 4
+        rest_origin = rest_vertex[panel_vertex]
+        rest_u = rest_vertex[panel_vertex + 3] - rest_origin
+        rest_v = rest_vertex[panel_vertex + 1] - rest_origin
+        rest_u_length2 = wp.max(wp.dot(rest_u, rest_u), 1.0e-8)
+        rest_v_length2 = wp.max(wp.dot(rest_v, rest_v), 1.0e-8)
     for py in range(min_y, max_y + 1):
         for px in range(min_x, max_x + 1):
             fx = float(px) + 0.5; fy = float(py) + 0.5
@@ -4141,6 +4222,15 @@ def raster_facade_depth(
             w1 = edge2(c, a, fx, fy) / area
             w2 = 1.0 - w0 - w1
             if w0 >= 0.0 and w1 >= 0.0 and w2 >= 0.0:
+                if family == 2 and panel_mode[panel] == 0:
+                    rest_point = rest_vertex[ids[0]] * w0 + rest_vertex[ids[1]] * w1 + rest_vertex[ids[2]] * w2
+                    relative = rest_point - rest_origin
+                    uv = wp.vec2(
+                        wp.dot(relative, rest_u) / rest_u_length2,
+                        wp.dot(relative, rest_v) / rest_v_length2,
+                    )
+                    if facade_glass_coverage(panel, uv, glass_damage) < 0.5:
+                        continue
                 z = w0 * a[2] + w1 * b[2] + w2 * c[2]
                 wp.atomic_min(depth, py * width + px, z)
 
@@ -4166,10 +4256,12 @@ def project_orthographic_shadow(
 def raster_facade_shadow_depth(
     vertex: wp.array(dtype=wp.vec3),
     rest_vertex: wp.array(dtype=wp.vec3),
+    anchor: wp.array(dtype=wp.int32),
     material: wp.array(dtype=wp.int32),
     panel_mode: wp.array(dtype=wp.int32),
     owner_fragment: wp.array(dtype=wp.int32),
     fragment_support: wp.array(dtype=float),
+    particle_damage: wp.array(dtype=float),
     shadow_depth: wp.array(dtype=float),
     shadow_offset: int,
     light_origin: wp.vec3,
@@ -4183,7 +4275,13 @@ def raster_facade_shadow_depth(
     triangle = wp.tid()
     panel = triangle // 2
     family = material[panel] // 10
-    if family == 2 or family == 8:
+    # Tinted facade glass still blocks most direct sunlight at building scale.
+    # Omitting it made window-heavy towers almost disappear from the shadow
+    # map, leaving neighbouring facades and streets uniformly illuminated.
+    # Terrain/asphalt is a receiver. Putting the same broad plane into the
+    # shadow map makes neighbouring PCF texels self-occlude and merely darkens
+    # the complete street instead of drawing building silhouettes on it.
+    if family == 8 or family == 9:
         return
     if panel_mode[panel] != 0:
         owner = owner_fragment[panel]
@@ -4218,6 +4316,30 @@ def raster_facade_shadow_depth(
     area = edge2(a, b, c[0], c[1])
     if wp.abs(area) < 1.0e-6:
         return
+    glass_damage = 0.0
+    rest_origin = wp.vec3(0.0, 0.0, 0.0)
+    rest_u = wp.vec3(1.0, 0.0, 0.0)
+    rest_v = wp.vec3(0.0, 1.0, 0.0)
+    rest_u_length2 = 1.0
+    rest_v_length2 = 1.0
+    if family == 2 and panel_mode[panel] == 0:
+        anchor_base = panel * 4
+        glass_damage = wp.max(
+            particle_damage[anchor[anchor_base]],
+            wp.max(
+                particle_damage[anchor[anchor_base + 1]],
+                wp.max(
+                    particle_damage[anchor[anchor_base + 2]],
+                    particle_damage[anchor[anchor_base + 3]],
+                ),
+            ),
+        )
+        panel_vertex = panel * 4
+        rest_origin = rest_vertex[panel_vertex]
+        rest_u = rest_vertex[panel_vertex + 3] - rest_origin
+        rest_v = rest_vertex[panel_vertex + 1] - rest_origin
+        rest_u_length2 = wp.max(wp.dot(rest_u, rest_u), 1.0e-8)
+        rest_v_length2 = wp.max(wp.dot(rest_v, rest_v), 1.0e-8)
     for py in range(min_y, max_y + 1):
         for px in range(min_x, max_x + 1):
             fx = float(px) + 0.5; fy = float(py) + 0.5
@@ -4225,6 +4347,15 @@ def raster_facade_shadow_depth(
             w1 = edge2(c, a, fx, fy) / area
             w2 = 1.0 - w0 - w1
             if w0 >= 0.0 and w1 >= 0.0 and w2 >= 0.0:
+                if family == 2 and panel_mode[panel] == 0:
+                    rest_point = rest_vertex[ids[0]] * w0 + rest_vertex[ids[1]] * w1 + rest_vertex[ids[2]] * w2
+                    relative = rest_point - rest_origin
+                    uv = wp.vec2(
+                        wp.dot(relative, rest_u) / rest_u_length2,
+                        wp.dot(relative, rest_v) / rest_v_length2,
+                    )
+                    if facade_glass_coverage(panel, uv, glass_damage) < 0.5:
+                        continue
                 z = w0 * a[2] + w1 * b[2] + w2 * c[2]
                 wp.atomic_min(shadow_depth, shadow_offset + py * resolution + px, z)
 
@@ -4276,7 +4407,14 @@ def apply_cascaded_shadow_maps(
     normal = wp.normalize(gbuffer_normal[i])
     sun_direction = wp.normalize(sun_direction_input)
     normal_light = wp.clamp(wp.dot(normal, sun_direction), 0.0, 1.0)
-    bias = 0.12 + (1.0 - normal_light) * 0.32
+    texel_world = (
+        2.0 * wp.max(half_extents[cascade][0], half_extents[cascade][1])
+        / float(shadow_resolution)
+    )
+    # Receiver-plane/slope bias must grow with cascade texel size and the 5x5
+    # PCF footprint. A constant bias caused broad roads and vertical facades to
+    # shadow themselves uniformly, hiding the actual cast-shadow silhouette.
+    bias = 0.07 + texel_world * (2.2 + 2.8 * (1.0 - normal_light))
     occluded = float(0.0)
     samples = int(0)
     offset = cascade * shadow_resolution * shadow_resolution
@@ -4291,7 +4429,7 @@ def apply_cascaded_shadow_maps(
     shadow = occluded / float(wp.max(samples, 1))
     if shadow > 0.0:
         current = color[i]
-        ambient = wp.vec3(current[0] * 0.47, current[1] * 0.53, current[2] * 0.58)
+        ambient = wp.vec3(current[0] * 0.36, current[1] * 0.42, current[2] * 0.48)
         color[i] = wp.lerp(current, ambient, shadow * shadow_strength)
 
 
@@ -4444,12 +4582,6 @@ def facade_procedural_surface(
         slope_u = waviness * 0.008
         slope_v = waviness * 0.008
     return wp.vec4(slope_u, slope_v, albedo, roughness_offset)
-
-
-@wp.func
-def facade_hash01(panel: int, salt: int) -> float:
-    value = wp.sin(float(panel * 37 + salt * 101) * 12.9898) * 43758.5453
-    return value - wp.floor(value)
 
 
 @wp.func
@@ -4709,6 +4841,9 @@ def raster_facade_color(
                         wp.dot(relative, rest_u) / rest_u_length2,
                         wp.dot(relative, rest_v) / rest_v_length2,
                     )
+                    if family == 2 and panel_mode[panel] == 0:
+                        if facade_glass_coverage(panel, uv, crack_damage) < 0.5:
+                            continue
                     surface = facade_procedural_surface(
                         normal, tangent_u, tangent_v, uv, family, palette, panel
                     )
@@ -4740,6 +4875,262 @@ def raster_facade_color(
                         previous_y = w0 * previous_a[1] + w1 * previous_b[1] + w2 * previous_c[1]
                         motion_x = fx - previous_x
                         motion_y = fy - previous_y
+                    gbuffer_motion[index] = wp.vec2(motion_x, motion_y)
+
+
+@wp.kernel
+def update_glass_shatter_state(
+    glass_panel: wp.array(dtype=wp.int32),
+    vertex: wp.array(dtype=wp.vec3),
+    previous_vertex: wp.array(dtype=wp.vec3),
+    anchor: wp.array(dtype=wp.int32),
+    particle_damage: wp.array(dtype=float),
+    birth_time: wp.array(dtype=float),
+    birth_origin: wp.array(dtype=wp.vec3),
+    birth_u: wp.array(dtype=wp.vec3),
+    birth_v: wp.array(dtype=wp.vec3),
+    birth_velocity: wp.array(dtype=wp.vec3),
+    time_s: float,
+    frame_dt: float,
+    shatter_damage: float,
+    initialize_existing_as_expired: int,
+    maximum_lifetime: float,
+):
+    slot = wp.tid()
+    if birth_time[slot] >= 0.0:
+        return
+    panel = glass_panel[slot]
+    anchor_base = panel * 4
+    damage = wp.max(
+        particle_damage[anchor[anchor_base]],
+        wp.max(
+            particle_damage[anchor[anchor_base + 1]],
+            wp.max(
+                particle_damage[anchor[anchor_base + 2]],
+                particle_damage[anchor[anchor_base + 3]],
+            ),
+        ),
+    )
+    if damage < shatter_damage:
+        return
+    vertex_base = panel * 4
+    a = vertex[vertex_base]
+    b = vertex[vertex_base + 1]
+    d = vertex[vertex_base + 3]
+    previous_center = wp.vec3(0.0, 0.0, 0.0)
+    current_center = wp.vec3(0.0, 0.0, 0.0)
+    for corner in range(4):
+        previous_center += previous_vertex[vertex_base + corner] * 0.25
+        current_center += vertex[vertex_base + corner] * 0.25
+    velocity = (current_center - previous_center) / wp.max(frame_dt, 1.0e-4)
+    speed = wp.length(velocity)
+    if speed > 14.0:
+        velocity *= 14.0 / speed
+    if initialize_existing_as_expired != 0:
+        birth_time[slot] = time_s - maximum_lifetime - 1.0
+    else:
+        birth_time[slot] = time_s
+    birth_origin[slot] = a
+    birth_u[slot] = d - a
+    birth_v[slot] = b - a
+    birth_velocity[slot] = velocity
+
+
+@wp.kernel
+def update_glass_micro_shards(
+    glass_panel: wp.array(dtype=wp.int32),
+    birth_time: wp.array(dtype=float),
+    birth_origin: wp.array(dtype=wp.vec3),
+    birth_u: wp.array(dtype=wp.vec3),
+    birth_v: wp.array(dtype=wp.vec3),
+    birth_velocity: wp.array(dtype=wp.vec3),
+    shard_vertex: wp.array(dtype=wp.vec3),
+    previous_shard_vertex: wp.array(dtype=wp.vec3),
+    shard_active: wp.array(dtype=wp.int32),
+    shards_per_panel: int,
+    time_s: float,
+    frame_dt: float,
+    minimum_lifetime: float,
+    maximum_lifetime: float,
+    ejection_speed: float,
+    shard_size_scale: float,
+    spawn_fraction: float,
+):
+    shard = wp.tid()
+    slot = shard // shards_per_panel
+    local = shard - slot * shards_per_panel
+    born = birth_time[slot]
+    shard_active[shard] = 0
+    if born < 0.0:
+        return
+    panel = glass_panel[slot]
+    if facade_hash01(panel, 401 + local * 17) > spawn_fraction:
+        return
+    age = time_s - born
+    lifetime = minimum_lifetime + (maximum_lifetime - minimum_lifetime) * facade_hash01(
+        panel, 409 + local * 23
+    )
+    if age < 0.0 or age > lifetime:
+        return
+    u = birth_u[slot]
+    v = birth_v[slot]
+    u_length = wp.max(wp.length(u), 1.0e-4)
+    v_length = wp.max(wp.length(v), 1.0e-4)
+    u_dir = u / u_length
+    v_dir = v / v_length
+    normal = wp.normalize(wp.cross(u, v))
+    uv_u = 0.12 + 0.76 * facade_hash01(panel, 419 + local * 29)
+    uv_v = 0.12 + 0.76 * facade_hash01(panel, 421 + local * 31)
+    start = birth_origin[slot] + u * uv_u + v * uv_v
+    tangent_jitter = (facade_hash01(panel, 431 + local * 37) - 0.5) * 1.6
+    vertical_jitter = 0.25 + facade_hash01(panel, 433 + local * 41) * 1.1
+    normal_jitter = 0.45 + facade_hash01(panel, 439 + local * 43) * ejection_speed
+    velocity = (
+        birth_velocity[slot]
+        + normal * normal_jitter
+        + u_dir * tangent_jitter
+        + v_dir * (vertical_jitter - 0.45)
+        + wp.vec3(0.0, vertical_jitter, 0.0)
+    )
+    drag = 0.70
+    travel = (1.0 - wp.exp(-drag * age)) / drag
+    center = start + velocity * travel + wp.vec3(0.0, -4.905 * age * age, 0.0)
+    previous_age = wp.max(age - frame_dt, 0.0)
+    previous_travel = (1.0 - wp.exp(-drag * previous_age)) / drag
+    previous_center = (
+        start + velocity * previous_travel
+        + wp.vec3(0.0, -4.905 * previous_age * previous_age, 0.0)
+    )
+    # Tiny visual splinters are retired on ground contact; the larger SPH
+    # glass fragments remain physical and continue to collide normally.
+    if center[1] < 0.04:
+        return
+    size = wp.min(u_length, v_length) * shard_size_scale * (
+        0.62 + 0.70 * facade_hash01(panel, 443 + local * 47)
+    )
+    spin_rate = (facade_hash01(panel, 449 + local * 53) - 0.5) * 13.0
+    angle = spin_rate * age
+    previous_angle = spin_rate * previous_age
+    spin_u = u_dir * wp.cos(angle) + v_dir * wp.sin(angle)
+    spin_v = -u_dir * wp.sin(angle) + v_dir * wp.cos(angle)
+    previous_spin_u = u_dir * wp.cos(previous_angle) + v_dir * wp.sin(previous_angle)
+    previous_spin_v = -u_dir * wp.sin(previous_angle) + v_dir * wp.cos(previous_angle)
+    base = shard * 3
+    shard_vertex[base] = center + spin_u * size
+    shard_vertex[base + 1] = center - spin_u * size * 0.72 + spin_v * size * 0.66
+    shard_vertex[base + 2] = center - spin_u * size * 0.38 - spin_v * size
+    previous_shard_vertex[base] = previous_center + previous_spin_u * size
+    previous_shard_vertex[base + 1] = previous_center - previous_spin_u * size * 0.72 + previous_spin_v * size * 0.66
+    previous_shard_vertex[base + 2] = previous_center - previous_spin_u * size * 0.38 - previous_spin_v * size
+    shard_active[shard] = 1
+
+
+@wp.kernel
+def raster_glass_shard_depth(
+    shard_vertex: wp.array(dtype=wp.vec3),
+    shard_active: wp.array(dtype=wp.int32),
+    depth: wp.array(dtype=float),
+    cam: wp.vec3,
+    right: wp.vec3,
+    up: wp.vec3,
+    forward: wp.vec3,
+    focal: float,
+    width: int,
+    height: int,
+):
+    shard = wp.tid()
+    if shard_active[shard] == 0:
+        return
+    base = shard * 3
+    a = project_point(shard_vertex[base], cam, right, up, forward, focal, width, height)
+    b = project_point(shard_vertex[base + 1], cam, right, up, forward, focal, width, height)
+    c = project_point(shard_vertex[base + 2], cam, right, up, forward, focal, width, height)
+    if a[2] <= 0.1 or b[2] <= 0.1 or c[2] <= 0.1:
+        return
+    min_x = wp.clamp(int(wp.floor(wp.min(a[0], wp.min(b[0], c[0])))), 0, width - 1)
+    max_x = wp.clamp(int(wp.ceil(wp.max(a[0], wp.max(b[0], c[0])))), 0, width - 1)
+    min_y = wp.clamp(int(wp.floor(wp.min(a[1], wp.min(b[1], c[1])))), 0, height - 1)
+    max_y = wp.clamp(int(wp.ceil(wp.max(a[1], wp.max(b[1], c[1])))), 0, height - 1)
+    area = edge2(a, b, c[0], c[1])
+    if wp.abs(area) < 1.0e-6:
+        return
+    for py in range(min_y, max_y + 1):
+        for px in range(min_x, max_x + 1):
+            fx = float(px) + 0.5; fy = float(py) + 0.5
+            w0 = edge2(b, c, fx, fy) / area
+            w1 = edge2(c, a, fx, fy) / area
+            w2 = 1.0 - w0 - w1
+            if w0 >= 0.0 and w1 >= 0.0 and w2 >= 0.0:
+                wp.atomic_min(depth, py * width + px, w0 * a[2] + w1 * b[2] + w2 * c[2])
+
+
+@wp.kernel
+def raster_glass_shard_color(
+    shard_vertex: wp.array(dtype=wp.vec3),
+    previous_shard_vertex: wp.array(dtype=wp.vec3),
+    shard_active: wp.array(dtype=wp.int32),
+    depth: wp.array(dtype=float),
+    color: wp.array(dtype=wp.vec3),
+    gbuffer_normal: wp.array(dtype=wp.vec3),
+    gbuffer_motion: wp.array(dtype=wp.vec2),
+    gbuffer_material: wp.array(dtype=wp.int32),
+    gbuffer_roughness: wp.array(dtype=float),
+    gbuffer_metallic: wp.array(dtype=float),
+    cam: wp.vec3,
+    right: wp.vec3,
+    up: wp.vec3,
+    forward: wp.vec3,
+    focal: float,
+    width: int,
+    height: int,
+    sun_direction_input: wp.vec3,
+):
+    shard = wp.tid()
+    if shard_active[shard] == 0:
+        return
+    base = shard * 3
+    world_a = shard_vertex[base]; world_b = shard_vertex[base + 1]; world_c = shard_vertex[base + 2]
+    a = project_point(world_a, cam, right, up, forward, focal, width, height)
+    b = project_point(world_b, cam, right, up, forward, focal, width, height)
+    c = project_point(world_c, cam, right, up, forward, focal, width, height)
+    pa = project_point(previous_shard_vertex[base], cam, right, up, forward, focal, width, height)
+    pb = project_point(previous_shard_vertex[base + 1], cam, right, up, forward, focal, width, height)
+    pc = project_point(previous_shard_vertex[base + 2], cam, right, up, forward, focal, width, height)
+    if a[2] <= 0.1 or b[2] <= 0.1 or c[2] <= 0.1:
+        return
+    min_x = wp.clamp(int(wp.floor(wp.min(a[0], wp.min(b[0], c[0])))), 0, width - 1)
+    max_x = wp.clamp(int(wp.ceil(wp.max(a[0], wp.max(b[0], c[0])))), 0, width - 1)
+    min_y = wp.clamp(int(wp.floor(wp.min(a[1], wp.min(b[1], c[1])))), 0, height - 1)
+    max_y = wp.clamp(int(wp.ceil(wp.max(a[1], wp.max(b[1], c[1])))), 0, height - 1)
+    area = edge2(a, b, c[0], c[1])
+    if wp.abs(area) < 1.0e-6:
+        return
+    normal = wp.normalize(wp.cross(world_b - world_a, world_c - world_a))
+    view_direction = wp.normalize(cam - (world_a + world_b + world_c) / 3.0)
+    if wp.dot(normal, view_direction) < 0.0:
+        normal = -normal
+    light = 0.20 + 0.80 * wp.clamp(wp.dot(normal, wp.normalize(sun_direction_input)), 0.0, 1.0)
+    fresnel = 0.22 + 0.78 * wp.pow(1.0 - wp.clamp(wp.dot(normal, view_direction), 0.0, 1.0), 5.0)
+    shard_color = wp.vec3(0.32, 0.64, 0.76) * light + wp.vec3(0.62, 0.82, 0.90) * fresnel
+    for py in range(min_y, max_y + 1):
+        for px in range(min_x, max_x + 1):
+            fx = float(px) + 0.5; fy = float(py) + 0.5
+            w0 = edge2(b, c, fx, fy) / area
+            w1 = edge2(c, a, fx, fy) / area
+            w2 = 1.0 - w0 - w1
+            if w0 >= 0.0 and w1 >= 0.0 and w2 >= 0.0:
+                z = w0 * a[2] + w1 * b[2] + w2 * c[2]
+                index = py * width + px
+                if z <= depth[index] + 0.025:
+                    color[index] = shard_color
+                    gbuffer_normal[index] = normal
+                    gbuffer_material[index] = 20
+                    gbuffer_roughness[index] = 0.12
+                    gbuffer_metallic[index] = 0.0
+                    motion_x = 0.0; motion_y = 0.0
+                    if pa[2] > 0.1 and pb[2] > 0.1 and pc[2] > 0.1:
+                        motion_x = fx - (w0 * pa[0] + w1 * pb[0] + w2 * pc[0])
+                        motion_y = fy - (w0 * pa[1] + w1 * pb[1] + w2 * pc[1])
                     gbuffer_motion[index] = wp.vec2(motion_x, motion_y)
 
 

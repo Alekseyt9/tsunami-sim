@@ -1,0 +1,32 @@
+{
+  "extends": "config_v3_city_clear_surge_30s_intermediate_viscosity.json",
+  "output_basename": "deluge_v3_city_sph_only_shoreline",
+  "duration_seconds": 30.0,
+  "output_fps": 24,
+  "checkpoint_every_frames": 24,
+  "reservoir_z_min": -84.0,
+  "reservoir_z_max": -20.0,
+  "water_depth": 14.0,
+  "wave_height": 17.85,
+  "wave_speed": 21.4,
+  "background_current": 8.0,
+  "environment": {
+    "terrain_z_min": -20.0
+  },
+  "v3": {
+    "shallow_water": {
+      "enabled": false,
+      "replace_far_sph": false,
+      "render_far_surface": false,
+      "stitch_surface": false,
+      "emit_sph": false,
+      "merge_sph": false,
+      "wave_train": {
+        "enabled": false
+      },
+      "wave_cohort": {
+        "enabled": false
+      }
+    }
+  }
+}

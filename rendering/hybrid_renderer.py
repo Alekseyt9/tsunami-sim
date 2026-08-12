@@ -30,9 +30,13 @@ from rendering.renderer import ParticleRenderer
 from kernels.hybrid import (
     apply_cascaded_shadow_maps,
     deform_facade_vertices,
+    raster_glass_shard_color,
+    raster_glass_shard_depth,
     raster_facade_color,
     raster_facade_depth,
     raster_facade_shadow_depth,
+    update_glass_micro_shards,
+    update_glass_shatter_state,
 )
 from kernels.surface import raster_anisotropic_water_depth, raster_water_mesh_depth
 
@@ -72,7 +76,16 @@ class HybridRenderer(ParticleRenderer):
                  water_absorption: tuple[float, float, float] = (0.17, 0.045, 0.018),
                  water_scattering: tuple[float, float, float] = (0.012, 0.032, 0.055),
                  water_phase_g: float = 0.35,
-                 water_maximum_optical_depth: float = 18.0):
+                 water_maximum_optical_depth: float = 18.0,
+                 glass_shards_enabled: bool = True,
+                 glass_shatter_damage: float = 0.42,
+                 glass_shards_per_panel: int = 4,
+                 glass_shard_minimum_lifetime: float = 1.4,
+                 glass_shard_maximum_lifetime: float = 3.2,
+                 glass_shard_ejection_speed: float = 2.2,
+                 glass_shard_size_scale: float = 0.065,
+                 glass_shard_spawn_fraction: float = 0.62,
+                 ballistic_droplets_as_mist: bool = True):
         super().__init__(width, height, camera, device)
         self.view_name = view_name
         self.maximum_panel_stretch = float(maximum_panel_stretch)
@@ -111,6 +124,17 @@ class HybridRenderer(ParticleRenderer):
         self.water_scattering = tuple(max(0.0, float(v)) for v in water_scattering)
         self.water_phase_g = max(-0.85, min(float(water_phase_g), 0.85))
         self.water_maximum_optical_depth = max(0.1, float(water_maximum_optical_depth))
+        self.glass_shards_enabled = bool(glass_shards_enabled)
+        self.glass_shatter_damage = max(0.34, min(float(glass_shatter_damage), 0.95))
+        self.glass_shards_per_panel = max(1, min(int(glass_shards_per_panel), 8))
+        self.glass_shard_minimum_lifetime = max(0.25, float(glass_shard_minimum_lifetime))
+        self.glass_shard_maximum_lifetime = max(
+            self.glass_shard_minimum_lifetime, float(glass_shard_maximum_lifetime)
+        )
+        self.glass_shard_ejection_speed = max(0.0, float(glass_shard_ejection_speed))
+        self.glass_shard_size_scale = max(0.005, min(float(glass_shard_size_scale), 0.20))
+        self.glass_shard_spawn_fraction = max(0.0, min(float(glass_shard_spawn_fraction), 1.0))
+        self.ballistic_droplets_as_mist = bool(ballistic_droplets_as_mist)
         pixel_count = width * height
         self.water_history = wp.empty(pixel_count, dtype=float, device=device)
         self.water_temporal = wp.empty(pixel_count, dtype=float, device=device)
@@ -143,6 +167,29 @@ class HybridRenderer(ParticleRenderer):
         self.panel_mode = wp.array(panel_mode, dtype=wp.int32, device=device)
         self.owner_fragment = wp.array(owner_fragment, dtype=wp.int32, device=device)
         material_family = material // 10
+        glass_panels = np.flatnonzero((panel_mode == 0) & (material_family == 2)).astype(
+            np.int32, copy=False
+        )
+        self.glass_panel_count = len(glass_panels)
+        self.glass_panels = wp.array(glass_panels, dtype=wp.int32, device=device)
+        self.glass_shatter_time = wp.array(
+            np.full(self.glass_panel_count, -1.0, dtype=np.float32), dtype=float, device=device
+        )
+        self.glass_birth_origin = wp.zeros(self.glass_panel_count, dtype=wp.vec3, device=device)
+        self.glass_birth_u = wp.zeros(self.glass_panel_count, dtype=wp.vec3, device=device)
+        self.glass_birth_v = wp.zeros(self.glass_panel_count, dtype=wp.vec3, device=device)
+        self.glass_birth_velocity = wp.zeros(self.glass_panel_count, dtype=wp.vec3, device=device)
+        self.glass_shard_count = (
+            self.glass_panel_count * self.glass_shards_per_panel
+            if self.glass_shards_enabled else 0
+        )
+        allocated_shards = max(self.glass_shard_count, 1)
+        self.glass_shard_vertex = wp.zeros(allocated_shards * 3, dtype=wp.vec3, device=device)
+        self.previous_glass_shard_vertex = wp.zeros(
+            allocated_shards * 3, dtype=wp.vec3, device=device
+        )
+        self.glass_shard_active = wp.zeros(allocated_shards, dtype=wp.int32, device=device)
+        self._glass_last_time: float | None = None
 
         def triangle_order(mask: np.ndarray):
             panels = np.flatnonzero(mask).astype(np.int32, copy=False)
@@ -258,6 +305,32 @@ class HybridRenderer(ParticleRenderer):
                     self.fragment_support, arrays["x"], arrays["rest_x"], self.current_vertex],
             device=self.device,
         )
+        glass_frame_dt = 1.0 / 24.0
+        if self._glass_last_time is not None:
+            glass_frame_dt = max(1.0 / 240.0, min(float(time_s) - self._glass_last_time, 0.25))
+        if self.glass_shards_enabled and self.glass_panel_count > 0:
+            wp.launch(
+                update_glass_shatter_state, dim=self.glass_panel_count,
+                inputs=[
+                    self.glass_panels, self.current_vertex, self.previous_vertex, self.anchor,
+                    arrays["damage"], self.glass_shatter_time, self.glass_birth_origin,
+                    self.glass_birth_u, self.glass_birth_v, self.glass_birth_velocity,
+                    float(time_s), glass_frame_dt, self.glass_shatter_damage,
+                    int(self._glass_last_time is None), self.glass_shard_maximum_lifetime,
+                ], device=self.device,
+            )
+            wp.launch(
+                update_glass_micro_shards, dim=self.glass_shard_count,
+                inputs=[
+                    self.glass_panels, self.glass_shatter_time, self.glass_birth_origin,
+                    self.glass_birth_u, self.glass_birth_v, self.glass_birth_velocity,
+                    self.glass_shard_vertex, self.previous_glass_shard_vertex,
+                    self.glass_shard_active, self.glass_shards_per_panel, float(time_s),
+                    glass_frame_dt, self.glass_shard_minimum_lifetime,
+                    self.glass_shard_maximum_lifetime, self.glass_shard_ejection_speed,
+                    self.glass_shard_size_scale, self.glass_shard_spawn_fraction,
+                ], device=self.device,
+            )
         if self.cascaded_shadows:
             wp.launch(
                 clear_depth, dim=len(self.shadow_depth), inputs=[self.shadow_depth], device=self.device,
@@ -267,8 +340,8 @@ class HybridRenderer(ParticleRenderer):
                 wp.launch(
                     raster_facade_shadow_depth, dim=self.panel_count * 2,
                     inputs=[
-                        self.current_vertex, self.rest_vertex, self.panel_material,
-                        self.panel_mode, self.owner_fragment, self.fragment_support,
+                        self.current_vertex, self.rest_vertex, self.anchor, self.panel_material,
+                        self.panel_mode, self.owner_fragment, self.fragment_support, arrays["damage"],
                         self.shadow_depth, cascade * shadow_pixels,
                         wp.vec3(*self.shadow_origins_host[cascade]),
                         wp.vec3(*self.shadow_rights_host[cascade]),
@@ -280,9 +353,16 @@ class HybridRenderer(ParticleRenderer):
                 )
         wp.launch(
             raster_facade_depth, dim=self.panel_count * 2,
-            inputs=[self.current_vertex, self.rest_vertex, self.panel_mode, self.owner_fragment,
-                    self.fragment_support, self.depth, *common, self.maximum_panel_stretch], device=self.device,
+            inputs=[self.current_vertex, self.rest_vertex, self.anchor, self.panel_material,
+                    self.panel_mode, self.owner_fragment, self.fragment_support, arrays["damage"],
+                    self.depth, *common, self.maximum_panel_stretch], device=self.device,
         )
+        if self.glass_shards_enabled and self.glass_shard_count > 0:
+            wp.launch(
+                raster_glass_shard_depth, dim=self.glass_shard_count,
+                inputs=[self.glass_shard_vertex, self.glass_shard_active, self.depth, *common],
+                device=self.device,
+            )
         if "water_mesh_indices" in arrays and len(arrays["water_mesh_indices"]) >= 3:
             wp.launch(
                 raster_water_mesh_depth, dim=len(arrays["water_mesh_indices"]) // 3,
@@ -299,7 +379,8 @@ class HybridRenderer(ParticleRenderer):
                         arrays["water_surface_mask"][:count], arrays["water_surface_normal"][:count],
                         arrays["water_foam_strength"][:count], arrays["water_phase"][:count],
                         self.water_depth, self.water_back_depth, self.water_foam, *common,
-                        self.water_tangent_scale, self.water_normal_scale], device=self.device,
+                        self.water_tangent_scale, self.water_normal_scale,
+                        int(self.ballistic_droplets_as_mist)], device=self.device,
             )
         elif "water_surface_mask" in arrays:
             wp.launch(
@@ -308,7 +389,8 @@ class HybridRenderer(ParticleRenderer):
                         arrays["water_surface_mask"][:count], arrays["water_surface_normal"][:count],
                         arrays["water_foam_strength"][:count], arrays["water_phase"][:count],
                         self.water_depth, self.water_back_depth, self.water_foam, *common,
-                        self.water_tangent_scale, self.water_normal_scale], device=self.device,
+                        self.water_tangent_scale, self.water_normal_scale,
+                        int(self.ballistic_droplets_as_mist)], device=self.device,
             )
         else:
             wp.launch(
@@ -363,6 +445,16 @@ class HybridRenderer(ParticleRenderer):
                         self.crack_strength, self.architectural_overlay_tolerance,
                         wp.vec3(*self.sun_direction), self.sky_turbidity, self.sky_intensity,
                         self.sun_intensity, self.ibl_strength], device=self.device,
+            )
+        if self.glass_shards_enabled and self.glass_shard_count > 0:
+            wp.launch(
+                raster_glass_shard_color, dim=self.glass_shard_count,
+                inputs=[
+                    self.glass_shard_vertex, self.previous_glass_shard_vertex,
+                    self.glass_shard_active, self.depth, self.color, self.gbuffer_normal,
+                    self.gbuffer_motion, self.gbuffer_material, self.gbuffer_roughness,
+                    self.gbuffer_metallic, *common, wp.vec3(*self.sun_direction),
+                ], device=self.device,
             )
         wp.launch(
             shade_water_surface, dim=pixel_count,
@@ -451,6 +543,7 @@ class HybridRenderer(ParticleRenderer):
             copy_vec3, dim=self.panel_count * 4,
             inputs=[self.current_vertex, self.previous_vertex], device=self.device,
         )
+        self._glass_last_time = float(time_s)
         wp.synchronize_device(self.device)
 
         resolved_color = self.display_color if self.hdr_enabled else self.taa_output

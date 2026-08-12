@@ -256,6 +256,7 @@ def raster_anisotropic_water_depth(
     height: int,
     tangent_scale: float,
     normal_scale: float,
+    ballistic_droplets_as_mist: int,
 ):
     i = wp.tid()
     if kind[i] != 0 or surface_mask[i] == 0:
@@ -275,6 +276,7 @@ def raster_anisotropic_water_depth(
     normal_radius = wp.clamp(focal * radius[i] * normal_scale / p[2], 1.1, 10.0)
     foam = particle_foam[i]
     phase = water_phase[i]
+    mist_only = phase == 2 and ballistic_droplets_as_mist != 0
     if phase == 1:
         # An overturning lamella is a broad, thin optical sheet, not a row of
         # circular blobs.  Preserve its measured normal and flatten only the
@@ -295,6 +297,15 @@ def raster_anisotropic_water_depth(
         speed_stretch = 1.0 + spray * wp.clamp(wp.length(v[i]) / 12.0, 0.0, 1.0)
         tangent_radius = wp.clamp(tangent_radius * speed_stretch, 1.35, 8.0)
         normal_radius = wp.clamp(normal_radius * (0.82 - 0.12 * spray), 0.7, 5.5)
+    if mist_only:
+        # One ballistic SPH sample represents a macroscopic water volume and
+        # must not be shown as a metre-scale refractive droplet. Keep its
+        # simulated mass/momentum, but feed only a compact foam/mist streak to
+        # the atmospheric pass. The connected surface and thin sheets retain
+        # their regular water depth and refraction.
+        foam = wp.max(foam, 0.48)
+        tangent_radius = wp.clamp(tangent_radius * 0.72, 1.0, 5.0)
+        normal_radius = wp.clamp(normal_radius * 0.55, 0.55, 2.2)
     cx = int(p[0]); cy = int(p[1])
     for oy in range(-14, 15):
         for ox in range(-14, 15):
@@ -307,8 +318,9 @@ def raster_anisotropic_water_depth(
                 surface_depth = p[2] - radius[i] * normal_scale * wp.sqrt(wp.max(0.0, 1.0 - ellipse))
                 rear_depth = p[2] + radius[i] * normal_scale * wp.sqrt(wp.max(0.0, 1.0 - ellipse))
                 index = py * width + px
-                wp.atomic_min(depth, index, surface_depth)
-                wp.atomic_max(back_depth, index, rear_depth)
+                if not mist_only:
+                    wp.atomic_min(depth, index, surface_depth)
+                    wp.atomic_max(back_depth, index, rear_depth)
                 wp.atomic_max(foam_field, index, foam)
 
 

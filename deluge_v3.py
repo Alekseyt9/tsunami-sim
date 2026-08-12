@@ -617,6 +617,33 @@ class HybridDelugeSolver(DelugeSolver):
                 water_maximum_optical_depth=float(render.get("water_optics", {}).get(
                     "maximum_optical_depth_m", 18.0
                 )),
+                glass_shards_enabled=bool(render.get("glass_shards", {}).get(
+                    "enabled", True
+                )),
+                glass_shatter_damage=float(render.get("glass_shards", {}).get(
+                    "shatter_damage", 0.42
+                )),
+                glass_shards_per_panel=int(render.get("glass_shards", {}).get(
+                    "shards_per_panel", 4
+                )),
+                glass_shard_minimum_lifetime=float(render.get("glass_shards", {}).get(
+                    "minimum_lifetime_seconds", 1.4
+                )),
+                glass_shard_maximum_lifetime=float(render.get("glass_shards", {}).get(
+                    "maximum_lifetime_seconds", 3.2
+                )),
+                glass_shard_ejection_speed=float(render.get("glass_shards", {}).get(
+                    "ejection_speed_mps", 2.2
+                )),
+                glass_shard_size_scale=float(render.get("glass_shards", {}).get(
+                    "size_scale", 0.065
+                )),
+                glass_shard_spawn_fraction=float(render.get("glass_shards", {}).get(
+                    "spawn_fraction", 0.62
+                )),
+                ballistic_droplets_as_mist=bool(render.get("spray", {}).get(
+                    "ballistic_droplets_as_mist", True
+                )),
             )
             for name, camera in configured_views.items()
         }
@@ -1215,6 +1242,7 @@ class HybridDelugeSolver(DelugeSolver):
         self.water_splash_brick_count = 0
         self.water_splash_mesh_vertices = 0
         self.water_stitch_sample_count = 0
+        self.water_far_mesh_vertex_count = 0
         self.water_surface_classify_ms = 0.0
         self.water_mesh_preprocess_ms = 0.0
         self.water_mesh_field_ms = 0.0
@@ -1600,6 +1628,10 @@ class HybridDelugeSolver(DelugeSolver):
             vertices, indices, detail_positions, detail_radii,
             np.ones(len(detail_positions), dtype=bool),
         )
+        # The shallow solver is a depth field, not a cloud of spherical
+        # samples. Append its closed height-field volume explicitly. Only the
+        # narrow overlap remains in the common Marching-Cubes field above.
+        vertices, indices = self._append_shallow_surface_mesh(vertices, indices)
         wp.synchronize_device(self.device)
         self.water_mesh_splash_ms = (time.perf_counter() - splash_started) * 1000.0
         self.water_sparse_field = field
@@ -1779,7 +1811,9 @@ class HybridDelugeSolver(DelugeSolver):
     def _append_shallow_surface_mesh(self, vertices, indices):
         shallow_vertices, shallow_indices = self.shallow_water.surface_mesh()
         if shallow_vertices is None or len(shallow_indices) < 3:
+            self.water_far_mesh_vertex_count = 0
             return vertices, indices
+        self.water_far_mesh_vertex_count = len(shallow_vertices)
         base = len(vertices)
         combined_vertices = np.concatenate([vertices.numpy(), shallow_vertices], axis=0)
         combined_indices = np.concatenate(
@@ -4619,6 +4653,7 @@ class HybridDelugeSolver(DelugeSolver):
             result["water_mesh_lod_changes"] = self.water_mesh_lod_change_count
             result["water_splash_bricks"] = self.water_splash_brick_count
             result["water_splash_mesh_vertices"] = self.water_splash_mesh_vertices
+            result["water_far_mesh_vertices"] = self.water_far_mesh_vertex_count
             result["water_stitch_surface_samples"] = self.water_stitch_sample_count
             result["water_surface_classify_ms"] = self.water_surface_classify_ms
             result["water_mesh_preprocess_ms"] = self.water_mesh_preprocess_ms

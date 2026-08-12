@@ -1136,3 +1136,108 @@ passed.  The replay log is in
 Frame metrics are now serialized as compact JSON Lines: exactly one complete
 JSON object followed by one LF for every output frame.  This is a physical
 one-record-per-line guarantee; editors may still visually wrap a long record.
+
+## Hidden far field, registered water seam and visible cast shadows (2026-08-06)
+
+At checkpoint 120 (5.0417 s), the reduced shallow-water model was 24.8-27.4 m
+high at the coupling boundary while the 95th-percentile SPH surface was only
+about 11.2 m.  The renderer was splatting shallow height samples from the full
+46 m rear domain into Marching Cubes.  This produced a separate floating ribbon
+to the right of the city and the old six-metre relative clamp prevented the
+transition from reaching the actual SPH height.
+
+The production city view now keeps the reduced-order far field hidden and uses
+only a 10 m overlap seam.  That seam is transversely filtered and terminates at
+the measured SPH surface without being clamped toward the taller shallow
+column.  Stitch samples fell from 16,555 to 3,440.  A closed 3,080-vertex
+height-field/bed/perimeter volume remains available for dedicated offshore
+views, but is deliberately disabled in the city preset.  The checkpoint-120
+comparison is in `outputs/seam_shadow_checkpoint120_city_20260806`.
+
+Window glass had also been omitted completely from the cascaded shadow map,
+making highly glazed towers weak occluders.  Tinted glass now casts direct
+sunlight shadows, production shadow strength is 0.90, and the shadow ambient
+term is darker without becoming black.  On the checkpoint-120 hero view, the
+same-frame shadow-on/off comparison changes 214,873 pixels (18.42% of the
+image); 196,379 pixels darken by more than five 8-bit levels.  The comparison
+and measurements are in `outputs/shadow_pair_checkpoint120_20260806`.
+
+The first shadow pass still did not produce readable building-to-building
+shadows.  Its high sun direction gave a 50 m tower only about 21 m of
+longitudinal ground reach, less than the roughly 39 m row spacing.  In
+addition, terrain family 9 was written into its own shadow map; 5x5 PCF then
+turned neighbouring ground texels into false blockers and darkened streets
+uniformly instead of drawing silhouettes.
+
+The production sun is now `[-0.12, 0.60, -0.79]`, giving a median tower enough
+reach to cross a complete building row. Terrain and asphalt remain receivers
+but no longer act as casters, and cascade-aware receiver-plane bias scales with
+world texel size and surface slope.  On the real checkpoint-120 G-buffer,
+17.72% of street pixels receive more than five levels of cast-shadow
+darkening while 76.34% remain unchanged; for building facade pixels those
+fractions are 39.19% and 56.09%.  The verified pair is in
+`outputs/shadow_pair_citycast_checkpoint120_20260806`.
+
+## Perforated glass and bounded micro-shards (2026-08-06)
+
+Facade glass previously remained a complete depth/shadow quad and only gained
+a colour crack mask. It could therefore look cracked but could neither expose
+the recessed apartment nor transmit sunlight through the broken region. A
+single deterministic damage-driven coverage function now feeds the depth,
+colour and cascaded-shadow raster passes. Hairline cracking starts first; from
+0.34 damage onward irregular cells are removed around the impact seed, leaving
+a narrow frame rim and radial slivers rather than deleting the whole window in
+one frame.
+
+Large glass pieces continue to use the existing adaptive structural particles,
+so they retain water, debris, gravity and ground contact. Fine splinters use a
+separate render-only ballistic layer: four preallocated candidates per pane,
+62% deterministic admission, 1.4-3.2 s lifetime and immediate retirement on
+ground contact. The pool never grows with elapsed simulation time. The current
+5,214 glass panes therefore reserve at most 20,856 micro-shards / 62,568
+triangle vertices, about 1.8 MiB per renderer before allocator overhead. A
+640x360 checkpoint comparison measured 83.07 ms without the shard pass and
+81.42 ms with it, i.e. no resolvable overhead above frame-to-frame noise.
+
+`validate_crack_rendering.py` verifies that missing glass coverage grows from
+2,481 to 7,116 of 9,216 samples as damage increases while the rim survives.
+`validate_glass_shards.py` verifies fixed capacity, complete retirement after
+3.2 s, and that resuming an already-damaged checkpoint does not re-emit an
+artificial city-wide glass burst. A complete four-view checkpoint render is
+`outputs/glass_shatter_resume_validation_checkpoint216_20260806.png`.
+
+## Ballistic water samples rendered as mist, not giant drops (2026-08-12)
+
+A detached SPH sample represents a macroscopic volume at the current 0.5-1.0 m
+resolution. Rendering that sample as refractive water therefore produced drops
+comparable to cars rather than real spray. Ballistic samples remain in the
+physics and retain mass, momentum, gravity and solid contact, but the production
+renderer no longer writes their front/back water depth. They contribute only a
+short velocity-aligned foam/mist footprint. Connected water and coherent thin
+sheets continue to use the volumetric water material normally.
+
+The behaviour is controlled by `render.spray.ballistic_droplets_as_mist`; the
+legacy refractive sample geometry remains available for diagnostics. The pool
+does not allocate additional particles or geometry. The CUDA regression
+`validate_spray_mist_rendering.py` confirms that connected water writes depth,
+ballistic samples write no depth but do write foam, and the diagnostic switch
+can still restore the old representation.
+
+## SPH-only shoreline without a shallow-water strip (2026-08-12)
+
+The authored terrain began at z=-20 m while the previous near-field reservoir
+ended at z=-2 m and the shallow/SPH stitch occupied another overlapping band.
+That made land and water appear to start at different locations even with the
+far shallow surface hidden. The `config_v3_city_sph_only_30s.json` production
+variant disables the shallow solver, replacement, rendering, stitch, emission,
+merge and wave train. Disabled shallow state is now initialized and reported as
+zero rather than retaining an unused wet diagnostic grid.
+
+The finite offshore reservoir is entirely physical SPH and spans z=-84..-20 m.
+Its last particle reaches exactly z=-20 m, where the configurable terrain panel
+now starts, so there is neither a gap nor an 18 m overlap. It contains 340,900
+water particles and leaves more than half of the 1.8 million capacity free. The
+crest has 17.85 m elevation and a measured initial peak material speed of
+19.99 m/s; the longer 64 m reservoir replaces the former shallow-water supply.
+The two-frame full smoke test used 408,905 total particles, about 3.0 GiB VRAM,
+3.7-3.9 s per output frame, zero stitch samples and zero shallow cells/volume.

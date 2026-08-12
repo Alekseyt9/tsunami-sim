@@ -1065,7 +1065,15 @@ def build_environment_skin(cfg: dict) -> dict[str, np.ndarray]:
 
     if any(layout.values()):
         # Terrain and roads are render-only panels bound to four fixed anchors.
-        add_panel(-9000, (0.0, -0.04, 55.0), (140.0, 0.08, 150.0), (0, 1, 0), 90)
+        terrain_z_min = float(cfg.get("environment", {}).get("terrain_z_min", -20.0))
+        terrain_z_max = float(cfg.get("domain_z_max", 130.0))
+        terrain_length = max(terrain_z_max - terrain_z_min, 1.0)
+        add_panel(
+            -9000,
+            (0.0, -0.04, 0.5 * (terrain_z_min + terrain_z_max)),
+            (float(cfg.get("domain_width", 140.0)), 0.08, terrain_length),
+            (0, 1, 0), 90,
+        )
         foreground_road_z = float(
             cfg.get("environment", {}).get("cars", {}).get("foreground_z", -5.0)
         ) + 1.35

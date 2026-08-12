@@ -25,6 +25,7 @@ if not exist "%PYTHON_EXE%" (
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_fracture_checkpoint.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_shallow_water.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_interface_emission.py" || exit /b 1
+"%PYTHON_EXE%" "%VALIDATION_DIR%validate_shallow_surface_stitch.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_shallow_return.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_wave_train.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_wave_train_reach.py" || exit /b 1
@@ -40,6 +41,9 @@ if not exist "%PYTHON_EXE%" (
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_hdr_water_optics.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_graphics_upgrade.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_crack_rendering.py" || exit /b 1
+"%PYTHON_EXE%" "%VALIDATION_DIR%validate_glass_shards.py" || exit /b 1
+"%PYTHON_EXE%" "%VALIDATION_DIR%validate_spray_mist_rendering.py" || exit /b 1
+"%PYTHON_EXE%" "%VALIDATION_DIR%validate_sph_only_shoreline.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_progressive_video.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_neighbor_optimizations.py" || exit /b 1
 "%PYTHON_EXE%" "%VALIDATION_DIR%validate_optimization_preparation.py" || exit /b 1
